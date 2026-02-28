@@ -1,0 +1,41 @@
+# === Shopify credentials - NEVER commit these ===
+app/config/shopify.json
+app/config/shopify_token.json
+
+# === Python cache ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# === Virtual environments ===
+venv/
+env/
+.venv/
+.env/
+
+# === PyInstaller build artifacts ===
+build/
+dist/
+*.spec
+
+# === Compiled binaries ===
+*.exe
+
+# === Runtime-generated files (safe to regenerate) ===
+app/config/shopify_sku_cache.csv
+
+# === Downloaded/cached images (large, runtime-generated) ===
+images/
+
+# === IDE & OS files ===
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+.DS_Store
+
+# === Logs ===
+*.log

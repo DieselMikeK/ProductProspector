@@ -1,0 +1,7 @@
+{
+  "run_mode": "Create New",
+  "year_policy": "replace",
+  "carry_down_sku": false,
+  "propose_title_year_update": false,
+  "only_rows_with_year_changes": false
+}

@@ -1,0 +1,3313 @@
+
+from __future__ import annotations
+
+import csv
+import ctypes
+from pathlib import Path
+import re
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
+
+import pandas as pd
+
+from product_prospector.core.config_store import (
+    AppSettings,
+    load_app_settings,
+    load_shopify_config,
+    load_shopify_token,
+    save_app_settings,
+    save_shopify_token,
+)
+from product_prospector.core.io_utils import read_table_from_path
+from product_prospector.core.mapping import suggest_columns
+from product_prospector.core.normalization import normalize_product
+from product_prospector.core.pricing_rules import (
+    DiscountMatch,
+    calculate_cost_from_price,
+    find_vendor_discount_file,
+    load_vendor_discounts,
+    resolve_discount_candidates,
+)
+from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS
+from product_prospector.core.processing import (
+    PlanningConfig,
+    RUN_MODE_CREATE,
+    RUN_MODE_UPDATE,
+    RUN_MODE_UPSERT,
+    build_action_plan,
+    normalize_sku,
+    stitch_rows_by_sku,
+)
+from product_prospector.core.create_product_output import build_create_product_output
+from product_prospector.core.session_state import AppSession, MODE_NEW, MODE_UPDATE
+from product_prospector.core.shopify_catalog import fetch_shopify_catalog_dataframe
+from product_prospector.core.shopify_catalog import fetch_shopify_catalog_for_skus
+from product_prospector.core.shopify_oauth import exchange_client_credentials_for_token, perform_oauth_handshake, validate_access_token
+from product_prospector.core.shopify_push import ShopifyDraftPushSummary, push_new_products_as_drafts
+from product_prospector.core.shopify_sku_cache import load_shopify_sku_cache, save_shopify_sku_cache
+from product_prospector.core.type_mapping_engine import TypeCategoryMapper
+from product_prospector.core.vendor_profiles import resolve_vendor_profile
+from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
+from product_prospector.core.workflow_build import (
+    build_products_from_session,
+    build_existing_shopify_index,
+    collect_session_skus,
+    detect_missing_required_fields,
+    merge_mode_label,
+    products_to_dataframe,
+)
+from product_prospector.core.scraper_engine import scrape_vendor_records
+
+
+APP_TITLE = "Product Prospector"
+APP_GEOMETRY = "1440x920"
+_SINGLE_INSTANCE_MUTEX = "Global\\ProductProspectorDesktopApp"
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _resolve_runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _resolve_runtime_data_root(runtime_root: Path) -> Path:
+    app_dir = runtime_root / "app"
+    if app_dir.exists():
+        return app_dir
+    return runtime_root
+
+
+def _safe_head(df: pd.DataFrame | None, rows: int = 30) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.head(rows).fillna("")
+
+
+def _combobox_set_values(widget: ttk.Combobox, values: list[str]) -> None:
+    widget["values"] = values
+    current = widget.get()
+    if current not in values:
+        widget.set("")
+
+
+def _tree_show_dataframe(
+    tree: ttk.Treeview,
+    df: pd.DataFrame,
+    max_rows: int = 40,
+    max_cols: int | None = None,
+    max_cell_chars: int = 260,
+) -> None:
+    tree.delete(*tree.get_children())
+    if df.empty:
+        tree["columns"] = ()
+        return
+
+    all_columns = list(df.columns)
+    if max_cols is not None and max_cols > 0:
+        columns = all_columns[:max_cols]
+    else:
+        columns = all_columns
+    subset = df.loc[:, columns].head(max_rows).astype(str)
+
+    tree["columns"] = columns
+    tree["show"] = "headings"
+    for column in columns:
+        tree.heading(column, text=column)
+        tree.column(column, width=180, minwidth=80, anchor=W, stretch=False)
+
+    def _display_cell(value: object) -> str:
+        text = str(value)
+        if len(text) <= max_cell_chars:
+            return text
+        return text[: max_cell_chars - 3] + "..."
+
+    for _, row in subset.iterrows():
+        tree.insert("", END, values=[_display_cell(row[col]) for col in columns])
+
+
+def _sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    used: set[str] = set()
+    normalized: list[str] = []
+    for index, raw in enumerate(out.columns, start=1):
+        column = str(raw).strip()
+        if not column or column.lower() == "nan":
+            column = f"column_{index}"
+        base = column
+        suffix = 2
+        while column in used:
+            column = f"{base}_{suffix}"
+            suffix += 1
+        used.add(column)
+        normalized.append(column)
+    out.columns = normalized
+    return out
+
+
+def _acquire_single_instance_mutex() -> int | None:
+    if sys.platform != "win32":
+        return -1
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetLastError(0)
+    handle = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX)
+    if not handle:
+        return -1
+    if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def _release_single_instance_mutex(handle: int | None) -> None:
+    if handle is None or handle == -1 or sys.platform != "win32":
+        return
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _show_already_running_message() -> None:
+    message = "Product Prospector is already open. Close the existing window first."
+    if sys.platform == "win32":
+        ctypes.windll.user32.MessageBoxW(None, message, APP_TITLE, 0x10)
+        return
+    print(message)
+
+
+class ProductProspectorDesktopApp:
+    def __init__(self) -> None:
+        self.root = Tk()
+        self.root.title(APP_TITLE)
+        self.root.geometry(APP_GEOMETRY)
+
+        self.vendor_df_raw: pd.DataFrame | None = None
+        self.shopify_df_raw: pd.DataFrame | None = None
+        self.vendor_df_stitched: pd.DataFrame | None = None
+        self.plan_df: pd.DataFrame | None = None
+        self.vendor_source_is_sheet = False
+        self.runtime_root = _resolve_runtime_root()
+        self.runtime_data_root = _resolve_runtime_data_root(self.runtime_root)
+        self._header_logo_image: tk.PhotoImage | None = None
+        self._set_window_icon()
+        self.required_root = self.runtime_data_root / "required"
+        if not self.required_root.exists():
+            self.required_root = Path(__file__).resolve().parent / "required"
+        self.type_mapper: TypeCategoryMapper | None = None
+        self.session = AppSession()
+        self.review_index = 0
+
+        self.vendor_path = StringVar(value="")
+        self.mode_help_text = StringVar(value="")
+        self.sku_scope_help_text = StringVar(value="Enter SKUs that need to be updated or added.")
+        self.input_metrics_text = StringVar(value="Vendor SKUs: 0 | Shopify Catalog SKUs: 0")
+        self.sku_text_status = StringVar(value="")
+        self.source_status_text = StringVar(value="")
+        self.duplicate_check_text = StringVar(value="")
+        self.setup_status_text = StringVar(value="Select a Run Mode to begin.")
+        self.processing_status_text = StringVar(value="")
+        self.review_status_text = StringVar(value="")
+
+        self.shopify_connected = False
+        self.shopify_connecting = False
+        self.shopify_cache_ready = False
+        self.shopify_cache_warmup_inflight = False
+        self.shopify_cache_spinner_job: str | None = None
+        self.shopify_cache_spinner_angle = 0
+        self.setup_widgets_enabled = False
+        self.processing_inflight = False
+        self._processing_request_id = 0
+        self._auto_open_review_after_processing = False
+
+        self.run_mode = StringVar(value="")
+        self.run_mode_locked = BooleanVar(value=False)
+        self.run_mode_summary_text = StringVar(value="")
+        self.use_all_sheet_skus = BooleanVar(value=False)
+
+        self.year_policy = StringVar(value="merge")
+        self.carry_down_sku = BooleanVar(value=True)
+        self.propose_title_year_update = BooleanVar(value=True)
+        self.only_rows_with_year_changes = BooleanVar(value=True)
+
+        self.vendor_sku_column = StringVar(value="")
+        self.vendor_title_column = StringVar(value="")
+        self.vendor_description_column = StringVar(value="")
+        self.vendor_fitment_column = StringVar(value="")
+        self.vendor_image_column = StringVar(value="")
+        self.vendor_price_column = StringVar(value="")
+        self.vendor_cost_column = StringVar(value="")
+        self.vendor_barcode_column = StringVar(value="")
+        self.vendor_weight_column = StringVar(value="")
+        self.vendor_vendor_column = StringVar(value="")
+
+        self.shopify_sku_column = StringVar(value="sku")
+        self.shopify_title_column = StringVar(value="title")
+        self.shopify_description_column = StringVar(value="description")
+        self.shopify_fitment_column = StringVar(value="fitment")
+
+        self.update_price = BooleanVar(value=False)
+        self.update_cost = BooleanVar(value=False)
+        self.update_title = BooleanVar(value=False)
+        self.update_description = BooleanVar(value=False)
+        self.update_images = BooleanVar(value=False)
+        self.update_category_fields = BooleanVar(value=False)
+        self.update_vendor = BooleanVar(value=False)
+        self.update_weight = BooleanVar(value=False)
+        self.update_barcode = BooleanVar(value=False)
+        self.update_application = BooleanVar(value=False)
+
+        self.scrape_search_url = StringVar(value="")
+        self.scrape_workers = StringVar(value="3")
+        self.scrape_delay = StringVar(value="0.35")
+        self.scrape_retries = StringVar(value="2")
+        self.scrape_headless = BooleanVar(value=True)
+        self.scrape_images = BooleanVar(value=True)
+        self.scrape_force = BooleanVar(value=False)
+
+        self.review_fields: dict[str, StringVar] = {
+            "title": StringVar(value=""),
+            "description_html": StringVar(value=""),
+            "media_urls": StringVar(value=""),
+            "price": StringVar(value=""),
+            "cost": StringVar(value=""),
+            "inventory": StringVar(value="3000000"),
+            "sku": StringVar(value=""),
+            "barcode": StringVar(value=""),
+            "weight": StringVar(value=""),
+            "vendor": StringVar(value=""),
+            "type": StringVar(value=""),
+            "google_product_type": StringVar(value=""),
+            "category_code": StringVar(value=""),
+            "product_subtype": StringVar(value=""),
+            "mpn": StringVar(value=""),
+            "brand": StringVar(value=""),
+            "application": StringVar(value=""),
+        }
+        self.review_index_text = StringVar(value="Product 0 / 0")
+        self.review_cost_rule_text = StringVar(value="")
+        self.review_cost_options: list[DiscountMatch] = []
+        self.review_cost_option_map: dict[str, DiscountMatch] = {}
+        self.vendor_discounts_df: pd.DataFrame | None = None
+        self.review_refresh_pending = False
+        self.review_refresh_inflight = False
+        self.review_table_refresh_job: str | None = None
+        self.review_loaded_raw: dict[str, str] = {}
+        self.review_loaded_display: dict[str, str] = {}
+        self.review_loaded_truncated: dict[str, bool] = {}
+        self.review_cost_options_loaded_for_sku: str = ""
+        self.review_busy_spinner_job: str | None = None
+        self.review_busy_spinner_angle = 0
+        self.review_busy_active = False
+        self.create_existing_skus: set[str] = set()
+        self.create_duplicate_scope: tuple[str, ...] = ()
+        self._duplicate_check_request_id = 0
+        self._duplicate_check_inflight = False
+        self._duplicate_check_active_workers = 0
+        self._duplicate_check_pending_scope: tuple[str, ...] = ()
+        self._duplicate_check_started_at = 0.0
+        self.shopify_push_inflight = False
+        self.push_selected_skus: set[str] = set()
+
+        self._mode_initialized = False
+
+        self.run_mode.trace_add("write", self._on_run_mode_changed)
+
+        self._create_layout()
+        self._initialize_shopify_cache_state()
+        self._load_settings()
+        self._on_run_mode_changed()
+        self._refresh_vendor_sheet_ui()
+        self._refresh_input_metrics()
+        self._mode_initialized = True
+        self._update_tab_access()
+        self._start_background_api_bootstrap()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _create_layout(self) -> None:
+        root_frame = ttk.Frame(self.root, padding=12)
+        root_frame.pack(fill=BOTH, expand=True)
+
+        header_frame = ttk.Frame(root_frame)
+        header_frame.pack(fill=X, pady=(0, 6))
+        logo_path = self.runtime_data_root / "logo.png"
+        if logo_path.exists():
+            try:
+                target_width = 550
+                try:
+                    from PIL import Image, ImageTk
+
+                    with Image.open(logo_path) as src:
+                        src_w, src_h = src.size
+                        safe_w = max(1, int(src_w))
+                        safe_h = max(1, int(src_h))
+                        target_height = max(1, int(round((safe_h * target_width) / safe_w)))
+                        resized = src.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                        self._header_logo_image = ImageTk.PhotoImage(resized)
+                except Exception:
+                    logo_image = tk.PhotoImage(file=str(logo_path))
+                    width = max(1, int(logo_image.width()))
+                    if width > target_width:
+                        scale_down = max(1, int(round(width / target_width)))
+                        logo_image = logo_image.subsample(scale_down, scale_down)
+                    elif width < target_width:
+                        scale_up = max(1, int(round(target_width / width)))
+                        logo_image = logo_image.zoom(scale_up, scale_up)
+                    self._header_logo_image = logo_image
+            except Exception:
+                self._header_logo_image = None
+        if self._header_logo_image is not None:
+            ttk.Label(header_frame, image=self._header_logo_image).pack(anchor="center")
+        else:
+            ttk.Label(header_frame, text="Product Prospector", font=("Segoe UI", 19, "bold")).pack(anchor="center")
+
+        api_frame = ttk.Frame(root_frame)
+        api_frame.pack(anchor="center", pady=(0, 8))
+        ttk.Label(api_frame, text="API Connections:", font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 10))
+        self.shopify_dot = Canvas(api_frame, width=16, height=16, highlightthickness=0, bd=0)
+        self.shopify_dot.pack(side=LEFT)
+        self.shopify_status_label = ttk.Label(api_frame, text="Shopify - Not Connected")
+        self.shopify_status_label.pack(side=LEFT, padx=(6, 0))
+        self.shopify_cache_api_text = StringVar(value="")
+        self.shopify_cache_api_spinner = Canvas(api_frame, width=16, height=16, highlightthickness=0, bd=0)
+        self.shopify_cache_api_label = ttk.Label(api_frame, textvariable=self.shopify_cache_api_text, foreground="#1f4e79")
+        self.shopify_connect_button = ttk.Button(api_frame, text="Connect", command=self._connect_shopify_clicked)
+        self.shopify_connect_button.pack(side=LEFT, padx=(12, 0))
+        self._draw_shopify_dot(state="disconnected")
+
+        self.notebook = ttk.Notebook(root_frame)
+        self.notebook.pack(fill=BOTH, expand=True)
+
+        self.tab_setup = ttk.Frame(self.notebook)
+        self.tab_preview = ttk.Frame(self.notebook)
+        self.tab_export = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.tab_setup, text="1) Setup")
+        self.notebook.add(self.tab_preview, text="2) Processing")
+        self.notebook.add(self.tab_export, text="3) Review & Export")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed, add="+")
+
+        self._build_setup_tab()
+        self._build_preview_tab()
+        self._build_export_tab()
+
+    def _set_window_icon(self) -> None:
+        icon_path = self.runtime_data_root / "icon.ico"
+        if not icon_path.exists():
+            return
+        try:
+            self.root.iconbitmap(default=str(icon_path))
+        except Exception:
+            return
+
+    def _build_setup_tab(self) -> None:
+        self.setup_canvas = Canvas(self.tab_setup, highlightthickness=0, bd=0)
+        self.setup_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.setup_scrollbar = ttk.Scrollbar(self.tab_setup, orient=VERTICAL, command=self.setup_canvas.yview)
+        self.setup_scrollbar.pack(side=RIGHT, fill=Y)
+        self.setup_canvas.configure(yscrollcommand=self.setup_scrollbar.set)
+
+        self.setup_inner = ttk.Frame(self.setup_canvas, padding=10)
+        self._setup_inner_id = self.setup_canvas.create_window((0, 0), window=self.setup_inner, anchor="nw")
+        self.setup_inner.bind(
+            "<Configure>",
+            lambda _event: self.setup_canvas.configure(scrollregion=self.setup_canvas.bbox("all")),
+        )
+        self.setup_canvas.bind(
+            "<Configure>",
+            lambda event: self.setup_canvas.itemconfigure(self._setup_inner_id, width=event.width),
+        )
+
+        self.mode_area = ttk.Frame(self.setup_inner)
+        self.mode_area.pack(fill=X, pady=(0, 8))
+
+        self.mode_selector_wrap = ttk.LabelFrame(self.mode_area, text="Run Mode", padding=8)
+        self.mode_selector_wrap.pack(fill=X)
+        ttk.Radiobutton(
+            self.mode_selector_wrap,
+            text="Update Existing Products",
+            variable=self.run_mode,
+            value=RUN_MODE_UPDATE,
+        ).pack(anchor=W, pady=2)
+        ttk.Radiobutton(
+            self.mode_selector_wrap,
+            text="Create New Products",
+            variable=self.run_mode,
+            value=RUN_MODE_CREATE,
+        ).pack(anchor=W, pady=2)
+
+        self.mode_summary_wrap = ttk.Frame(self.mode_area)
+        ttk.Label(self.mode_summary_wrap, textvariable=self.run_mode_summary_text, font=("Segoe UI", 13, "bold")).pack(
+            side=LEFT
+        )
+        ttk.Button(self.mode_summary_wrap, text="Change", command=self._unlock_run_mode).pack(side=LEFT, padx=(10, 0))
+
+        input_box = ttk.LabelFrame(self.setup_inner, text="SKUs In Scope", padding=8)
+        input_box.pack(fill=X, pady=(0, 8))
+        ttk.Label(input_box, textvariable=self.sku_scope_help_text).pack(anchor=W)
+
+        self.text_input_wrap = ttk.Frame(input_box)
+        self.text_input_wrap.pack(fill=X, pady=(6, 6))
+        ttk.Label(
+            self.text_input_wrap,
+            text="Paste SKUs using any delimiter: comma, space, |, or line break.",
+        ).pack(anchor=W)
+        self.sku_text_widget = tk.Text(self.text_input_wrap, height=6, wrap="word")
+        self.sku_text_widget.pack(fill=X, pady=(6, 6))
+        paste_btn_row = ttk.Frame(self.text_input_wrap)
+        paste_btn_row.pack(fill=X)
+        self.load_pasted_btn = ttk.Button(paste_btn_row, text="Load Pasted SKUs", command=self._load_pasted_skus)
+        self.load_pasted_btn.pack(side=LEFT)
+        self.clear_pasted_btn = ttk.Button(paste_btn_row, text="Clear", command=self._clear_pasted_skus)
+        self.clear_pasted_btn.pack(side=LEFT, padx=(8, 0))
+        ttk.Label(paste_btn_row, textvariable=self.sku_text_status, foreground="#1f4e79").pack(side=LEFT, padx=(12, 0))
+
+        self.use_all_sheet_check = ttk.Checkbutton(
+            input_box,
+            text="Use all SKUs from uploaded spreadsheet",
+            variable=self.use_all_sheet_skus,
+            command=self._on_use_all_sheet_toggle,
+        )
+        self.use_all_sheet_check.pack(anchor=W, pady=(0, 6))
+
+        self.spreadsheet_input_wrap = ttk.Frame(input_box)
+        self.spreadsheet_input_wrap.pack(fill=X)
+        self.load_sheet_btn = ttk.Button(
+            self.spreadsheet_input_wrap,
+            text="Load Vendor Price Sheet (CSV/XLSX)",
+            command=self._load_vendor_file,
+        )
+        self.load_sheet_btn.pack(side=LEFT)
+        ttk.Label(self.spreadsheet_input_wrap, textvariable=self.vendor_path).pack(side=LEFT, padx=(10, 0))
+        ttk.Label(
+            input_box,
+            text="If loaded, spreadsheet values are used for in-scope SKUs and scraper fills only missing fields.",
+            foreground="#1f4e79",
+        ).pack(anchor=W, pady=(6, 0))
+
+        self.vendor_mapping_wrap = ttk.LabelFrame(self.setup_inner, text="Vendor Mapping", padding=8)
+        mapping_grid = ttk.Frame(self.vendor_mapping_wrap)
+        mapping_grid.pack(fill=X)
+        mapping_grid.columnconfigure(0, weight=1)
+        mapping_grid.columnconfigure(1, weight=1)
+
+        self.vendor_vendor_combo = self._combo_row(mapping_grid, "Vendor", self.vendor_vendor_column, 0, column=0)
+        self.vendor_title_combo = self._combo_row(mapping_grid, "Title", self.vendor_title_column, 1, column=0)
+        self.vendor_desc_combo = self._combo_row(mapping_grid, "Description", self.vendor_description_column, 2, column=0)
+        self.vendor_image_combo = self._combo_row(mapping_grid, "Media", self.vendor_image_column, 3, column=0)
+        self.vendor_price_combo = self._combo_row(mapping_grid, "Price", self.vendor_price_column, 4, column=0)
+
+        self.vendor_cost_combo = self._combo_row(mapping_grid, "Cost", self.vendor_cost_column, 0, column=1)
+        self.vendor_sku_combo = self._combo_row(mapping_grid, "SKU (required)", self.vendor_sku_column, 1, column=1)
+        self.vendor_sku_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_vendor_sku_mapping_changed())
+        self.vendor_barcode_combo = self._combo_row(mapping_grid, "Barcode", self.vendor_barcode_column, 2, column=1)
+        self.vendor_weight_combo = self._combo_row(mapping_grid, "Weight", self.vendor_weight_column, 3, column=1)
+        self.vendor_fitment_combo = self._combo_row(mapping_grid, "Application", self.vendor_fitment_column, 4, column=1)
+
+        vendor_btn_row = ttk.Frame(self.vendor_mapping_wrap)
+        vendor_btn_row.pack(anchor=W, pady=(8, 0))
+        self.auto_suggest_btn = ttk.Button(vendor_btn_row, text="Auto Suggest Vendor", command=self._auto_suggest_vendor)
+        self.auto_suggest_btn.pack(side=LEFT, padx=(0, 8))
+        self.stitch_btn = ttk.Button(vendor_btn_row, text="Stitch Vendor Rows", command=self._stitch_vendor_rows)
+        self.stitch_btn.pack(side=LEFT)
+        ttk.Label(
+            self.vendor_mapping_wrap,
+            text="Unmapped fields are allowed and can be filled by defaults/rules later.",
+            foreground="#1f4e79",
+        ).pack(anchor=W, pady=(6, 0))
+
+        self.vendor_preview_wrap = ttk.LabelFrame(self.setup_inner, text="Vendor Input Preview", padding=8)
+        self.vendor_preview = self._create_tree(self.vendor_preview_wrap, height_rows=10, expand=False, fill_mode=BOTH)
+
+        self.update_fields_wrap = ttk.LabelFrame(self.setup_inner, text="Fields To Update (Update Mode)", padding=8)
+        update_grid = ttk.Frame(self.update_fields_wrap)
+        update_grid.pack(fill=X)
+        ttk.Checkbutton(update_grid, text="Title", variable=self.update_title).grid(row=0, column=0, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Price", variable=self.update_price).grid(row=0, column=1, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Cost", variable=self.update_cost).grid(row=0, column=2, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Description", variable=self.update_description).grid(row=1, column=0, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Images", variable=self.update_images).grid(row=1, column=1, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Category Fields", variable=self.update_category_fields).grid(row=1, column=2, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Vendor", variable=self.update_vendor).grid(row=2, column=0, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Weight", variable=self.update_weight).grid(row=2, column=1, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Barcode", variable=self.update_barcode).grid(row=2, column=2, sticky=W, padx=(0, 16))
+        ttk.Checkbutton(update_grid, text="Application", variable=self.update_application).grid(row=3, column=0, sticky=W, padx=(0, 16))
+        ttk.Label(
+            self.update_fields_wrap,
+            text="Checked fields are the only fields that will be updated on matching Shopify products.",
+            foreground="#1f4e79",
+        ).pack(anchor=W, pady=(6, 0))
+
+        ttk.Label(self.setup_inner, textvariable=self.input_metrics_text, foreground="#1f4e79").pack(anchor=W)
+        ttk.Label(self.setup_inner, textvariable=self.source_status_text, foreground="#1f4e79").pack(anchor=W, pady=(2, 8))
+        self.duplicate_status_wrap = ttk.Frame(self.setup_inner)
+        self.duplicate_status_wrap.pack(fill=X, pady=(0, 2))
+        ttk.Label(self.duplicate_status_wrap, textvariable=self.duplicate_check_text, foreground="#1f4e79").pack(anchor=W)
+        self.duplicate_check_progress = ttk.Progressbar(
+            self.duplicate_status_wrap,
+            mode="determinate",
+            length=420,
+            maximum=100,
+            value=0,
+        )
+        self.rules_status = ttk.Label(self.setup_inner, text="", foreground="#1f4e79")
+        self.rules_status.pack(anchor=W)
+
+        self.setup_status = ttk.Label(self.setup_inner, textvariable=self.setup_status_text, foreground="#1f4e79")
+        self.setup_status.pack(anchor=W)
+
+        continue_row = ttk.Frame(self.setup_inner)
+        continue_row.pack(fill=X, pady=(6, 6))
+        self.setup_continue_btn = ttk.Button(
+            continue_row,
+            text="Save & Continue to Scraping",
+            command=self._continue_from_setup,
+        )
+        self.setup_continue_btn.pack(side=LEFT)
+        self.setup_mode_widgets = [
+            self.use_all_sheet_check,
+            self.load_sheet_btn,
+            self.load_pasted_btn,
+            self.clear_pasted_btn,
+            self.vendor_vendor_combo,
+            self.vendor_title_combo,
+            self.vendor_desc_combo,
+            self.vendor_image_combo,
+            self.vendor_price_combo,
+            self.vendor_cost_combo,
+            self.vendor_sku_combo,
+            self.vendor_barcode_combo,
+            self.vendor_weight_combo,
+            self.vendor_fitment_combo,
+            self.auto_suggest_btn,
+            self.stitch_btn,
+            self.setup_continue_btn,
+        ]
+        self._refresh_sku_action_labels()
+        self._set_duplicate_check_busy(False)
+        self._refresh_mode_lock_ui()
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        try:
+            current = self.notebook.select()
+            if current == str(self.tab_setup):
+                self.setup_canvas.yview_moveto(0)
+                return
+            if current == str(self.tab_preview) and hasattr(self, "preview_canvas"):
+                self.preview_canvas.yview_moveto(0)
+                return
+            if current == str(self.tab_export) and hasattr(self, "export_canvas"):
+                self._ensure_review_ready()
+                self.export_canvas.yview_moveto(0)
+        except Exception:
+            return
+
+    def _ensure_review_ready(self) -> None:
+        if not self.review_refresh_pending or self.review_refresh_inflight:
+            return
+        self.review_refresh_inflight = True
+        self.review_status_text.set("Loading review data...")
+        self.root.after(1, self._finish_review_refresh)
+
+    def _finish_review_refresh(self) -> None:
+        try:
+            self._refresh_review_tab()
+            self.review_refresh_pending = False
+        finally:
+            self.review_refresh_inflight = False
+
+    def _open_review_tab(self) -> None:
+        self.notebook.select(2)
+        self._ensure_review_ready()
+
+    def _cancel_review_table_refresh(self) -> None:
+        if self.review_table_refresh_job is None:
+            return
+        try:
+            self.root.after_cancel(self.review_table_refresh_job)
+        except Exception:
+            pass
+        self.review_table_refresh_job = None
+
+    def _schedule_review_table_refresh(self) -> None:
+        self._cancel_review_table_refresh()
+        try:
+            self.review_table_refresh_job = self.root.after(25, self._refresh_review_table_async)
+        except Exception:
+            self.review_table_refresh_job = None
+
+    def _refresh_review_table_async(self) -> None:
+        self.review_table_refresh_job = None
+        products = self.session.products or []
+        if not products:
+            self.push_selected_skus = set()
+            _tree_show_dataframe(self.review_table, pd.DataFrame())
+            return
+
+        available = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
+        self.push_selected_skus = {sku for sku in self.push_selected_skus if sku in available}
+        if not self.push_selected_skus and available:
+            self.push_selected_skus = set(available)
+
+        # Keep review grid lightweight to avoid UI lockups on large/long text payloads.
+        rows: list[dict[str, str]] = []
+        for product in products[:120]:
+            sku = normalize_sku(getattr(product, "sku", ""))
+            rows.append(
+                {
+                    "push": "[x]" if sku and sku in self.push_selected_skus else "[ ]",
+                    "sku": str(product.sku or ""),
+                    "title": str(product.title or ""),
+                    "price": str(product.price or ""),
+                    "cost": str(product.cost or ""),
+                    "vendor": str(product.vendor or ""),
+                    "type": str(product.type or ""),
+                    "google_product_type": str(product.google_product_type or ""),
+                    "category_code": str(product.category_code or ""),
+                    "product_subtype": str(product.product_subtype or ""),
+                    "application": str(product.application or ""),
+                    "scrape_status": str(product.scrape_status or ""),
+                }
+            )
+        df = pd.DataFrame(rows)
+        _tree_show_dataframe(self.review_table, df, max_rows=120)
+
+    def _lock_run_mode(self) -> None:
+        self.run_mode_locked.set(True)
+        self._refresh_mode_lock_ui()
+
+    def _unlock_run_mode(self) -> None:
+        self.run_mode_locked.set(False)
+        self.session.reset_for_new_run()
+        self.push_selected_skus = set()
+        self.run_mode.set("")
+        self.setup_status_text.set("Run mode unlocked. Choose mode to continue.")
+        self.processing_status_text.set("")
+        self.review_status_text.set("")
+        self.review_refresh_pending = False
+        self.review_refresh_inflight = False
+        self._cancel_review_table_refresh()
+        self._hide_review_busy_overlay()
+        self.review_loaded_raw = {}
+        self.review_loaded_display = {}
+        self.review_loaded_truncated = {}
+        self.review_cost_options_loaded_for_sku = ""
+        if hasattr(self, "to_review_btn"):
+            self.to_review_btn.configure(state="disabled")
+        self._update_tab_access()
+        self._refresh_mode_lock_ui()
+
+    def _refresh_mode_lock_ui(self) -> None:
+        mode_name = self.run_mode.get().strip()
+        display_mode_map = {
+            RUN_MODE_UPDATE: "Update Existing Products",
+            RUN_MODE_CREATE: "Create New Products",
+        }
+        display_mode = display_mode_map.get(mode_name, "Not Selected")
+        self.run_mode_summary_text.set(f"Run Mode - {display_mode}")
+        if self.run_mode_locked.get():
+            self.mode_selector_wrap.pack_forget()
+            self.mode_summary_wrap.pack(fill=X)
+            return
+        self.mode_summary_wrap.pack_forget()
+        self.mode_selector_wrap.pack(fill=X)
+
+    def _build_preview_tab(self) -> None:
+        self.preview_canvas = Canvas(self.tab_preview, highlightthickness=0, bd=0)
+        self.preview_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.preview_scrollbar = ttk.Scrollbar(self.tab_preview, orient=VERTICAL, command=self.preview_canvas.yview)
+        self.preview_scrollbar.pack(side=RIGHT, fill=Y)
+        self.preview_canvas.configure(yscrollcommand=self.preview_scrollbar.set)
+
+        self.preview_inner = ttk.Frame(self.preview_canvas, padding=10)
+        self._preview_inner_id = self.preview_canvas.create_window((0, 0), window=self.preview_inner, anchor="nw")
+        self.preview_inner.bind(
+            "<Configure>",
+            lambda _event: self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")),
+        )
+        self.preview_canvas.bind(
+            "<Configure>",
+            lambda event: self.preview_canvas.itemconfigure(self._preview_inner_id, width=event.width),
+        )
+
+        settings_wrap = ttk.LabelFrame(self.preview_inner, text="Scraper Settings", padding=8)
+        settings_wrap.pack(fill=X, pady=(0, 8))
+
+        ttk.Label(settings_wrap, text="Vendor Search URL", width=24).grid(row=0, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Entry(settings_wrap, textvariable=self.scrape_search_url).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(settings_wrap, text="Chrome Workers", width=24).grid(row=1, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Entry(settings_wrap, textvariable=self.scrape_workers, width=12).grid(row=1, column=1, sticky=W, pady=3)
+        ttk.Label(settings_wrap, text="Delay Between Requests", width=24).grid(row=2, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Entry(settings_wrap, textvariable=self.scrape_delay, width=12).grid(row=2, column=1, sticky=W, pady=3)
+        ttk.Label(settings_wrap, text="Retry Count", width=24).grid(row=3, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Entry(settings_wrap, textvariable=self.scrape_retries, width=12).grid(row=3, column=1, sticky=W, pady=3)
+        settings_wrap.columnconfigure(1, weight=1)
+
+        toggles = ttk.Frame(settings_wrap)
+        toggles.grid(row=4, column=0, columnspan=2, sticky=W, pady=(6, 0))
+        ttk.Checkbutton(toggles, text="Headless Mode", variable=self.scrape_headless).pack(side=LEFT, padx=(0, 12))
+        ttk.Checkbutton(toggles, text="Scrape Images", variable=self.scrape_images).pack(side=LEFT, padx=(0, 12))
+        ttk.Checkbutton(toggles, text="Force Scrape", variable=self.scrape_force).pack(side=LEFT, padx=(0, 12))
+
+        action_row = ttk.Frame(self.preview_inner)
+        action_row.pack(fill=X, pady=(0, 8))
+        self.start_processing_btn = ttk.Button(action_row, text="Start Processing", command=self._start_processing_clicked)
+        self.start_processing_btn.pack(side=LEFT)
+        self.to_review_btn = ttk.Button(
+            action_row,
+            text="Continue to Review",
+            command=self._open_review_tab,
+            state="disabled",
+        )
+        self.to_review_btn.pack(side=LEFT, padx=(8, 0))
+
+        self.processing_status = ttk.Label(self.preview_inner, textvariable=self.processing_status_text, foreground="#1f4e79")
+        self.processing_status.pack(anchor=W, pady=(0, 8))
+
+        run_preview_wrap = ttk.LabelFrame(self.preview_inner, text="Processing Output Preview", padding=8)
+        run_preview_wrap.pack(fill=X, pady=(0, 8))
+        self.processing_preview = self._create_tree(run_preview_wrap, height_rows=11, expand=False, fill_mode=X)
+        self.processing_preview.configure(selectmode="none", takefocus=0)
+        self.processing_preview.bind("<Button-1>", lambda _event: "break", add="+")
+        self.processing_preview.bind("<ButtonRelease-1>", lambda _event: "break", add="+")
+        self.processing_preview.bind("<Double-1>", lambda _event: "break", add="+")
+
+    def _build_export_tab(self) -> None:
+        self.export_canvas = Canvas(self.tab_export, highlightthickness=0, bd=0)
+        self.export_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.export_scrollbar = ttk.Scrollbar(self.tab_export, orient=VERTICAL, command=self.export_canvas.yview)
+        self.export_scrollbar.pack(side=RIGHT, fill=Y)
+        self.export_canvas.configure(yscrollcommand=self.export_scrollbar.set)
+
+        self.export_inner = ttk.Frame(self.export_canvas, padding=10)
+        self._export_inner_id = self.export_canvas.create_window((0, 0), window=self.export_inner, anchor="nw")
+        self.export_inner.bind(
+            "<Configure>",
+            lambda _event: self.export_canvas.configure(scrollregion=self.export_canvas.bbox("all")),
+        )
+        self.export_canvas.bind(
+            "<Configure>",
+            lambda event: self.export_canvas.itemconfigure(self._export_inner_id, width=event.width),
+        )
+
+        nav_row = ttk.Frame(self.export_inner)
+        nav_row.pack(fill=X, pady=(0, 8))
+        ttk.Button(nav_row, text="Previous", command=self._review_prev).pack(side=LEFT)
+        ttk.Button(nav_row, text="Next", command=self._review_next).pack(side=LEFT, padx=(8, 0))
+        ttk.Label(nav_row, textvariable=self.review_index_text).pack(side=LEFT, padx=(12, 0))
+
+        form_wrap = ttk.LabelFrame(self.export_inner, text="Product Review", padding=8)
+        form_wrap.pack(fill=X, pady=(0, 8))
+        form_grid = ttk.Frame(form_wrap)
+        form_grid.pack(fill=X)
+        form_grid.columnconfigure(1, weight=1)
+        form_grid.columnconfigure(3, weight=1)
+
+        self._review_entry_row(form_grid, "Title", "title", 0, 0)
+        self._review_entry_row(form_grid, "Description", "description_html", 1, 0)
+        self._review_entry_row(form_grid, "Media URLs", "media_urls", 2, 0)
+        self._review_entry_row(form_grid, "Price", "price", 3, 0)
+        self._review_cost_row(form_grid, 4, 0)
+        self._review_entry_row(form_grid, "Inventory", "inventory", 5, 0)
+        self._review_entry_row(form_grid, "SKU", "sku", 6, 0)
+        self._review_entry_row(form_grid, "Barcode", "barcode", 7, 0)
+        self._review_entry_row(form_grid, "Weight", "weight", 8, 0)
+
+        self._review_entry_row(form_grid, "Vendor", "vendor", 0, 2)
+        self._review_entry_row(form_grid, "Type", "type", 1, 2)
+        self._review_entry_row(form_grid, "Google Product Type", "google_product_type", 2, 2)
+        self._review_entry_row(form_grid, "Category Type", "category_code", 3, 2)
+        self._review_entry_row(form_grid, "Product Subtype", "product_subtype", 4, 2)
+        self._review_entry_row(form_grid, "MPN", "mpn", 5, 2)
+        self._review_entry_row(form_grid, "Brand", "brand", 6, 2)
+        self._review_entry_row(form_grid, "Application", "application", 7, 2)
+
+        table_wrap = ttk.LabelFrame(self.export_inner, text="All Products", padding=8)
+        table_wrap.pack(fill=BOTH, expand=True)
+        self.review_table = self._create_tree(table_wrap)
+        self.review_table.bind("<ButtonRelease-1>", self._on_review_table_click, add="+")
+        table_action_row = ttk.Frame(self.export_inner)
+        table_action_row.pack(fill=X, pady=(4, 0))
+        ttk.Button(table_action_row, text="Load All Products Preview", command=self._refresh_review_table_async).pack(side=LEFT)
+        ttk.Button(table_action_row, text="Select All for Push", command=self._select_all_for_push).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(table_action_row, text="Clear Push Selection", command=self._clear_push_selection).pack(side=LEFT, padx=(8, 0))
+        ttk.Label(table_action_row, text="Click the [x]/[ ] cell in the Push column to toggle rows.", foreground="#1f4e79").pack(side=LEFT, padx=(10, 0))
+
+        remap_wrap = ttk.LabelFrame(self.export_inner, text="Remap Fields (Optional)", padding=8)
+        remap_wrap.pack(fill=X, pady=(8, 0))
+        remap_grid = ttk.Frame(remap_wrap)
+        remap_grid.pack(fill=X)
+        remap_grid.columnconfigure(0, weight=1)
+        remap_grid.columnconfigure(1, weight=1)
+
+        self.remap_vendor_combo = self._combo_row(remap_grid, "Vendor", self.vendor_vendor_column, 0, column=0)
+        self.remap_title_combo = self._combo_row(remap_grid, "Title", self.vendor_title_column, 1, column=0)
+        self.remap_desc_combo = self._combo_row(remap_grid, "Description", self.vendor_description_column, 2, column=0)
+        self.remap_media_combo = self._combo_row(remap_grid, "Media", self.vendor_image_column, 3, column=0)
+        self.remap_price_combo = self._combo_row(remap_grid, "Price", self.vendor_price_column, 4, column=0)
+        self.remap_cost_combo = self._combo_row(remap_grid, "Cost", self.vendor_cost_column, 0, column=1)
+        self.remap_sku_combo = self._combo_row(remap_grid, "SKU (required)", self.vendor_sku_column, 1, column=1)
+        self.remap_barcode_combo = self._combo_row(remap_grid, "Barcode", self.vendor_barcode_column, 2, column=1)
+        self.remap_weight_combo = self._combo_row(remap_grid, "Weight", self.vendor_weight_column, 3, column=1)
+        self.remap_application_combo = self._combo_row(remap_grid, "Application", self.vendor_fitment_column, 4, column=1)
+        remap_action = ttk.Frame(remap_wrap)
+        remap_action.pack(fill=X, pady=(6, 0))
+        ttk.Button(remap_action, text="Apply Remap & Reprocess", command=self._reprocess_from_review).pack(side=LEFT)
+
+        self.export_status = ttk.Label(self.export_inner, textvariable=self.review_status_text, foreground="#1f4e79")
+        self.export_status.pack(anchor=W, pady=(6, 0))
+
+        export_row = ttk.Frame(self.export_inner)
+        export_row.pack(fill=X, pady=(8, 0))
+        ttk.Button(export_row, text="Save Current", command=self._save_current_review_product).pack(side=LEFT)
+        ttk.Button(export_row, text="Generate CSV", command=self._export_review_products).pack(side=LEFT, padx=(8, 0))
+        self.push_shopify_btn = ttk.Button(export_row, text="Push to Shopify", command=self._push_to_shopify_clicked)
+        self.push_shopify_btn.pack(side=LEFT, padx=(8, 0))
+        self._refresh_push_button_state()
+
+        # Review overlay blocks interaction during remap/reprocess and shows spinner progress state.
+        self.review_busy_overlay = tk.Frame(self.tab_export, bg="#9CA3AF", highlightthickness=0, bd=0)
+        self.review_busy_overlay.bind("<Button-1>", lambda _event: "break", add="+")
+        self.review_busy_overlay.bind("<ButtonRelease-1>", lambda _event: "break", add="+")
+        self.review_busy_overlay.bind("<Double-1>", lambda _event: "break", add="+")
+        self.review_busy_overlay.bind("<MouseWheel>", lambda _event: "break", add="+")
+
+        overlay_card = tk.Frame(self.review_busy_overlay, bg="#F3F4F6", padx=18, pady=14, relief="ridge", bd=1)
+        overlay_card.place(relx=0.5, rely=0.5, anchor="center")
+        self.review_busy_spinner = Canvas(overlay_card, width=18, height=18, highlightthickness=0, bd=0, bg="#F3F4F6")
+        self.review_busy_spinner.pack(side=LEFT)
+        self.review_busy_text = StringVar(value="Reprocessing...")
+        tk.Label(
+            overlay_card,
+            textvariable=self.review_busy_text,
+            bg="#F3F4F6",
+            fg="#111827",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side=LEFT, padx=(10, 0))
+
+    def _combo_row(self, parent, label: str, variable: StringVar, row: int, column: int = 0) -> ttk.Combobox:
+        frame = ttk.Frame(parent)
+        pad_x = (0, 8) if column == 0 else (8, 0)
+        frame.grid(row=row, column=column, sticky="ew", padx=pad_x, pady=3)
+        ttk.Label(frame, text=label, width=24).pack(side=LEFT)
+        combo = ttk.Combobox(frame, textvariable=variable, state="readonly", width=44)
+        combo.pack(side=LEFT, fill=X, expand=True)
+        return combo
+
+    def _create_tree(
+        self,
+        parent,
+        height_rows: int = 12,
+        expand: bool = True,
+        fill_mode=BOTH,
+    ) -> ttk.Treeview:
+        container = ttk.Frame(parent)
+        container.pack(fill=fill_mode, expand=expand)
+        tree = ttk.Treeview(container, show="headings", height=height_rows)
+        y_scroll = ttk.Scrollbar(container, orient=VERTICAL, command=tree.yview)
+        x_scroll = ttk.Scrollbar(container, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        container.columnconfigure(0, weight=1)
+        if expand:
+            container.rowconfigure(0, weight=1)
+        tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        return tree
+
+    def _review_entry_row(self, parent, label: str, field_name: str, row: int, col_offset: int) -> None:
+        ttk.Label(parent, text=label, width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        ttk.Entry(parent, textvariable=self.review_fields[field_name]).grid(
+            row=row,
+            column=col_offset + 1,
+            sticky="ew",
+            padx=(0, 12),
+            pady=2,
+        )
+
+    def _review_cost_row(self, parent, row: int, col_offset: int) -> None:
+        ttk.Label(parent, text="Cost", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
+        frame.columnconfigure(1, weight=1)
+        ttk.Entry(frame, textvariable=self.review_fields["cost"], width=16).grid(row=0, column=0, sticky=W, padx=(0, 6))
+        self.review_cost_rule_combo = ttk.Combobox(
+            frame,
+            textvariable=self.review_cost_rule_text,
+            state="readonly",
+        )
+        self.review_cost_rule_combo.grid(row=0, column=1, sticky="ew")
+        self.review_cost_rule_combo.bind("<<ComboboxSelected>>", self._on_review_cost_rule_selected, add="+")
+        self.review_cost_rule_combo.bind("<Button-1>", self._on_review_cost_dropdown_open, add="+")
+        self.review_cost_rule_combo.configure(values=())
+        self.review_cost_rule_combo.configure(state="disabled")
+
+    def _parse_float_value(self, value: object) -> float | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        cleaned = re.sub(r"[^0-9.\-]", "", text.replace(",", ""))
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+
+    def _load_vendor_discounts_cached(self) -> pd.DataFrame:
+        if self.vendor_discounts_df is not None:
+            return self.vendor_discounts_df
+        discount_file = find_vendor_discount_file(self.required_root)
+        if discount_file is None:
+            self.vendor_discounts_df = pd.DataFrame()
+            return self.vendor_discounts_df
+        try:
+            self.vendor_discounts_df = load_vendor_discounts(discount_file)
+        except Exception:
+            self.vendor_discounts_df = pd.DataFrame()
+        return self.vendor_discounts_df
+
+    def _refresh_review_cost_rule_options(self, product) -> None:
+        if not hasattr(self, "review_cost_rule_combo"):
+            return
+        raw_vendor = str(getattr(product, "vendor", "") or "").strip()
+        normalized_vendor = normalize_vendor_from_rules(raw_vendor, required_root=self.required_root)
+        profile = resolve_vendor_profile(normalized_vendor or raw_vendor, required_root=self.required_root)
+        vendor_for_discount = (
+            (profile.discount_vendor_key if profile is not None else "")
+            or normalized_vendor
+            or raw_vendor
+        )
+        vendor_label = (
+            (profile.canonical_vendor if profile is not None else "")
+            or normalized_vendor
+            or raw_vendor
+            or "No vendor"
+        )
+
+        discount_df = self._load_vendor_discounts_cached()
+        options = resolve_discount_candidates(
+            discounts_df=discount_df,
+            vendor_name=vendor_for_discount,
+            product_title=str(getattr(product, "title", "") or ""),
+            product_type=str(getattr(product, "type", "") or ""),
+        )
+        if not options and raw_vendor and vendor_for_discount.lower() != raw_vendor.lower():
+            options = resolve_discount_candidates(
+                discounts_df=discount_df,
+                vendor_name=raw_vendor,
+                product_title=str(getattr(product, "title", "") or ""),
+                product_type=str(getattr(product, "type", "") or ""),
+            )
+
+        self.review_cost_options = options
+        self.review_cost_option_map = {item.vendor_label: item for item in options}
+        option_labels = [item.vendor_label for item in options]
+        self.review_cost_rule_combo.configure(values=option_labels)
+
+        if option_labels:
+            self.review_cost_rule_combo.configure(state="readonly")
+            if self.review_cost_rule_text.get() not in option_labels:
+                self.review_cost_rule_text.set(vendor_label)
+            return
+
+        self.review_cost_rule_text.set(vendor_label)
+        self.review_cost_rule_combo.configure(state="disabled")
+
+    def _on_review_cost_rule_selected(self, _event=None) -> None:
+        selected = self.review_cost_rule_text.get().strip()
+        option = self.review_cost_option_map.get(selected)
+        if option is None:
+            return
+        price_value = self._parse_float_value(self.review_fields["price"].get())
+        if price_value is None:
+            messagebox.showwarning(APP_TITLE, "Cannot calculate cost because price is blank or invalid.")
+            return
+        cost_value = calculate_cost_from_price(price=price_value, discount_percent=option.discount_percent)
+        self.review_fields["cost"].set(f"{cost_value:.2f}")
+        self.review_status_text.set(
+            f"Applied discount {option.discount_percent:.2f}% from '{selected}' to calculate cost."
+        )
+
+    def _on_review_cost_dropdown_open(self, _event=None) -> None:
+        if not self.session.products:
+            return
+        if self.review_index < 0 or self.review_index >= len(self.session.products):
+            return
+        sku = str(self.session.products[self.review_index].sku or "").strip().upper()
+        if sku and self.review_cost_options_loaded_for_sku == sku and self.review_cost_option_map:
+            return
+        self._refresh_review_cost_rule_options(self.session.products[self.review_index])
+        self.review_cost_options_loaded_for_sku = sku
+
+    def _display_field_value(self, field_name: str, raw_value: str) -> tuple[str, bool]:
+        limits = {
+            "description_html": 4000,
+            "media_urls": 2500,
+            "application": 2000,
+        }
+        limit = limits.get(field_name)
+        if limit is None:
+            return raw_value, False
+        if len(raw_value) <= limit:
+            return raw_value, False
+        return raw_value[:limit] + " ... [truncated for display]", True
+
+    def _read_review_field(self, field_name: str) -> str:
+        current = self.review_fields[field_name].get().strip()
+        if self.review_loaded_truncated.get(field_name):
+            displayed = self.review_loaded_display.get(field_name, "").strip()
+            if current == displayed:
+                return self.review_loaded_raw.get(field_name, "").strip()
+        return current
+
+    def _start_processing_clicked(self, auto_open_review: bool = False) -> bool:
+        if self.processing_inflight:
+            return False
+        if not self.session.setup_complete:
+            messagebox.showwarning(APP_TITLE, "Complete Setup first.")
+            return False
+
+        try:
+            workers = max(int(float(self.scrape_workers.get().strip() or "1")), 1)
+            delay = max(float(self.scrape_delay.get().strip() or "0"), 0.0)
+            retries = max(int(float(self.scrape_retries.get().strip() or "0")), 0)
+        except Exception:
+            messagebox.showerror(APP_TITLE, "Invalid scraper settings. Use numeric values for workers/delay/retries.")
+            return False
+
+        self.session.scrape_settings.vendor_search_url = self.scrape_search_url.get().strip()
+        self.session.scrape_settings.chrome_workers = workers
+        self.session.scrape_settings.delay_seconds = delay
+        self.session.scrape_settings.retry_count = retries
+        self.session.scrape_settings.headless = bool(self.scrape_headless.get())
+        self.session.scrape_settings.scrape_images = bool(self.scrape_images.get())
+        self.session.scrape_settings.force_scrape = bool(self.scrape_force.get())
+
+        target_skus = collect_session_skus(self.session)
+        if not target_skus:
+            messagebox.showwarning(APP_TITLE, "No valid SKUs found in the current scope.")
+            return False
+
+        if self.session.missing_fields and not self.session.scrape_settings.vendor_search_url:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Missing fields require scraping. Set Vendor Search URL in Processing or complete mappings in Setup.",
+            )
+            return False
+
+        self._processing_request_id += 1
+        request_id = self._processing_request_id
+        self._auto_open_review_after_processing = bool(auto_open_review)
+        self._set_processing_busy(True)
+        self.processing_status_text.set(f"Processing {len(target_skus)} SKU(s) in background...")
+        try:
+            if hasattr(self, "preview_canvas"):
+                self.preview_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+        worker = threading.Thread(
+            target=self._run_processing_worker,
+            kwargs={"request_id": request_id, "target_skus": list(target_skus)},
+            daemon=True,
+        )
+        worker.start()
+        return True
+
+    def _set_processing_busy(self, busy: bool) -> None:
+        self.processing_inflight = busy
+        state = "disabled" if busy else "normal"
+        if hasattr(self, "start_processing_btn"):
+            self.start_processing_btn.configure(state=state)
+        if busy:
+            if hasattr(self, "to_review_btn"):
+                self.to_review_btn.configure(state="disabled")
+            return
+        self._hide_review_busy_overlay()
+        if hasattr(self, "to_review_btn") and self.session.processing_complete:
+            self.to_review_btn.configure(state="normal")
+
+    def _load_shopify_catalog_for_processing(self, target_skus: list[str]) -> tuple[pd.DataFrame | None, str | None]:
+        config = load_shopify_config()
+        if config is None:
+            return None, "Invalid config/shopify.json. Cannot sync Shopify catalog."
+
+        token = load_shopify_token()
+        if token is None:
+            self._connect_shopify_worker(allow_handshake=False)
+            token = load_shopify_token()
+        if token is None:
+            return None, "Shopify is not connected. Connect Shopify first and retry."
+
+        use_targeted = bool(target_skus)
+        if use_targeted:
+            df, error = fetch_shopify_catalog_for_skus(
+                config=config,
+                access_token=token.access_token,
+                skus=target_skus,
+            )
+            if not error and (df is None or df.empty):
+                df, error = fetch_shopify_catalog_dataframe(config=config, access_token=token.access_token)
+        else:
+            df, error = fetch_shopify_catalog_dataframe(config=config, access_token=token.access_token)
+        if error:
+            return None, error
+        return df if df is not None else pd.DataFrame(), None
+
+    def _scope_missing_media_for_scrape(self, target_skus: list[str]) -> bool:
+        if not target_skus:
+            return False
+        if self.session.vendor_df is None or self.session.vendor_df.empty:
+            return True
+
+        sku_column = (self.session.source_mapping.sku or "").strip()
+        media_column = (self.session.source_mapping.media or "").strip()
+        if not sku_column or not media_column:
+            return True
+        if sku_column not in self.session.vendor_df.columns or media_column not in self.session.vendor_df.columns:
+            return True
+
+        try:
+            working = self.session.vendor_df[[sku_column, media_column]].copy()
+            working["_norm_sku"] = working[sku_column].astype(str).map(normalize_sku)
+            working["_media_text"] = working[media_column].astype(str).map(lambda value: str(value).strip())
+            working = working[working["_norm_sku"] != ""]
+            if working.empty:
+                return True
+
+            has_media_by_sku = (
+                working.groupby("_norm_sku")["_media_text"]
+                .apply(lambda series: any(bool(item) for item in series))
+                .to_dict()
+            )
+            for sku in [normalize_sku(item) for item in target_skus if normalize_sku(item)]:
+                if not has_media_by_sku.get(sku, False):
+                    return True
+            return False
+        except Exception:
+            return True
+
+    def _run_processing_worker(self, request_id: int, target_skus: list[str]) -> None:
+        result_payload: dict[str, object] = {}
+        try:
+            existing_index: dict[str, dict[str, str]] = {}
+            shopify_df: pd.DataFrame | None = None
+            if self.session.mode == MODE_UPDATE:
+                shopify_df, catalog_error = self._load_shopify_catalog_for_processing(target_skus)
+                if catalog_error:
+                    raise RuntimeError(catalog_error)
+                existing_index = build_existing_shopify_index(shopify_df)
+
+            scrape_records: dict[str, dict[str, str]] = {}
+            scrape_sku_errors: dict[str, str] = {}
+            scrape_general_errors: list[str] = []
+            can_scrape = bool(self.session.scrape_settings.vendor_search_url and target_skus)
+            image_scrape_needed = bool(self.session.scrape_settings.scrape_images) and self._scope_missing_media_for_scrape(target_skus)
+            should_scrape = can_scrape and (
+                self.session.scrape_settings.force_scrape
+                or bool(self.session.missing_fields)
+                or image_scrape_needed
+            )
+            if should_scrape:
+                scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
+                    vendor_search_url=self.session.scrape_settings.vendor_search_url,
+                    skus=target_skus,
+                    workers=self.session.scrape_settings.chrome_workers,
+                    retry_count=self.session.scrape_settings.retry_count,
+                    delay_seconds=self.session.scrape_settings.delay_seconds,
+                    scrape_images=self.session.scrape_settings.scrape_images,
+                    image_output_root=self.runtime_root / "images",
+                )
+
+            products, build_stats = build_products_from_session(
+                session=self.session,
+                existing_shopify_index=existing_index,
+                scraped_records=scrape_records,
+            )
+
+            mapper = self.type_mapper
+            if mapper is None:
+                mapper = TypeCategoryMapper.from_required_root(self.required_root)
+
+            update_scope = set(self.session.update_fields or [])
+            allow_category_overwrite = self.session.mode == MODE_NEW or bool(
+                {"type", "google_product_type", "category_code", "product_subtype"}.intersection(update_scope)
+            )
+
+            normalized_products = []
+            for product in products:
+                normalized = normalize_product(
+                    product=product,
+                    required_root=self.required_root,
+                    mode=self.session.mode,
+                    update_fields=update_scope,
+                )
+                if self.session.mode == MODE_NEW or allow_category_overwrite:
+                    normalized = mapper.apply(
+                        product=normalized,
+                        allow_category_overwrite=allow_category_overwrite,
+                    )
+                normalized.finalize_defaults()
+                normalized_products.append(normalized)
+
+            self._apply_scrape_diagnostics(
+                products=normalized_products,
+                target_skus=target_skus,
+                should_scrape=should_scrape,
+                scrape_records=scrape_records,
+                scrape_sku_errors=scrape_sku_errors,
+            )
+
+            result_payload = {
+                "shopify_df": shopify_df,
+                "products": normalized_products,
+                "build_stats": build_stats,
+                "should_scrape": should_scrape,
+                "scrape_records": scrape_records,
+                "scrape_sku_errors": scrape_sku_errors,
+                "scrape_general_errors": scrape_general_errors,
+                "image_scrape_needed": image_scrape_needed,
+                "can_scrape": can_scrape,
+                "mapper": mapper,
+            }
+            error_text: str | None = None
+        except Exception as exc:
+            error_text = str(exc)
+
+        def apply() -> None:
+            if request_id != self._processing_request_id:
+                return
+            self._set_processing_busy(False)
+            if error_text:
+                self.processing_status_text.set(f"Processing failed: {error_text}")
+                messagebox.showerror(APP_TITLE, f"Processing failed:\n{error_text}")
+                self._auto_open_review_after_processing = False
+                return
+
+            mapper_obj = result_payload.get("mapper")
+            if mapper_obj is not None:
+                self.type_mapper = mapper_obj
+
+            shopify_df = result_payload.get("shopify_df")
+            if isinstance(shopify_df, pd.DataFrame):
+                self.shopify_df_raw = shopify_df
+                self._refresh_input_metrics()
+                if self.session.mode == MODE_UPDATE:
+                    self.rules_status.configure(text=f"Shopify targeted sync complete: {len(shopify_df)} SKU rows loaded.")
+
+            normalized_products = list(result_payload.get("products") or [])
+            build_stats = result_payload.get("build_stats")
+            should_scrape = bool(result_payload.get("should_scrape"))
+            can_scrape = bool(result_payload.get("can_scrape"))
+            image_scrape_needed = bool(result_payload.get("image_scrape_needed"))
+            scrape_records = dict(result_payload.get("scrape_records") or {})
+            scrape_sku_errors = dict(result_payload.get("scrape_sku_errors") or {})
+            scrape_general_errors = list(result_payload.get("scrape_general_errors") or [])
+
+            self.session.products = normalized_products
+            self.push_selected_skus = {
+                normalize_sku(getattr(product, "sku", ""))
+                for product in normalized_products
+                if normalize_sku(getattr(product, "sku", ""))
+            }
+            self.session.processing_complete = True
+            self._update_tab_access()
+
+            preview_df = products_to_dataframe(normalized_products)
+            _tree_show_dataframe(self.processing_preview, _safe_head(preview_df, rows=120))
+
+            rows_considered = int(getattr(build_stats, "rows_considered", len(normalized_products)))
+            rows_skipped_no_shopify_match = int(getattr(build_stats, "rows_skipped_no_shopify_match", 0))
+            rows_skipped_missing_sku = int(getattr(build_stats, "rows_skipped_missing_sku", 0))
+            status_parts = [
+                f"Processing Complete - {len(normalized_products)} products processed.",
+                f"Rows considered: {rows_considered}",
+            ]
+            if rows_skipped_no_shopify_match:
+                status_parts.append(f"Skipped (no Shopify match): {rows_skipped_no_shopify_match}")
+            if rows_skipped_missing_sku:
+                status_parts.append(f"Skipped (missing SKU): {rows_skipped_missing_sku}")
+
+            if self.session.missing_fields:
+                status_parts.append(f"Missing fields: {', '.join(self.session.missing_fields)}")
+            if should_scrape:
+                status_parts.append(f"Scraped: {len(scrape_records)} SKU hits")
+                if scrape_sku_errors:
+                    status_parts.append(f"Scrape SKU failures: {len(scrape_sku_errors)}")
+                    first_error = next(iter(scrape_sku_errors.values()), "")
+                    if first_error:
+                        status_parts.append(f"First scrape error: {first_error}")
+                if scrape_general_errors:
+                    status_parts.append(f"Scrape warnings: {len(scrape_general_errors)}")
+                downloaded_images = sum(
+                    len([part for part in re.split(r"[|,\n]+", str(record.get("media_local_files", ""))) if part.strip()])
+                    for record in scrape_records.values()
+                )
+                if downloaded_images:
+                    status_parts.append(f"Downloaded images: {downloaded_images}")
+            elif can_scrape:
+                if image_scrape_needed:
+                    status_parts.append("Scraper skipped unexpectedly for images. Enable Force Scrape and retry.")
+                else:
+                    status_parts.append("Scraper skipped: mapped data already covers requested fields.")
+            self.processing_status_text.set(" | ".join(status_parts))
+            self.to_review_btn.configure(state="normal")
+            self.review_refresh_pending = True
+            if self._auto_open_review_after_processing:
+                self._open_review_tab()
+            self._auto_open_review_after_processing = False
+
+        try:
+            self.root.after(0, apply)
+        except RuntimeError:
+            return
+
+    def _apply_scrape_diagnostics(
+        self,
+        products,
+        target_skus: list[str],
+        should_scrape: bool,
+        scrape_records: dict[str, dict[str, str]],
+        scrape_sku_errors: dict[str, str],
+    ) -> None:
+        records = {normalize_sku(sku): payload for sku, payload in (scrape_records or {}).items()}
+        errors = {normalize_sku(sku): str(error).strip() for sku, error in (scrape_sku_errors or {}).items()}
+
+        compact_record_keys: dict[str, dict[str, str]] = {}
+        for key, payload in records.items():
+            compact = self._compact_sku_for_partial_match(key)
+            if compact and compact not in compact_record_keys:
+                compact_record_keys[compact] = payload
+
+        compact_error_keys: dict[str, str] = {}
+        for key, value in errors.items():
+            compact = self._compact_sku_for_partial_match(key)
+            if compact and compact not in compact_error_keys:
+                compact_error_keys[compact] = value
+
+        def lookup_payload(sku_value: str) -> dict[str, str]:
+            normalized = normalize_sku(sku_value)
+            payload = records.get(normalized, {})
+            if payload:
+                return payload
+            compact = self._compact_sku_for_partial_match(normalized)
+            if compact and compact in compact_record_keys:
+                return compact_record_keys[compact]
+            if not compact:
+                return {}
+            for key, candidate_payload in records.items():
+                candidate_compact = self._compact_sku_for_partial_match(key)
+                if not candidate_compact:
+                    continue
+                if candidate_compact.endswith(compact) or compact.endswith(candidate_compact):
+                    return candidate_payload
+            return {}
+
+        def lookup_error(sku_value: str) -> str:
+            normalized = normalize_sku(sku_value)
+            error_text = errors.get(normalized, "")
+            if error_text:
+                return error_text
+            compact = self._compact_sku_for_partial_match(normalized)
+            if compact and compact in compact_error_keys:
+                return compact_error_keys[compact]
+            if not compact:
+                return ""
+            for key, candidate_error in errors.items():
+                candidate_compact = self._compact_sku_for_partial_match(key)
+                if not candidate_compact:
+                    continue
+                if candidate_compact.endswith(compact) or compact.endswith(candidate_compact):
+                    return candidate_error
+            return ""
+
+        product_by_sku = {normalize_sku(product.sku): product for product in products if normalize_sku(product.sku)}
+        scoped_skus = [normalize_sku(sku) for sku in target_skus if normalize_sku(sku)]
+        found_fields_order = [
+            "title",
+            "description_html",
+            "media_urls",
+            "price",
+            "cost",
+            "barcode",
+            "weight",
+            "application",
+            "vendor",
+            "media_local_files",
+        ]
+
+        for sku in scoped_skus:
+            product = product_by_sku.get(sku)
+            if product is None:
+                continue
+            if not should_scrape:
+                product.scrape_status = "not run"
+                product.scrape_fields_found = ""
+                product.scrape_error = ""
+                continue
+
+            payload = lookup_payload(sku)
+            if payload:
+                found = [field for field in found_fields_order if str(payload.get(field, "")).strip()]
+                product.scrape_status = "success check"
+                provider_value = str(payload.get("search_provider", "")).strip().lower()
+                if provider_value.endswith("_fuzzy"):
+                    found.append("fuzzy_match")
+                product.scrape_fields_found = ", ".join(found)
+                parse_error = str(payload.get("extract_error", "")).strip()
+                image_error = str(payload.get("image_download_error", "")).strip()
+                fuzzy_warning = ""
+                if provider_value.endswith("_fuzzy"):
+                    fuzzy_warning = "Fuzzy SKU match from search provider. Verify product selection."
+                product.scrape_error = image_error or parse_error or fuzzy_warning
+            else:
+                product.scrape_status = "fail X"
+                product.scrape_fields_found = ""
+                product.scrape_error = lookup_error(sku) or "No scrape data found"
+
+            media_folder = str(payload.get("media_folder", "")).strip()
+            if media_folder:
+                try:
+                    product.media_folder = Path(media_folder).name or media_folder
+                except Exception:
+                    product.media_folder = media_folder
+
+    def _refresh_review_tab(self) -> None:
+        total = len(self.session.products)
+        if total == 0:
+            self.push_selected_skus = set()
+            self.review_index = 0
+            self.review_index_text.set("Product 0 / 0")
+            for var in self.review_fields.values():
+                var.set("")
+            self.review_cost_rule_text.set("")
+            self.review_cost_options = []
+            self.review_cost_option_map = {}
+            if hasattr(self, "review_cost_rule_combo"):
+                self.review_cost_rule_combo.configure(values=())
+                self.review_cost_rule_combo.configure(state="disabled")
+            self._cancel_review_table_refresh()
+            _tree_show_dataframe(self.review_table, pd.DataFrame())
+            self.review_loaded_raw = {}
+            self.review_loaded_display = {}
+            self.review_loaded_truncated = {}
+            self.review_cost_options_loaded_for_sku = ""
+            self.review_status_text.set("No products available yet. Run Processing first.")
+            return
+        self.review_index = max(0, min(self.review_index, total - 1))
+        self._load_review_product(self.review_index)
+        _tree_show_dataframe(self.review_table, pd.DataFrame())
+        self.review_status_text.set("Review form loaded. Click 'Load All Products Preview' if needed.")
+
+    def _load_review_product(self, index: int) -> None:
+        if not self.session.products:
+            return
+        index = max(0, min(index, len(self.session.products) - 1))
+        self.review_index = index
+        product = self.session.products[index]
+        row = product.to_row()
+        self.review_loaded_raw = {}
+        self.review_loaded_display = {}
+        self.review_loaded_truncated = {}
+        for field_name, var in self.review_fields.items():
+            raw = str(row.get(field_name, ""))
+            display, truncated = self._display_field_value(field_name, raw)
+            self.review_loaded_raw[field_name] = raw
+            self.review_loaded_display[field_name] = display
+            self.review_loaded_truncated[field_name] = truncated
+            var.set(display)
+        self.review_cost_option_map = {}
+        self.review_cost_options = []
+        self.review_cost_options_loaded_for_sku = ""
+        vendor_label = str(product.vendor or "").strip() or "Select discount rule"
+        if hasattr(self, "review_cost_rule_combo"):
+            self.review_cost_rule_combo.configure(values=())
+            self.review_cost_rule_combo.configure(state="readonly")
+        self.review_cost_rule_text.set(vendor_label)
+        self.review_index_text.set(f"Product {index + 1} / {len(self.session.products)}")
+
+    def _save_current_review_product(self) -> None:
+        if not self.session.products:
+            return
+        product = self.session.products[self.review_index]
+        product.title = self._read_review_field("title")
+        product.description_html = self._read_review_field("description_html")
+        media_text = self._read_review_field("media_urls")
+        product.media_urls = [part.strip() for part in re.split(r"[|,\n]+", media_text) if part.strip()]
+        product.price = self._read_review_field("price")
+        product.cost = self._read_review_field("cost")
+        try:
+            product.inventory = int(float(self._read_review_field("inventory") or "3000000"))
+        except Exception:
+            product.inventory = 3000000
+        product.sku = self._read_review_field("sku").upper()
+        product.barcode = self._read_review_field("barcode")
+        product.weight = self._read_review_field("weight")
+        product.vendor = self._read_review_field("vendor")
+        product.type = self._read_review_field("type")
+        product.google_product_type = self._read_review_field("google_product_type")
+        product.category_code = self._read_review_field("category_code")
+        product.product_subtype = self._read_review_field("product_subtype")
+        product.mpn = self._read_review_field("mpn")
+        product.brand = self._read_review_field("brand")
+        product.application = self._read_review_field("application")
+        product.finalize_defaults()
+        self.review_status_text.set(f"Saved product {self.review_index + 1}.")
+
+    def _review_prev(self) -> None:
+        if not self.session.products:
+            return
+        self._save_current_review_product()
+        self._load_review_product(self.review_index - 1)
+
+    def _review_next(self) -> None:
+        if not self.session.products:
+            return
+        self._save_current_review_product()
+        self._load_review_product(self.review_index + 1)
+
+    def _export_review_products(self) -> None:
+        df = products_to_dataframe(self.session.products)
+        if df.empty:
+            messagebox.showinfo(APP_TITLE, "No processed products to export.")
+            return
+        for column in PRODUCT_EXPORT_COLUMNS:
+            if column not in df.columns:
+                df[column] = ""
+        self._export_dataframe(df[PRODUCT_EXPORT_COLUMNS], "product_prospector_products.csv")
+
+    def _set_shopify_push_busy(self, busy: bool) -> None:
+        self.shopify_push_inflight = bool(busy)
+        self._refresh_push_button_state()
+        if not busy:
+            self._hide_review_busy_overlay()
+
+    def _refresh_push_button_state(self) -> None:
+        if not hasattr(self, "push_shopify_btn"):
+            return
+        if self.shopify_push_inflight:
+            self.push_shopify_btn.configure(state="disabled")
+            return
+        if self.session.mode != MODE_NEW:
+            self.push_shopify_btn.configure(state="disabled")
+            return
+        self.push_shopify_btn.configure(state="normal")
+
+    def _push_to_shopify_clicked(self) -> None:
+        if self.shopify_push_inflight:
+            return
+        if self.session.mode != MODE_NEW:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Push to Shopify is create-only right now.\nUse Create New Products mode.",
+            )
+            return
+        if not self.session.products:
+            messagebox.showwarning(APP_TITLE, "No products available to push.")
+            return
+
+        self._save_current_review_product()
+        selected = {normalize_sku(sku) for sku in self.push_selected_skus if normalize_sku(sku)}
+        products = [product for product in list(self.session.products or []) if normalize_sku(getattr(product, "sku", "")) in selected]
+        if not products:
+            messagebox.showwarning(APP_TITLE, "No selected rows to push. Check [x] next to at least one product.")
+            return
+
+        confirmed = messagebox.askyesno(
+            APP_TITLE,
+            (
+                f"Create {len(products)} Shopify products as DRAFT?\n\n"
+                "Safety checks:\n"
+                "- Existing SKUs are skipped.\n"
+                "- No existing products are updated.\n"
+                "- Writes are create-only in the Products area.\n\n"
+                "Continue?"
+            ),
+        )
+        if not confirmed:
+            return
+
+        include_images_choice = messagebox.askyesnocancel(
+            APP_TITLE,
+            "Include images in this Shopify push?\n\nYes = Upload images\nNo = Skip images\nCancel = Abort push",
+        )
+        if include_images_choice is None:
+            return
+        include_images = bool(include_images_choice)
+
+        config = load_shopify_config()
+        if config is None:
+            messagebox.showerror(APP_TITLE, "Invalid config/shopify.json. Cannot push to Shopify.")
+            return
+        token = load_shopify_token()
+        if token is None:
+            self._connect_shopify_worker(allow_handshake=False)
+            token = load_shopify_token()
+        if token is None:
+            messagebox.showerror(APP_TITLE, "Shopify is not connected. Connect first and retry.")
+            return
+
+        image_mode_text = "with images" if include_images else "without images"
+        self.review_status_text.set(f"Pushing {len(products)} products to Shopify drafts ({image_mode_text})...")
+        self.review_busy_text.set("Checking existing SKUs in Shopify...")
+        self._show_review_busy_overlay("Checking existing SKUs in Shopify...")
+        self._set_shopify_push_busy(True)
+
+        worker = threading.Thread(
+            target=self._run_shopify_push_worker,
+            kwargs={
+                "config": config,
+                "access_token": token.access_token,
+                "products": products,
+                "include_images": include_images,
+            },
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_shopify_push_worker(self, config, access_token: str, products: list, include_images: bool) -> None:
+        requested_skus = [normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))]
+        existing_df: pd.DataFrame | None = None
+        existing_skus: set[str] = set()
+        push_error: str | None = None
+        summary = ShopifyDraftPushSummary(requested=len(products))
+
+        def on_existing_progress(done: int, total: int) -> None:
+            try:
+                self.root.after(
+                    0,
+                    lambda: self.review_busy_text.set(f"Checking existing SKUs in Shopify... {done}/{total}"),
+                )
+            except Exception:
+                pass
+
+        def on_push_progress(done: int, total: int, sku: str) -> None:
+            label = f"Pushing draft products to Shopify... {done}/{total}"
+            sku_text = normalize_sku(sku)
+            if sku_text:
+                label += f" | {sku_text}"
+            try:
+                self.root.after(0, lambda: self.review_busy_text.set(label))
+            except Exception:
+                pass
+
+        try:
+            existing_skus, existing_error, existing_df = self._fetch_existing_shopify_skus(
+                requested_skus,
+                progress_callback=on_existing_progress,
+                refresh_on_cache_miss=True,
+            )
+            if existing_error:
+                push_error = f"Could not verify existing Shopify SKUs: {existing_error}"
+            else:
+                summary = push_new_products_as_drafts(
+                    config=config,
+                    access_token=access_token,
+                    products=products,
+                    existing_skus=existing_skus,
+                    include_images=include_images,
+                    image_root=self.runtime_root / "images",
+                    required_root=self.required_root,
+                    progress_callback=on_push_progress,
+                )
+        except Exception as exc:
+            push_error = str(exc)
+
+        def apply() -> None:
+            self._set_shopify_push_busy(False)
+            if isinstance(existing_df, pd.DataFrame) and not existing_df.empty:
+                self.shopify_df_raw = existing_df
+                self._refresh_input_metrics()
+
+            if push_error:
+                self.review_status_text.set(f"Shopify push failed: {push_error}")
+                messagebox.showerror(APP_TITLE, f"Shopify push failed:\n{push_error}")
+                return
+
+            created = len(summary.created_skus)
+            skipped = len(summary.skipped_existing_skus)
+            failed = len(summary.failed_by_sku)
+            warnings_count = len(summary.warnings)
+            self.review_status_text.set(
+                f"Shopify draft push complete: created {created}, skipped existing {skipped}, failed {failed}."
+            )
+
+            image_mode_text = "Yes" if include_images else "No"
+            details: list[str] = [
+                f"Requested: {summary.requested}",
+                f"Created (draft): {created}",
+                f"Skipped (already exists): {skipped}",
+                f"Failed: {failed}",
+                f"Images included: {image_mode_text}",
+            ]
+            if warnings_count:
+                details.append(f"Warnings: {warnings_count}")
+
+            if summary.failed_by_sku:
+                details.append("")
+                details.append("Failure samples:")
+                for sku, error in list(summary.failed_by_sku.items())[:6]:
+                    details.append(f"- {sku}: {error}")
+
+            if summary.warnings:
+                details.append("")
+                details.append("Warning samples:")
+                for item in summary.warnings[:5]:
+                    details.append(f"- {item}")
+
+            messagebox.showinfo(APP_TITLE, "\n".join(details))
+
+        try:
+            self.root.after(0, apply)
+        except RuntimeError:
+            return
+
+    def _select_all_for_push(self) -> None:
+        products = self.session.products or []
+        self.push_selected_skus = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
+        self._refresh_review_table_async()
+
+    def _clear_push_selection(self) -> None:
+        self.push_selected_skus = set()
+        self._refresh_review_table_async()
+
+    def _on_review_table_click(self, event) -> None:
+        if not self.session.products:
+            return
+        tree = self.review_table
+        row_id = tree.identify_row(event.y)
+        column_id = tree.identify_column(event.x)
+        if not row_id or column_id != "#1":
+            return
+        sku_value = normalize_sku(tree.set(row_id, "sku"))
+        if not sku_value:
+            return
+        if sku_value in self.push_selected_skus:
+            self.push_selected_skus.remove(sku_value)
+        else:
+            self.push_selected_skus.add(sku_value)
+        self._refresh_review_table_async()
+
+    def _start_background_api_bootstrap(self) -> None:
+        worker = threading.Thread(target=self._background_api_bootstrap, daemon=True)
+        worker.start()
+
+    def _cached_shopify_sku_count(self) -> int:
+        try:
+            return int(len(load_shopify_sku_cache()))
+        except Exception:
+            return 0
+
+    def _initialize_shopify_cache_state(self) -> None:
+        self.shopify_cache_ready = self._cached_shopify_sku_count() > 0
+        self._set_shopify_cache_api_busy(False)
+        self._refresh_new_mode_check_controls()
+
+    def _start_background_shopify_cache_warmup(self) -> None:
+        if self.shopify_cache_warmup_inflight:
+            return
+        worker = threading.Thread(target=self._background_shopify_cache_warmup, daemon=True)
+        self.shopify_cache_warmup_inflight = True
+        worker.start()
+
+    def _background_shopify_cache_warmup(self) -> None:
+        try:
+            cached = load_shopify_sku_cache()
+            if cached is not None and not cached.empty:
+                self.shopify_cache_ready = True
+                return
+
+            config = load_shopify_config()
+            if config is None:
+                return
+
+            token = load_shopify_token()
+            if token is None:
+                return
+
+            self._set_shopify_cache_api_busy(True, "Downloading Shopify SKU cache... 0 SKUs")
+
+            def on_catalog_progress(_page_count: int, row_count: int) -> None:
+                self._set_shopify_cache_api_busy(True, f"Downloading Shopify SKU cache... {row_count:,} SKUs")
+
+            df, error = fetch_shopify_catalog_dataframe(
+                config=config,
+                access_token=token.access_token,
+                progress_callback=on_catalog_progress,
+            )
+            if error or df is None or df.empty:
+                return
+            save_shopify_sku_cache(df)
+            self.shopify_cache_ready = True
+            if self.shopify_df_raw is None or self.shopify_df_raw.empty:
+                self.shopify_df_raw = df
+        finally:
+            self.shopify_cache_warmup_inflight = False
+            self._set_shopify_cache_api_busy(False)
+            try:
+                self.root.after(0, self._refresh_new_mode_check_controls)
+                self.root.after(0, self._refresh_input_metrics)
+            except RuntimeError:
+                pass
+
+    def _set_shopify_cache_api_busy(self, busy: bool, text: str = "") -> None:
+        def apply() -> None:
+            if busy:
+                self.shopify_cache_api_text.set(text or "Downloading Shopify SKU cache...")
+                if not self.shopify_cache_api_spinner.winfo_ismapped():
+                    self.shopify_cache_api_spinner.pack(side=LEFT, padx=(10, 0))
+                if not self.shopify_cache_api_label.winfo_ismapped():
+                    self.shopify_cache_api_label.pack(side=LEFT, padx=(6, 0))
+                self._start_shopify_cache_spinner()
+                return
+            self._stop_shopify_cache_spinner()
+            if self.shopify_cache_api_spinner.winfo_ismapped():
+                self.shopify_cache_api_spinner.pack_forget()
+            if self.shopify_cache_api_label.winfo_ismapped():
+                self.shopify_cache_api_label.pack_forget()
+            self.shopify_cache_api_text.set("")
+
+        try:
+            self.root.after(0, apply)
+        except RuntimeError:
+            return
+
+    def _draw_shopify_cache_spinner_frame(self) -> None:
+        canvas = self.shopify_cache_api_spinner
+        canvas.delete("all")
+        canvas.create_oval(2, 2, 14, 14, outline="#B8C2CC", width=1)
+        canvas.create_arc(
+            2,
+            2,
+            14,
+            14,
+            start=self.shopify_cache_spinner_angle,
+            extent=92,
+            style="arc",
+            outline="#0FA34A",
+            width=2,
+        )
+
+    def _animate_shopify_cache_spinner(self) -> None:
+        self.shopify_cache_spinner_job = None
+        if not self.shopify_cache_api_spinner.winfo_exists() or not self.shopify_cache_api_spinner.winfo_ismapped():
+            return
+        self._draw_shopify_cache_spinner_frame()
+        self.shopify_cache_spinner_angle = (self.shopify_cache_spinner_angle + 28) % 360
+        try:
+            self.shopify_cache_spinner_job = self.root.after(85, self._animate_shopify_cache_spinner)
+        except RuntimeError:
+            self.shopify_cache_spinner_job = None
+
+    def _start_shopify_cache_spinner(self) -> None:
+        if self.shopify_cache_spinner_job is not None:
+            return
+        self._draw_shopify_cache_spinner_frame()
+        try:
+            self.shopify_cache_spinner_job = self.root.after(85, self._animate_shopify_cache_spinner)
+        except RuntimeError:
+            self.shopify_cache_spinner_job = None
+
+    def _stop_shopify_cache_spinner(self) -> None:
+        if self.shopify_cache_spinner_job is not None:
+            try:
+                self.root.after_cancel(self.shopify_cache_spinner_job)
+            except Exception:
+                pass
+            self.shopify_cache_spinner_job = None
+        if self.shopify_cache_api_spinner.winfo_exists():
+            self.shopify_cache_api_spinner.delete("all")
+
+    def _draw_review_busy_spinner_frame(self) -> None:
+        if not hasattr(self, "review_busy_spinner") or not self.review_busy_spinner.winfo_exists():
+            return
+        canvas = self.review_busy_spinner
+        canvas.delete("all")
+        canvas.create_oval(2, 2, 16, 16, outline="#C4C9D1", width=1)
+        canvas.create_arc(
+            2,
+            2,
+            16,
+            16,
+            start=self.review_busy_spinner_angle,
+            extent=98,
+            style="arc",
+            outline="#1F4E79",
+            width=2,
+        )
+
+    def _animate_review_busy_spinner(self) -> None:
+        self.review_busy_spinner_job = None
+        if not self.review_busy_active:
+            return
+        if not hasattr(self, "review_busy_spinner") or not self.review_busy_spinner.winfo_exists():
+            return
+        self._draw_review_busy_spinner_frame()
+        self.review_busy_spinner_angle = (self.review_busy_spinner_angle + 24) % 360
+        try:
+            self.review_busy_spinner_job = self.root.after(85, self._animate_review_busy_spinner)
+        except RuntimeError:
+            self.review_busy_spinner_job = None
+
+    def _show_review_busy_overlay(self, message: str) -> None:
+        if not hasattr(self, "review_busy_overlay"):
+            return
+        self.review_busy_text.set(message or "Reprocessing...")
+        self.review_busy_active = True
+        self.review_busy_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.review_busy_overlay.lift()
+        self._draw_review_busy_spinner_frame()
+        if self.review_busy_spinner_job is None:
+            try:
+                self.review_busy_spinner_job = self.root.after(85, self._animate_review_busy_spinner)
+            except RuntimeError:
+                self.review_busy_spinner_job = None
+
+    def _hide_review_busy_overlay(self) -> None:
+        self.review_busy_active = False
+        if self.review_busy_spinner_job is not None:
+            try:
+                self.root.after_cancel(self.review_busy_spinner_job)
+            except Exception:
+                pass
+            self.review_busy_spinner_job = None
+        if hasattr(self, "review_busy_spinner") and self.review_busy_spinner.winfo_exists():
+            self.review_busy_spinner.delete("all")
+        if hasattr(self, "review_busy_overlay"):
+            self.review_busy_overlay.place_forget()
+
+    def _draw_shopify_dot(self, state: str) -> None:
+        self.shopify_dot.delete("all")
+        if state == "connected":
+            self.shopify_dot.create_oval(1, 1, 15, 15, fill="#9CFFD6", outline="")
+            self.shopify_dot.create_oval(3, 3, 13, 13, fill="#34D058", outline="")
+            self.shopify_dot.create_oval(5, 5, 11, 11, fill="#0FA34A", outline="")
+            return
+        if state == "connecting":
+            self.shopify_dot.create_oval(2, 2, 14, 14, fill="#FFD66E", outline="")
+            self.shopify_dot.create_oval(4, 4, 12, 12, fill="#D9A527", outline="")
+            return
+        self.shopify_dot.create_oval(3, 3, 13, 13, fill="#D9534F", outline="")
+
+    def _set_shopify_status(self, connected: bool, connecting: bool = False) -> None:
+        def apply() -> None:
+            self.shopify_connecting = connecting
+            if connecting:
+                self.shopify_status_label.configure(text="Shopify - Connecting...")
+                self._draw_shopify_dot(state="connecting")
+                self.shopify_connect_button.configure(text="Connecting...", state="disabled")
+            elif connected:
+                self.shopify_status_label.configure(text="Shopify - Connected")
+                self._draw_shopify_dot(state="connected")
+                self.shopify_connect_button.configure(text="Reconnect", state="normal")
+            else:
+                self.shopify_status_label.configure(text="Shopify - Not Connected")
+                self._draw_shopify_dot(state="disconnected")
+                self.shopify_connect_button.configure(text="Connect", state="normal")
+            self.shopify_connected = connected
+            if connected:
+                self._start_background_shopify_cache_warmup()
+            else:
+                self._set_shopify_cache_api_busy(False)
+
+        try:
+            self.root.after(0, apply)
+        except RuntimeError:
+            return
+
+    def _connect_shopify_clicked(self) -> None:
+        if self.shopify_connecting:
+            return
+        worker = threading.Thread(target=self._connect_shopify_worker, kwargs={"allow_handshake": True}, daemon=True)
+        worker.start()
+
+    def _background_api_bootstrap(self) -> None:
+        self._connect_shopify_worker(allow_handshake=False)
+    def _connect_shopify_worker(self, allow_handshake: bool) -> None:
+        self._set_shopify_status(connected=False, connecting=True)
+        config = load_shopify_config()
+        if config is None:
+            self._set_shopify_status(connected=False)
+            if allow_handshake:
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, "Invalid config/shopify.json"))
+            return
+
+        if config.admin_api_access_token:
+            token_valid, reason = validate_access_token(config=config, access_token=config.admin_api_access_token)
+            if token_valid:
+                save_shopify_token(access_token=config.admin_api_access_token, scope="admin_api_access_token")
+                self._set_shopify_status(connected=True)
+                return
+            self._set_shopify_status(connected=False)
+            if allow_handshake:
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        APP_TITLE,
+                        "Configured admin_api_access_token is invalid.\n"
+                        f"Validation error: {reason}",
+                    ),
+                )
+            return
+
+        existing_token = load_shopify_token()
+        if existing_token:
+            valid, _ = validate_access_token(config=config, access_token=existing_token.access_token)
+            if valid:
+                self._set_shopify_status(connected=True)
+                return
+
+        if config.auth_mode in {"auto", "client_credentials"}:
+            cc_result = exchange_client_credentials_for_token(config=config)
+            if cc_result.success:
+                save_shopify_token(access_token=cc_result.access_token, scope=cc_result.scope or "client_credentials")
+                self._set_shopify_status(connected=True)
+                return
+            if config.auth_mode == "client_credentials":
+                self._set_shopify_status(connected=False)
+                if allow_handshake:
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showerror(
+                            APP_TITLE,
+                            "Shopify client_credentials failed.\n"
+                            f"{cc_result.error}",
+                        ),
+                    )
+                return
+
+        if not allow_handshake:
+            self._set_shopify_status(connected=False)
+            return
+
+        if config.auth_mode not in {"auto", "oauth"}:
+            self._set_shopify_status(connected=False)
+            return
+
+        handshake = perform_oauth_handshake(config)
+        if not handshake.success:
+            self._set_shopify_status(connected=False)
+            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Shopify connect failed:\n{handshake.error}"))
+            return
+
+        save_shopify_token(access_token=handshake.access_token, scope=handshake.scope)
+        self._set_shopify_status(connected=True)
+
+    def _toggle_advanced_mode(self) -> None:
+        return
+
+    def _on_run_mode_changed(self, *_args) -> None:
+        mode = self.run_mode.get().strip()
+        if not mode:
+            self.run_mode_locked.set(False)
+            self.setup_status_text.set("Select a Run Mode to begin.")
+            self.sku_scope_help_text.set("Enter SKUs that need to be updated or added.")
+            self.create_existing_skus = set()
+            self.create_duplicate_scope = ()
+            self.duplicate_check_text.set("")
+            self._set_duplicate_check_busy(False)
+            self._set_setup_mode_widgets_enabled(False)
+            self.update_fields_wrap.pack_forget()
+            self.session.mode = ""
+            self._refresh_mode_lock_ui()
+            self._update_tab_access()
+            self._refresh_sku_action_labels()
+            return
+
+        if self._mode_initialized and not self.run_mode_locked.get():
+            self.run_mode_locked.set(True)
+
+        if mode == RUN_MODE_UPDATE:
+            self.session.mode = MODE_UPDATE
+            self.sku_scope_help_text.set("Enter SKUs that need to be updated.")
+            self.create_existing_skus = set()
+            self.create_duplicate_scope = ()
+            self.duplicate_check_text.set("")
+            self._set_duplicate_check_busy(False)
+            self.mode_help_text.set(
+                "Update Existing Products: Finds matching SKUs and proposes field changes (fitment/title/etc). "
+                "SKUs not found are skipped."
+            )
+            self.update_fields_wrap.pack(fill=X, pady=(0, 8), before=self.setup_status)
+            self.setup_continue_btn.configure(text="Save & Continue to Scraping")
+        elif mode == RUN_MODE_CREATE:
+            self.session.mode = MODE_NEW
+            self.sku_scope_help_text.set("Enter SKUs that need to be added as new products.")
+            cached_count = 0
+            try:
+                cached_count = int(len(load_shopify_sku_cache()))
+            except Exception:
+                cached_count = 0
+            if cached_count:
+                self.duplicate_check_text.set(f"Shopify SKU cache ready: {cached_count} SKU(s).")
+            else:
+                self.duplicate_check_text.set("Shopify SKU cache is downloading. SKU check buttons enable when ready.")
+            self._set_duplicate_check_busy(False)
+            self.mode_help_text.set(
+                "Create New Products: Treats input as candidates for new product creation. "
+                "If Shopify export is loaded, already-existing SKUs can be excluded."
+            )
+            self.update_fields_wrap.pack_forget()
+            self.setup_continue_btn.configure(text="Save & Continue to Scraping")
+        else:
+            self.session.mode = ""
+            self.mode_help_text.set("Select a valid run mode.")
+        self._set_setup_mode_widgets_enabled(True)
+        self.setup_status_text.set(f"Run Mode selected: {merge_mode_label(self.session.mode)}")
+        self._refresh_mode_lock_ui()
+        self._refresh_sku_action_labels()
+        self._refresh_new_mode_check_controls()
+        self._refresh_input_metrics()
+        self._refresh_push_button_state()
+
+    def _set_setup_mode_widgets_enabled(self, enabled: bool) -> None:
+        self.setup_widgets_enabled = enabled
+        state = "normal" if enabled else "disabled"
+        for widget in getattr(self, "setup_mode_widgets", []):
+            try:
+                widget.configure(state=state)
+            except Exception:
+                continue
+        self.sku_text_widget.configure(state=state)
+        if not enabled:
+            self._set_duplicate_check_busy(False)
+            self.setup_continue_btn.configure(state="disabled")
+            self._refresh_new_mode_check_controls()
+            return
+        self.setup_continue_btn.configure(state="normal")
+        self._refresh_new_mode_check_controls()
+
+    def _refresh_new_mode_check_controls(self) -> None:
+        if not hasattr(self, "load_pasted_btn"):
+            return
+
+        base_state = "normal" if self.setup_widgets_enabled else "disabled"
+        if base_state == "disabled":
+            self.load_pasted_btn.configure(state="disabled")
+            self.use_all_sheet_check.configure(state="disabled")
+            return
+
+        if self.session.mode != MODE_NEW:
+            self.load_pasted_btn.configure(state=base_state)
+            self.use_all_sheet_check.configure(state=base_state)
+            return
+
+        check_state = "normal" if self.shopify_cache_ready else "disabled"
+        self.load_pasted_btn.configure(state=check_state)
+        self.use_all_sheet_check.configure(state=check_state)
+
+    def _refresh_sku_action_labels(self) -> None:
+        if self.session.mode == MODE_NEW:
+            self.load_pasted_btn.configure(text="Load and Check SKUs")
+            self.load_sheet_btn.configure(text="Load Price Sheet and Check SKUs")
+            self.use_all_sheet_check.configure(text="Use all SKUs from uploaded spreadsheet (and check Shopify)")
+            return
+        self.load_pasted_btn.configure(text="Load Pasted SKUs")
+        self.load_sheet_btn.configure(text="Load Vendor Price Sheet (CSV/XLSX)")
+        self.use_all_sheet_check.configure(text="Use all SKUs from uploaded spreadsheet")
+
+    def _set_duplicate_check_busy(self, busy: bool) -> None:
+        if busy:
+            self._duplicate_check_inflight = True
+            self._duplicate_check_started_at = time.monotonic()
+            if not self.duplicate_check_progress.winfo_ismapped():
+                self.duplicate_check_progress.pack(anchor=W, fill=X, pady=(4, 0))
+            self.duplicate_check_progress.configure(mode="determinate", maximum=100, value=0)
+            return
+        self._duplicate_check_inflight = False
+        self._duplicate_check_active_workers = 0
+        self._duplicate_check_pending_scope = ()
+        self._duplicate_check_started_at = 0.0
+        if self.duplicate_check_progress.winfo_ismapped():
+            self.duplicate_check_progress.pack_forget()
+
+    def _set_duplicate_check_progress(self, current: int, total: int, text: str | None = None) -> None:
+        def apply() -> None:
+            if not self._duplicate_check_inflight:
+                return
+            safe_total = max(1, int(total))
+            safe_current = max(0, min(int(current), safe_total))
+            if not self.duplicate_check_progress.winfo_ismapped():
+                self.duplicate_check_progress.pack(anchor=W, fill=X, pady=(4, 0))
+            self.duplicate_check_progress.configure(mode="determinate", maximum=safe_total, value=safe_current)
+            if text is not None:
+                self.duplicate_check_text.set(text)
+
+        if threading.current_thread() is threading.main_thread():
+            apply()
+            return
+        try:
+            self.root.after(0, apply)
+        except RuntimeError:
+            return
+
+    def _on_use_all_sheet_toggle(self) -> None:
+        self._refresh_input_metrics()
+        if self.session.mode != MODE_NEW:
+            return
+        if not self.shopify_cache_ready:
+            self.duplicate_check_text.set("Shopify SKU cache is downloading. SKU check buttons enable when ready.")
+            return
+        scope_skus = self._create_scope_skus_for_duplicate_check()
+        if not scope_skus:
+            if self.use_all_sheet_skus.get():
+                self.duplicate_check_text.set("Load a spreadsheet and map SKU to run duplicate check.")
+            return
+        self._queue_create_duplicate_check(scope_skus)
+
+    def _on_vendor_sku_mapping_changed(self) -> None:
+        self._refresh_input_metrics()
+        if self.session.mode != MODE_NEW or not self.use_all_sheet_skus.get():
+            return
+        if not self.shopify_cache_ready:
+            self.duplicate_check_text.set("Shopify SKU cache is downloading. SKU check buttons enable when ready.")
+            return
+        scope_skus = self._sheet_scope_skus()
+        if not scope_skus:
+            self.duplicate_check_text.set("Map SKU column to run duplicate check for spreadsheet scope.")
+            return
+        self._queue_create_duplicate_check(scope_skus)
+
+    def _sheet_scope_skus(self) -> list[str]:
+        if not self.vendor_source_is_sheet or self.vendor_df_raw is None or self.vendor_df_raw.empty:
+            return []
+        sku_col = self.vendor_sku_column.get().strip()
+        if not sku_col or sku_col not in self.vendor_df_raw.columns:
+            return []
+        return (
+            self.vendor_df_raw[sku_col]
+            .astype(str)
+            .map(normalize_sku)
+            .replace("", pd.NA)
+            .dropna()
+            .drop_duplicates()
+            .tolist()
+        )
+
+    def _create_scope_skus_for_duplicate_check(self) -> list[str]:
+        if self.session.mode != MODE_NEW:
+            return []
+        if self.use_all_sheet_skus.get():
+            return self._sheet_scope_skus()
+        return self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+
+    def _compact_sku_for_partial_match(self, value: str) -> str:
+        return re.sub(r"[^A-Z0-9]", "", normalize_sku(value))
+
+    def _match_requested_skus_against_shopify_skus(
+        self,
+        requested_skus: list[str],
+        shopify_skus: list[str],
+        progress_callback=None,
+    ) -> set[str]:
+        requested_ordered = list(
+            dict.fromkeys(normalize_sku(sku) for sku in requested_skus if normalize_sku(sku))
+        )
+        if not requested_ordered:
+            return set()
+
+        shopify_norm = [normalize_sku(sku) for sku in shopify_skus if normalize_sku(sku)]
+        if not shopify_norm:
+            if progress_callback is not None:
+                try:
+                    progress_callback(len(requested_ordered), len(requested_ordered))
+                except Exception:
+                    pass
+            return set()
+
+        shopify_set = set(shopify_norm)
+        shopify_compact = [self._compact_sku_for_partial_match(sku) for sku in shopify_norm]
+        shopify_compact = [value for value in shopify_compact if value]
+        shopify_compact_set = set(shopify_compact)
+        requested_compact = {sku: self._compact_sku_for_partial_match(sku) for sku in requested_ordered}
+
+        lengths = sorted({len(value) for value in requested_compact.values() if value})
+        suffix_lookup: dict[int, set[str]] = {}
+        if shopify_compact and lengths:
+            compact_candidates = list(dict.fromkeys(shopify_compact))
+            for length in lengths:
+                suffix_lookup[length] = {candidate[-length:] for candidate in compact_candidates if len(candidate) >= length}
+
+        matched_requested: set[str] = set()
+        total = len(requested_ordered)
+        for index, requested in enumerate(requested_ordered, start=1):
+            matched = requested in shopify_set
+            if not matched:
+                compact = requested_compact.get(requested, "")
+                if compact and compact in shopify_compact_set:
+                    matched = True
+                elif compact:
+                    matched = compact in suffix_lookup.get(len(compact), set())
+            if matched:
+                matched_requested.add(requested)
+            if progress_callback is not None:
+                try:
+                    progress_callback(index, total)
+                except Exception:
+                    pass
+        return matched_requested
+
+    def _fetch_existing_shopify_skus(
+        self,
+        skus: list[str],
+        progress_callback=None,
+        refresh_on_cache_miss: bool = False,
+    ) -> tuple[set[str], str | None, pd.DataFrame | None]:
+        normalized_skus = [normalize_sku(sku) for sku in skus if normalize_sku(sku)]
+        if not normalized_skus:
+            return set(), None, pd.DataFrame(columns=["sku"])
+
+        config = load_shopify_config()
+        if config is None:
+            return set(), "Invalid config/shopify.json.", None
+
+        token = load_shopify_token()
+        if token is None:
+            self._connect_shopify_worker(allow_handshake=False)
+            token = load_shopify_token()
+        if token is None:
+            return set(), "Shopify is not connected.", None
+
+        # Fast path: use in-memory catalog if already available, then local cache.
+        df = self.shopify_df_raw.copy() if self.shopify_df_raw is not None and not self.shopify_df_raw.empty else None
+        used_cached_catalog = False
+        if df is None or df.empty:
+            cached_df = load_shopify_sku_cache()
+            if cached_df is not None and not cached_df.empty:
+                df = cached_df
+                used_cached_catalog = True
+
+        # First-time or missing cache: full read-only catalog download and local save.
+        if df is None or df.empty:
+            fallback_df, fallback_error = fetch_shopify_catalog_dataframe(config=config, access_token=token.access_token)
+            if fallback_error:
+                return set(), fallback_error, None
+            df = fallback_df if fallback_df is not None else pd.DataFrame(columns=["sku"])
+            if not df.empty:
+                save_shopify_sku_cache(df)
+            used_cached_catalog = False
+
+        if "sku" not in df.columns:
+            return set(), None, df
+
+        shopify_skus = df["sku"].astype(str).tolist()
+        existing = self._match_requested_skus_against_shopify_skus(
+            requested_skus=normalized_skus,
+            shopify_skus=shopify_skus,
+            progress_callback=progress_callback,
+        )
+
+        # Optional refresh path for stale cache. Off by default to keep duplicate checks fast.
+        if not existing and used_cached_catalog and refresh_on_cache_miss:
+            fallback_df, fallback_error = fetch_shopify_catalog_dataframe(config=config, access_token=token.access_token)
+            if fallback_error:
+                return set(), fallback_error, None
+            if fallback_df is not None:
+                df = fallback_df
+                if not df.empty:
+                    save_shopify_sku_cache(df)
+                if "sku" in df.columns:
+                    existing = self._match_requested_skus_against_shopify_skus(
+                        requested_skus=normalized_skus,
+                        shopify_skus=df["sku"].astype(str).tolist(),
+                        progress_callback=progress_callback,
+                    )
+        return existing, None, df
+
+    def _queue_create_duplicate_check(self, skus: list[str]) -> None:
+        if self.session.mode != MODE_NEW:
+            return
+        normalized = [normalize_sku(sku) for sku in skus if normalize_sku(sku)]
+        if not normalized:
+            self.create_existing_skus = set()
+            self.create_duplicate_scope = ()
+            self.duplicate_check_text.set("No scoped SKUs to check.")
+            self._set_duplicate_check_busy(False)
+            return
+
+        self._duplicate_check_request_id += 1
+        request_id = self._duplicate_check_request_id
+        has_memory_catalog = self.shopify_df_raw is not None and not self.shopify_df_raw.empty
+        has_cached_catalog = False
+        if not has_memory_catalog:
+            try:
+                has_cached_catalog = not load_shopify_sku_cache().empty
+            except Exception:
+                has_cached_catalog = False
+        if has_memory_catalog or has_cached_catalog:
+            self.duplicate_check_text.set(f"Checking Shopify for {len(normalized)} scoped SKU(s)...")
+        else:
+            self.duplicate_check_text.set(
+                f"Building local Shopify SKU cache (one-time read-only sync), then checking {len(normalized)} SKU(s)..."
+            )
+        self._set_duplicate_check_busy(True)
+        self._duplicate_check_pending_scope = tuple(normalized)
+        self._duplicate_check_active_workers += 1
+        self._set_duplicate_check_progress(
+            0,
+            len(normalized),
+            f"Checking Shopify for {len(normalized)} scoped SKU(s)... 0/{len(normalized)}",
+        )
+
+        def worker() -> None:
+            update_step = max(1, len(normalized) // 100)
+            last_progress = {"value": 0}
+
+            def on_progress(done: int, total: int) -> None:
+                if total <= 0:
+                    return
+                if done < total and done - last_progress["value"] < update_step:
+                    return
+                last_progress["value"] = done
+                self._set_duplicate_check_progress(
+                    done,
+                    total,
+                    f"Checking Shopify for {total} scoped SKU(s)... {done}/{total}",
+                )
+
+            existing: set[str] = set()
+            error: str | None = None
+            df: pd.DataFrame | None = None
+            try:
+                existing, error, df = self._fetch_existing_shopify_skus(normalized, progress_callback=on_progress)
+            except Exception as exc:
+                error = str(exc)
+
+            def apply() -> None:
+                self._duplicate_check_active_workers = max(0, self._duplicate_check_active_workers - 1)
+                if request_id != self._duplicate_check_request_id:
+                    if self._duplicate_check_active_workers <= 0:
+                        self._set_duplicate_check_busy(False)
+                    return
+                self._set_duplicate_check_busy(False)
+                if error:
+                    self.create_existing_skus = set()
+                    self.create_duplicate_scope = ()
+                    self.duplicate_check_text.set(f"Shopify duplicate check unavailable: {error}")
+                    return
+
+                if df is not None:
+                    self.shopify_df_raw = df
+                    self._refresh_input_metrics()
+                self.create_existing_skus = set(existing)
+                self.create_duplicate_scope = tuple(normalized)
+                if not existing:
+                    self.duplicate_check_text.set(
+                        f"Shopify duplicate check complete: none found across {len(normalized)} scoped SKU(s)."
+                    )
+                    return
+
+                existing_ordered = [sku for sku in normalized if sku in existing]
+                preview = ", ".join(existing_ordered[:12])
+                more = "" if len(existing_ordered) <= 12 else f" (+{len(existing_ordered) - 12} more)"
+                self.duplicate_check_text.set(
+                    f"{len(existing_ordered)} SKU(s) already exist and will be excluded: {preview}{more}"
+                )
+
+            try:
+                self.root.after(0, apply)
+            except RuntimeError:
+                return
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ensure_create_duplicate_check(self, skus: list[str]) -> tuple[set[str], str | None]:
+        normalized = [normalize_sku(sku) for sku in skus if normalize_sku(sku)]
+        if not normalized:
+            return set(), None
+
+        if tuple(normalized) == self.create_duplicate_scope:
+            return set(self.create_existing_skus), None
+
+        has_memory_catalog = self.shopify_df_raw is not None and not self.shopify_df_raw.empty
+        has_cached_catalog = False
+        if not has_memory_catalog:
+            try:
+                has_cached_catalog = not load_shopify_sku_cache().empty
+            except Exception:
+                has_cached_catalog = False
+        if has_memory_catalog or has_cached_catalog:
+            self.duplicate_check_text.set(f"Checking Shopify for {len(normalized)} scoped SKU(s)...")
+        else:
+            self.duplicate_check_text.set(
+                f"Building local Shopify SKU cache (one-time read-only sync), then checking {len(normalized)} SKU(s)..."
+            )
+        self._set_duplicate_check_busy(True)
+        self._set_duplicate_check_progress(
+            0,
+            len(normalized),
+            f"Checking Shopify for {len(normalized)} scoped SKU(s)... 0/{len(normalized)}",
+        )
+        update_step = max(1, len(normalized) // 100)
+        last_progress = 0
+
+        def on_progress(done: int, total: int) -> None:
+            nonlocal last_progress
+            if total <= 0:
+                return
+            if done < total and done - last_progress < update_step:
+                return
+            last_progress = done
+            self._set_duplicate_check_progress(
+                done,
+                total,
+                f"Checking Shopify for {total} scoped SKU(s)... {done}/{total}",
+            )
+            self.root.update_idletasks()
+
+        self.root.update_idletasks()
+        existing, error, df = self._fetch_existing_shopify_skus(normalized, progress_callback=on_progress)
+        self._set_duplicate_check_busy(False)
+        if error:
+            return set(), error
+
+        self.create_existing_skus = set(existing)
+        self.create_duplicate_scope = tuple(normalized)
+        if df is not None:
+            self.shopify_df_raw = df
+            self._refresh_input_metrics()
+
+        if not existing:
+            self.duplicate_check_text.set(f"Shopify duplicate check complete: none found across {len(normalized)} scoped SKU(s).")
+        else:
+            existing_ordered = [sku for sku in normalized if sku in existing]
+            preview = ", ".join(existing_ordered[:12])
+            more = "" if len(existing_ordered) <= 12 else f" (+{len(existing_ordered) - 12} more)"
+            self.duplicate_check_text.set(
+                f"{len(existing_ordered)} SKU(s) already exist and will be excluded: {preview}{more}"
+            )
+        return existing, None
+
+    def _selected_update_fields(self) -> list[str]:
+        selected: list[str] = []
+        if self.update_title.get():
+            selected.append("title")
+        if self.update_price.get():
+            selected.append("price")
+        if self.update_cost.get():
+            selected.append("cost")
+        if self.update_description.get():
+            selected.append("description_html")
+        if self.update_images.get():
+            selected.append("media_urls")
+        if self.update_category_fields.get():
+            selected.extend(["type", "google_product_type", "category_code", "product_subtype"])
+        if self.update_vendor.get():
+            selected.append("vendor")
+        if self.update_weight.get():
+            selected.append("weight")
+        if self.update_barcode.get():
+            selected.append("barcode")
+        if self.update_application.get():
+            selected.append("application")
+        return selected
+
+    def _update_tab_access(self) -> None:
+        if not hasattr(self, "notebook"):
+            return
+        if not self.session.setup_complete:
+            self.notebook.tab(1, state="disabled")
+            self.notebook.tab(2, state="disabled")
+            return
+        self.notebook.tab(1, state="normal")
+        if self.session.processing_complete:
+            self.notebook.tab(2, state="normal")
+            return
+        self.notebook.tab(2, state="disabled")
+
+    def _capture_setup_to_session(
+        self,
+        show_messages: bool = True,
+        preserve_review_state: bool = False,
+    ) -> bool:
+        if not self.session.mode:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, "Select a Run Mode first.")
+            return False
+
+        pasted_skus = self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+        has_sheet = self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty
+        use_all_sheet_skus = bool(self.use_all_sheet_skus.get())
+
+        if use_all_sheet_skus and not has_sheet:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, "Load a vendor spreadsheet before using all spreadsheet SKUs.")
+            return False
+
+        self.session.source_mapping.vendor = self.vendor_vendor_column.get().strip()
+        self.session.source_mapping.title = self.vendor_title_column.get().strip()
+        self.session.source_mapping.description = self.vendor_description_column.get().strip()
+        self.session.source_mapping.media = self.vendor_image_column.get().strip()
+        self.session.source_mapping.price = self.vendor_price_column.get().strip()
+        self.session.source_mapping.cost = self.vendor_cost_column.get().strip()
+        self.session.source_mapping.sku = self.vendor_sku_column.get().strip()
+        self.session.source_mapping.barcode = self.vendor_barcode_column.get().strip()
+        self.session.source_mapping.weight = self.vendor_weight_column.get().strip()
+        self.session.source_mapping.application = self.vendor_fitment_column.get().strip()
+        if not has_sheet:
+            self.session.source_mapping.sku = "sku"
+
+        sheet_scope_skus: list[str] = []
+        filtered_vendor_df: pd.DataFrame | None = None
+        sheet_rows_matched = 0
+        if has_sheet:
+            sku_column = self.session.source_mapping.sku
+            if not sku_column:
+                if show_messages:
+                    messagebox.showwarning(APP_TITLE, "Map the SKU column before continuing.")
+                return False
+            if sku_column not in self.vendor_df_raw.columns:
+                if show_messages:
+                    messagebox.showwarning(APP_TITLE, "Mapped SKU column is not in the loaded spreadsheet.")
+                return False
+
+            sheet_scope_skus = (
+                self.vendor_df_raw[sku_column]
+                .astype(str)
+                .map(normalize_sku)
+                .replace("", pd.NA)
+                .dropna()
+                .drop_duplicates()
+                .tolist()
+            )
+            if not sheet_scope_skus:
+                if show_messages:
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "Mapped SKU column has no valid SKU values.\n\nSelect the correct SKU column before continuing.",
+                    )
+                return False
+
+        if use_all_sheet_skus:
+            target_skus = sheet_scope_skus
+        else:
+            target_skus = pasted_skus
+
+        if not target_skus:
+            if show_messages:
+                if has_sheet and not use_all_sheet_skus:
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "Paste SKUs or enable 'Use all SKUs from uploaded spreadsheet'.",
+                    )
+                else:
+                    messagebox.showwarning(APP_TITLE, "Provide at least one valid SKU before continuing.")
+            return False
+
+        existing_create_skus: set[str] = set()
+        if self.session.mode == MODE_NEW:
+            if not self.shopify_cache_ready:
+                if show_messages:
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "Shopify SKU cache is still downloading. Wait for it to finish, then run SKU checks.",
+                    )
+                return False
+
+            target_scope = tuple(target_skus)
+            if self._duplicate_check_inflight and self._duplicate_check_active_workers <= 0:
+                self._set_duplicate_check_busy(False)
+            if self._duplicate_check_inflight:
+                elapsed = 0.0
+                if self._duplicate_check_started_at > 0:
+                    elapsed = time.monotonic() - self._duplicate_check_started_at
+                if elapsed > 120.0:
+                    self._set_duplicate_check_busy(False)
+                    self.duplicate_check_text.set("Previous duplicate check timed out and was reset.")
+                elif self._duplicate_check_pending_scope and self._duplicate_check_pending_scope != target_scope:
+                    self._queue_create_duplicate_check(target_skus)
+                    if show_messages:
+                        messagebox.showinfo(
+                            APP_TITLE,
+                            "A previous duplicate check was running for a different SKU scope.\n\nStarted a new check for your current scope. Press Save & Continue again when it completes.",
+                        )
+                    return False
+                else:
+                    if show_messages:
+                        messagebox.showinfo(
+                            APP_TITLE,
+                            "Shopify duplicate check is still running in background.\n\nWait for status to finish, then press Save & Continue again.",
+                        )
+                    return False
+
+            if target_scope != self.create_duplicate_scope:
+                self._queue_create_duplicate_check(target_skus)
+                if show_messages:
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "Running Shopify duplicate check in background for your current SKU scope.\n\nPress Save & Continue again when it completes.",
+                    )
+                return False
+
+            existing_create_skus = set(self.create_existing_skus)
+            if existing_create_skus:
+                target_skus = [sku for sku in target_skus if sku not in existing_create_skus]
+                if not target_skus:
+                    if show_messages:
+                        messagebox.showinfo(APP_TITLE, "All scoped SKUs already exist in Shopify. Nothing to create.")
+                    self.setup_status_text.set("All scoped SKUs already exist in Shopify.")
+                    return False
+
+        if has_sheet:
+            sku_column = self.session.source_mapping.sku
+            working = self.vendor_df_raw.copy()
+            working["_norm_sku"] = working[sku_column].astype(str).map(normalize_sku)
+            working = working[working["_norm_sku"] != ""].copy()
+            target_set = set(target_skus)
+            filtered_vendor_df = working[working["_norm_sku"].isin(target_set)].copy()
+            sheet_rows_matched = len(filtered_vendor_df)
+            if sheet_rows_matched == 0:
+                if show_messages:
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "No scoped SKUs matched the loaded spreadsheet using the mapped SKU column.\n\nCheck SKU mapping before continuing.",
+                    )
+                return False
+            filtered_vendor_df.drop(columns=["_norm_sku"], inplace=True, errors="ignore")
+
+        self.session.vendor_df = filtered_vendor_df if has_sheet else None
+        self.session.pasted_skus = target_skus
+        self.session.target_skus = target_skus
+
+        if self.session.mode == MODE_UPDATE:
+            selected = self._selected_update_fields()
+            if not selected:
+                if show_messages:
+                    messagebox.showwarning(APP_TITLE, "Select at least one update field for Update mode.")
+                return False
+            self.session.update_fields = selected
+        else:
+            self.session.update_fields = []
+
+        self.session.missing_fields = detect_missing_required_fields(self.session, required_root=self.required_root)
+        self.session.setup_complete = True
+        if not preserve_review_state:
+            self.session.processing_complete = False
+            self.session.products = []
+        self.review_refresh_pending = False
+        self.review_refresh_inflight = False
+        if not preserve_review_state:
+            self._cancel_review_table_refresh()
+            self._hide_review_busy_overlay()
+            self.review_loaded_raw = {}
+            self.review_loaded_display = {}
+            self.review_loaded_truncated = {}
+            self.review_cost_options_loaded_for_sku = ""
+        if has_sheet:
+            self.source_status_text.set(
+                f"SKU scope: {len(target_skus)} | Spreadsheet rows matched to scope: {sheet_rows_matched}"
+            )
+        else:
+            self.source_status_text.set(f"SKU scope: {len(target_skus)} | Spreadsheet: not loaded")
+        if self.session.mode == MODE_NEW and existing_create_skus:
+            self.rules_status.configure(
+                text=f"Excluded existing Shopify SKUs from Create scope: {len(existing_create_skus)}"
+            )
+        return True
+
+    def _continue_from_setup(self) -> None:
+        if not self._capture_setup_to_session(show_messages=True):
+            return
+
+        missing_text = ", ".join(self.session.missing_fields) or "none"
+        self.processing_status_text.set(
+            f"Setup saved for {merge_mode_label(self.session.mode)}. Missing fields: {missing_text}"
+        )
+        self.review_status_text.set("")
+        self._update_tab_access()
+        if self.session.missing_fields:
+            self.setup_status_text.set("Setup saved. Missing fields found; continue in Processing to scrape.")
+            self.notebook.select(1)
+            return
+
+        self.setup_status_text.set("Setup saved. All required fields mapped; generating review data now.")
+        self.notebook.select(1)
+        self._start_processing_clicked(auto_open_review=True)
+
+    def _reprocess_from_review(self) -> None:
+        if not self._capture_setup_to_session(show_messages=True, preserve_review_state=True):
+            return
+        self.setup_status_text.set("Remap applied. Reprocessing now...")
+        self.processing_status_text.set("Reprocessing with updated mappings...")
+        self.review_status_text.set("Reprocessing in background...")
+        self._show_review_busy_overlay("Reprocessing remapped products...")
+        started = self._start_processing_clicked(auto_open_review=False)
+        if not started:
+            self._hide_review_busy_overlay()
+
+    def _refresh_vendor_sheet_ui(self) -> None:
+        has_vendor_sheet_rows = self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty
+
+        self.vendor_preview_wrap.pack_forget()
+        self.vendor_mapping_wrap.pack_forget()
+        if has_vendor_sheet_rows:
+            self.vendor_mapping_wrap.pack(fill=X, pady=(0, 8))
+            self.vendor_preview_wrap.pack(fill=X, pady=(0, 8))
+
+    def _parse_sku_text(self, raw_text: str) -> list[str]:
+        tokens = re.split(r"[\s,;|]+", raw_text or "")
+        seen: set[str] = set()
+        values: list[str] = []
+        for token in tokens:
+            sku = normalize_sku(token)
+            if not sku or sku in seen:
+                continue
+            seen.add(sku)
+            values.append(sku)
+        return values
+
+    def _clear_pasted_skus(self) -> None:
+        self.sku_text_widget.delete("1.0", END)
+        self.sku_text_status.set("")
+        if self.session.mode == MODE_NEW and not self.use_all_sheet_skus.get():
+            self.create_existing_skus = set()
+            self.create_duplicate_scope = ()
+            self.duplicate_check_text.set("Shopify duplicate check runs when SKU scope is loaded.")
+        self._refresh_input_metrics()
+
+    def _set_vendor_dataframe(self, df: pd.DataFrame, path_text: str, source_is_sheet: bool) -> None:
+        normalized_df = _sanitize_dataframe_columns(df)
+        self.vendor_df_raw = normalized_df
+        self.vendor_df_stitched = None
+        self.plan_df = None
+        self.vendor_source_is_sheet = source_is_sheet
+        self.vendor_path.set(path_text)
+        _tree_show_dataframe(self.vendor_preview, _safe_head(normalized_df))
+        self._bind_vendor_columns(list(normalized_df.columns))
+        self._auto_suggest_vendor()
+        sample_columns = ", ".join(list(normalized_df.columns)[:8])
+        if len(normalized_df.columns) > 8:
+            sample_columns += ", ..."
+        self.source_status_text.set(
+            f"Vendor input loaded: {len(normalized_df)} rows, {len(normalized_df.columns)} columns. {sample_columns}"
+        )
+        self._refresh_input_metrics()
+        self._refresh_vendor_sheet_ui()
+        if self.session.mode == MODE_NEW and self.use_all_sheet_skus.get():
+            scope_skus = self._sheet_scope_skus()
+            if scope_skus:
+                self._queue_create_duplicate_check(scope_skus)
+
+    def _load_vendor_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Vendor File",
+            filetypes=[("Spreadsheet", "*.csv *.xlsx *.xls"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            df = read_table_from_path(path)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not read vendor file:\n{exc}")
+            return
+        if len(df.columns) == 0:
+            messagebox.showerror(
+                APP_TITLE,
+                "This file did not produce any columns. Confirm the file has a header row and values.",
+            )
+            return
+
+        self._set_vendor_dataframe(df=df, path_text=path, source_is_sheet=True)
+
+    def _load_pasted_skus(self) -> None:
+        raw_text = self.sku_text_widget.get("1.0", END)
+        skus = self._parse_sku_text(raw_text)
+        if not skus:
+            messagebox.showwarning(APP_TITLE, "No valid SKUs found in pasted text.")
+            return
+
+        self.sku_text_status.set(f"Found {len(skus)} unique SKUs in text scope")
+        self.source_status_text.set(f"SKU text scope ready: {len(skus)} SKUs.")
+        self._refresh_input_metrics()
+        if self.session.mode == MODE_NEW and not self.use_all_sheet_skus.get():
+            self._queue_create_duplicate_check(skus)
+
+    def _refresh_input_metrics(self) -> None:
+        vendor_skus = 0
+        if self.vendor_df_raw is not None and not self.vendor_df_raw.empty:
+            sku_col = self.vendor_sku_column.get().strip()
+            if sku_col and sku_col in self.vendor_df_raw.columns:
+                vendor_skus = int(self.vendor_df_raw[sku_col].astype(str).map(normalize_sku).replace("", pd.NA).dropna().nunique())
+            else:
+                vendor_skus = int(len(self.vendor_df_raw))
+
+        scoped_skus = len(self._parse_sku_text(self.sku_text_widget.get("1.0", END)))
+        if self.use_all_sheet_skus.get() and vendor_skus:
+            scoped_skus = vendor_skus
+
+        shopify_rows = int(len(self.shopify_df_raw)) if self.shopify_df_raw is not None else 0
+        self.input_metrics_text.set(
+            f"Vendor SKUs: {vendor_skus} | Scoped SKUs: {scoped_skus} | Shopify Catalog SKUs: {shopify_rows}"
+        )
+    def _bind_vendor_columns(self, columns: list[str]) -> None:
+        normalized = [str(column) for column in columns]
+        required = normalized
+        optional = [""] + normalized
+        optional_widgets = [
+            self.vendor_vendor_combo,
+            self.vendor_title_combo,
+            self.vendor_desc_combo,
+            self.vendor_fitment_combo,
+            self.vendor_image_combo,
+            self.vendor_price_combo,
+            self.vendor_cost_combo,
+            self.vendor_barcode_combo,
+            self.vendor_weight_combo,
+            getattr(self, "remap_vendor_combo", None),
+            getattr(self, "remap_title_combo", None),
+            getattr(self, "remap_desc_combo", None),
+            getattr(self, "remap_media_combo", None),
+            getattr(self, "remap_price_combo", None),
+            getattr(self, "remap_cost_combo", None),
+            getattr(self, "remap_barcode_combo", None),
+            getattr(self, "remap_weight_combo", None),
+            getattr(self, "remap_application_combo", None),
+        ]
+        required_widgets = [self.vendor_sku_combo, getattr(self, "remap_sku_combo", None)]
+
+        for widget in optional_widgets:
+            if widget is None:
+                continue
+            _combobox_set_values(widget, optional)
+        for widget in required_widgets:
+            if widget is None:
+                continue
+            _combobox_set_values(widget, required)
+
+    def _suggest_vendor_column_by_keywords(self, keywords: list[str]) -> str | None:
+        if self.vendor_df_raw is None:
+            return None
+        lowered_keywords = [keyword.lower() for keyword in keywords]
+        for column in self.vendor_df_raw.columns:
+            name = str(column).lower()
+            if any(keyword in name for keyword in lowered_keywords):
+                return str(column)
+        return None
+
+    def _auto_suggest_vendor(self) -> None:
+        if self.vendor_df_raw is None or self.vendor_df_raw.empty:
+            return
+
+        suggestions = suggest_columns(
+            self.vendor_df_raw,
+            fields=["sku", "title", "description", "fitment", "years", "image_url", "price", "cost", "barcode"],
+        )
+        self.vendor_vendor_column.set(
+            self._suggest_vendor_column_by_keywords(["vendor", "brand", "manufacturer"]) or self.vendor_vendor_column.get()
+        )
+        self.vendor_sku_column.set(suggestions["sku"].column or self.vendor_sku_column.get())
+        self.vendor_title_column.set(suggestions["title"].column or self.vendor_title_column.get())
+        self.vendor_description_column.set(suggestions["description"].column or self.vendor_description_column.get())
+        self.vendor_fitment_column.set(suggestions["fitment"].column or self.vendor_fitment_column.get())
+        self.vendor_image_column.set(suggestions["image_url"].column or self.vendor_image_column.get())
+        self.vendor_price_column.set(suggestions["price"].column or self.vendor_price_column.get())
+        self.vendor_cost_column.set(suggestions["cost"].column or self.vendor_cost_column.get())
+        self.vendor_barcode_column.set(suggestions["barcode"].column or self.vendor_barcode_column.get())
+
+        self.vendor_weight_column.set(
+            self._suggest_vendor_column_by_keywords(["weight", "lbs", "pounds"]) or self.vendor_weight_column.get()
+        )
+
+        self.rules_status.configure(text="Vendor auto-suggestions applied for core mapping fields.")
+        self._refresh_input_metrics()
+        self._on_vendor_sku_mapping_changed()
+
+    def _stitch_vendor_rows(self) -> None:
+        if self.vendor_df_raw is None or self.vendor_df_raw.empty:
+            messagebox.showwarning(APP_TITLE, "Load vendor input first (spreadsheet or pasted SKUs).")
+            return
+
+        sku_column = self.vendor_sku_column.get().strip()
+        if not sku_column:
+            messagebox.showwarning(APP_TITLE, "Select the Vendor SKU column first.")
+            return
+
+        try:
+            stitched = stitch_rows_by_sku(self.vendor_df_raw, sku_column, carry_down_sku=self.carry_down_sku.get())
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not stitch rows:\n{exc}")
+            return
+
+        self.vendor_df_stitched = stitched
+        self.plan_df = None
+        _tree_show_dataframe(self.vendor_preview, _safe_head(stitched))
+        self.rules_status.configure(
+            text=f"Stitched vendor rows: {len(stitched)} SKU records from {len(self.vendor_df_raw)} source rows."
+        )
+        self._refresh_input_metrics()
+
+    def _sync_shopify_catalog_for_matching(self, show_errors: bool, target_skus: list[str] | None = None) -> bool:
+        config = load_shopify_config()
+        if config is None:
+            if show_errors:
+                messagebox.showerror(APP_TITLE, "Invalid config/shopify.json. Cannot sync Shopify catalog.")
+            return False
+
+        existing_token = load_shopify_token()
+        if existing_token is None:
+            self._connect_shopify_worker(allow_handshake=False)
+            existing_token = load_shopify_token()
+        if existing_token is None:
+            if show_errors:
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Shopify is not connected. Connect Shopify first, then try processing again.",
+                )
+            return False
+
+        use_targeted = bool(target_skus)
+        if use_targeted:
+            df, error = fetch_shopify_catalog_for_skus(
+                config=config,
+                access_token=existing_token.access_token,
+                skus=target_skus or [],
+            )
+            if not error and (df is None or df.empty):
+                # Fall back when search syntax or index misses a subset.
+                df, error = fetch_shopify_catalog_dataframe(config=config, access_token=existing_token.access_token)
+        else:
+            df, error = fetch_shopify_catalog_dataframe(config=config, access_token=existing_token.access_token)
+
+        if error:
+            if show_errors:
+                messagebox.showerror(APP_TITLE, f"Shopify catalog sync failed:\n{error}")
+            return False
+
+        self.shopify_df_raw = df
+        self._refresh_input_metrics()
+        if use_targeted:
+            self.rules_status.configure(text=f"Shopify targeted sync complete: {len(df)} SKU rows loaded.")
+        else:
+            self.rules_status.configure(text=f"Shopify catalog synced in background: {len(df)} SKU rows.")
+        return True
+
+    def _build_action_plan(self) -> None:
+        if self.vendor_df_raw is None:
+            messagebox.showwarning(APP_TITLE, "Load vendor input first.")
+            return
+
+        if self.vendor_df_stitched is None:
+            self._stitch_vendor_rows()
+            if self.vendor_df_stitched is None:
+                return
+
+        if self.run_mode.get() in {RUN_MODE_UPDATE, RUN_MODE_UPSERT} and (
+            self.shopify_df_raw is None or self.shopify_df_raw.empty
+        ):
+            synced = self._sync_shopify_catalog_for_matching(show_errors=True)
+            if not synced:
+                return
+
+        shopify_df_for_plan = self.shopify_df_raw
+
+        vendor_year_columns = [
+            column
+            for column in [
+                self.vendor_fitment_column.get().strip(),
+                self.vendor_title_column.get().strip(),
+                self.vendor_description_column.get().strip(),
+            ]
+            if column
+        ]
+        config = PlanningConfig(
+            run_mode=self.run_mode.get(),
+            year_policy=self.year_policy.get(),
+            vendor_sku_column=self.vendor_sku_column.get().strip(),
+            vendor_title_column=self.vendor_title_column.get().strip() or None,
+            vendor_description_column=self.vendor_description_column.get().strip() or None,
+            vendor_fitment_column=self.vendor_fitment_column.get().strip() or None,
+            vendor_year_columns=vendor_year_columns,
+            shopify_sku_column=self.shopify_sku_column.get().strip() or None,
+            shopify_title_column=self.shopify_title_column.get().strip() or None,
+            shopify_description_column=self.shopify_description_column.get().strip() or None,
+            shopify_fitment_column=self.shopify_fitment_column.get().strip() or None,
+            propose_title_year_update=self.propose_title_year_update.get(),
+            only_rows_with_year_changes=self.only_rows_with_year_changes.get(),
+        )
+
+        try:
+            plan = build_action_plan(vendor_df=self.vendor_df_stitched, shopify_df=shopify_df_for_plan, config=config)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not build action plan:\n{exc}")
+            return
+
+        self.plan_df = plan
+        self._refresh_plan_preview()
+        self.plan_status.configure(text=f"Action plan built with {len(plan)} rows.")
+
+    def _filtered_plan(self) -> pd.DataFrame:
+        if self.plan_df is None or self.plan_df.empty:
+            return pd.DataFrame()
+
+        allowed: list[str] = []
+        if self.filter_update.get():
+            allowed.append("update")
+        if self.filter_create.get():
+            allowed.append("create")
+        if self.filter_skip.get():
+            allowed.append("skip")
+        if not allowed:
+            return self.plan_df.iloc[0:0].copy()
+        return self.plan_df[self.plan_df["row_action"].isin(allowed)].copy()
+
+    def _refresh_plan_preview(self) -> None:
+        plan = self._filtered_plan()
+        _tree_show_dataframe(self.plan_preview, _safe_head(plan, rows=100))
+
+        full = self.plan_df if self.plan_df is not None else pd.DataFrame()
+        updates = int((full.get("row_action", pd.Series(dtype=str)) == "update").sum()) if not full.empty else 0
+        creates = int((full.get("row_action", pd.Series(dtype=str)) == "create").sum()) if not full.empty else 0
+        skips = int((full.get("row_action", pd.Series(dtype=str)) == "skip").sum()) if not full.empty else 0
+        rows = int(len(full))
+
+        self.plan_metrics.configure(
+            text=f"Rows: {rows} | Update: {updates} | Create: {creates} | Skip: {skips}"
+        )
+
+    def _export_dataframe(self, df: pd.DataFrame, suggested_name: str) -> None:
+        if df.empty:
+            messagebox.showinfo(APP_TITLE, "There is no data to export.")
+            return
+        suggested_path = Path(suggested_name)
+        default_name = (
+            suggested_path.with_suffix(".xlsx").name
+            if suggested_path.suffix.lower() == ".csv"
+            else suggested_path.name
+        )
+        path = filedialog.asksaveasfilename(
+            title="Save Export",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Workbook", "*.xlsx"), ("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        export_df = df.copy()
+        for column in export_df.columns:
+            export_df[column] = (
+                export_df[column]
+                .fillna("")
+                .map(lambda value: str(value).replace("\x00", "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip())
+            )
+        output_path = Path(path)
+        try:
+            if output_path.suffix.lower() == ".xlsx":
+                with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+                    sheet_name = "Export"
+                    export_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                    worksheet = writer.sheets.get(sheet_name)
+                    if worksheet is not None:
+                        header_to_column: dict[str, int] = {}
+                        for header_cell in worksheet[1]:
+                            header_text = str(header_cell.value).strip().lower() if header_cell.value is not None else ""
+                            if header_text:
+                                header_to_column[header_text] = int(header_cell.column)
+                        for column_name in ("sku", "barcode", "mpn"):
+                            column_index = header_to_column.get(column_name)
+                            if not column_index:
+                                continue
+                            for row in worksheet.iter_rows(
+                                min_row=2,
+                                max_row=worksheet.max_row,
+                                min_col=column_index,
+                                max_col=column_index,
+                            ):
+                                cell = row[0]
+                                if cell.value is None:
+                                    continue
+                                cell.value = str(cell.value).strip()
+                                cell.number_format = "@"
+            else:
+                export_df.to_csv(
+                    output_path,
+                    index=False,
+                    encoding="utf-8-sig",
+                    quoting=csv.QUOTE_ALL,
+                    lineterminator="\n",
+                )
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not save file:\n{exc}")
+            return
+        if output_path.suffix.lower() == ".csv":
+            self.export_status.configure(
+                text=f"Exported: {path} (Excel may auto-format long IDs; save as .xlsx to keep SKU/Barcode/MPN exact)."
+            )
+        else:
+            self.export_status.configure(text=f"Exported: {path}")
+
+    def _export_full_plan(self) -> None:
+        if self.plan_df is None:
+            messagebox.showinfo(APP_TITLE, "Build an action plan first.")
+            return
+        self._export_dataframe(self.plan_df, "product_prospector_action_plan.csv")
+
+    def _export_unmatched(self) -> None:
+        if self.plan_df is None:
+            messagebox.showinfo(APP_TITLE, "Build an action plan first.")
+            return
+        unmatched = self.plan_df[self.plan_df["match_status"] == "unmatched"].copy()
+        self._export_dataframe(unmatched, "product_prospector_unmatched_skus.csv")
+
+    def _export_filtered(self) -> None:
+        if self.plan_df is None:
+            messagebox.showinfo(APP_TITLE, "Build an action plan first.")
+            return
+        filtered = self._filtered_plan()
+        self._export_dataframe(filtered, "product_prospector_filtered_view.csv")
+
+    def _export_create_template(self) -> None:
+        if self.plan_df is None:
+            messagebox.showinfo(APP_TITLE, "Build an action plan first.")
+            return
+        template = build_create_product_output(self.plan_df)
+        if template.empty:
+            messagebox.showinfo(APP_TITLE, "No create rows found in the current action plan.")
+            return
+        self._export_dataframe(template, "product_prospector_create_product_template.csv")
+
+    def _load_settings(self) -> None:
+        settings = load_app_settings()
+        self.run_mode.set("")
+        self.year_policy.set(settings.year_policy)
+        self.carry_down_sku.set(settings.carry_down_sku)
+        self.propose_title_year_update.set(settings.propose_title_year_update)
+        self.only_rows_with_year_changes.set(settings.only_rows_with_year_changes)
+
+    def _on_close(self) -> None:
+        self._stop_shopify_cache_spinner()
+        self._hide_review_busy_overlay()
+        settings = AppSettings(
+            run_mode=self.run_mode.get(),
+            year_policy=self.year_policy.get(),
+            carry_down_sku=self.carry_down_sku.get(),
+            propose_title_year_update=self.propose_title_year_update.get(),
+            only_rows_with_year_changes=self.only_rows_with_year_changes.get(),
+        )
+        try:
+            save_app_settings(settings)
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def main() -> int:
+    mutex_handle = _acquire_single_instance_mutex()
+    if mutex_handle is None:
+        _show_already_running_message()
+        return 1
+    try:
+        app = ProductProspectorDesktopApp()
+        app.run()
+        return 0
+    finally:
+        _release_single_instance_mutex(mutex_handle)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

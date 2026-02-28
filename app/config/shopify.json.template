@@ -1,0 +1,19 @@
+{
+  "shop_domain": "your-store.myshopify.com",
+  "storefront_domain": "www.yourstore.com",
+  "client_id": "",
+  "client_secret": "",
+  "admin_api_access_token": "",
+  "auth_mode": "client_credentials",
+  "api_version": "2025-10",
+  "scopes": [
+    "read_products",
+    "write_products",
+    "read_metafields",
+    "write_metafields"
+  ],
+  "redirect_uri": "http://127.0.0.1:8787/callback",
+  "callback_bind_host": "0.0.0.0",
+  "callback_bind_port": 8787,
+  "auth_timeout_seconds": 240
+}

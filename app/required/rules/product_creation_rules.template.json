@@ -1,0 +1,31 @@
+{
+  "title_rules": {
+    "format": "{vendor_normalized} {product_name} {fitment}",
+    "notes": "Fill this with your exact title normalization rules.",
+    "max_length": 255
+  },
+  "description_rules": {
+    "notes": "Fill this with your exact description composition rules and cleanup logic."
+  },
+  "defaults": {
+    "inventory_available": 3000000,
+    "status": "draft",
+    "fallback_weight_lb": 2,
+    "min_weight_lb": 2,
+    "max_weight_lb": 149,
+    "enable_low_stock": true
+  },
+  "metafield_keys": {
+    "application": "custom.application",
+    "google_product_type": "custom.google_product_type",
+    "product_subtype": "custom.product_subtype",
+    "category_codes_simplified": "custom.category_codes_simplified",
+    "variant_enable_low_stock": "custom.enable_low_stock",
+    "variant_google_mpn": "google.mpn"
+  },
+  "lookup_sources": {
+    "discounts_sheet": "PPU Line Card",
+    "type_mappings_sheet": "Filter Upgrade Master File",
+    "shopify_like_product_matching": true
+  }
+}

@@ -1,0 +1,2 @@
+"""Product Prospector package."""
+

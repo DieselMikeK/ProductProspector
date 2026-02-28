@@ -1,0 +1,4 @@
+pattern,category,subtype,google_leaf,enabled,notes
+\bpie\s*cut(?:s)?\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,MBRP pie cut kits
+\b(cat[-\s]*back|turbo[-\s]*back|axle[-\s]*back|exhaust\s+system)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,Common exhaust system phrasing
+\bexhaust\s+brake\b|\bengine\s+brake\b|\bpacbrake\b,Exhaust Brakes / Engine Brakes,,,1,Brake-specific override
