@@ -13,6 +13,8 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv-mac-build/
+.venv-win-build/
 .env/
 
 # === PyInstaller build artifacts ===
@@ -22,12 +24,16 @@ dist/
 
 # === Compiled binaries ===
 *.exe
+ProductProspector.app/
 
 # === Runtime-generated files (safe to regenerate) ===
 app/config/shopify_sku_cache.csv
 
 # === Downloaded/cached images (large, runtime-generated) ===
 images/
+
+# === Design source files ===
+*.themaskproj
 
 # === IDE & OS files ===
 .vscode/

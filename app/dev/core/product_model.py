@@ -9,7 +9,11 @@ PRODUCT_EXPORT_COLUMNS = [
     "description_html",
     "media_urls",
     "price",
+    "map_price",
+    "msrp_price",
+    "jobber_price",
     "cost",
+    "dealer_cost",
     "inventory",
     "barcode",
     "weight",
@@ -18,6 +22,7 @@ PRODUCT_EXPORT_COLUMNS = [
     "google_product_type",
     "category_code",
     "product_subtype",
+    "core_charge_product_code",
     "mpn",
     "brand",
     "application",
@@ -38,7 +43,11 @@ class Product:
     description_html: str = ""
     media_urls: list[str] = field(default_factory=list)
     price: str = ""
+    map_price: str = ""
+    msrp_price: str = ""
+    jobber_price: str = ""
     cost: str = ""
+    dealer_cost: str = ""
     inventory: int = 3000000
     sku: str = ""
     barcode: str = ""
@@ -48,6 +57,7 @@ class Product:
     google_product_type: str = ""
     category_code: str = ""
     product_subtype: str = ""
+    core_charge_product_code: str = ""
     mpn: str = ""
     brand: str = ""
     application: str = ""
@@ -84,7 +94,11 @@ class Product:
             "description_html": _clean_text(self.description_html),
             "media_urls": " | ".join([item for item in self.media_urls if _clean_text(item)]),
             "price": _clean_text(self.price),
+            "map_price": _clean_text(self.map_price),
+            "msrp_price": _clean_text(self.msrp_price),
+            "jobber_price": _clean_text(self.jobber_price),
             "cost": _clean_text(self.cost),
+            "dealer_cost": _clean_text(self.dealer_cost),
             "inventory": str(self.inventory),
             "barcode": _clean_text(self.barcode),
             "weight": _clean_text(self.weight),
@@ -93,6 +107,7 @@ class Product:
             "google_product_type": _clean_text(self.google_product_type),
             "category_code": _clean_text(self.category_code),
             "product_subtype": _clean_text(self.product_subtype),
+            "core_charge_product_code": _clean_text(self.core_charge_product_code),
             "mpn": _clean_text(self.mpn),
             "brand": _clean_text(self.brand),
             "application": _clean_text(self.application),

@@ -924,7 +924,17 @@ def _merge_seed_payload(
     seed = seed_payload or {}
 
     if seed:
-        for key in ["title", "description_html", "price", "cost", "barcode", "weight", "application", "vendor"]:
+        for key in [
+            "title",
+            "description_html",
+            "price",
+            "cost",
+            "barcode",
+            "weight",
+            "application",
+            "vendor",
+            "core_charge_product_code",
+        ]:
             if _clean_text(merged.get(key, "")):
                 continue
             value = _clean_text(seed.get(key, ""))
@@ -963,7 +973,17 @@ def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: boo
         if combined_media:
             merged["media_urls"] = " | ".join(combined_media)
 
-    for key in ["title", "description_html", "price", "cost", "barcode", "weight", "application", "vendor"]:
+    for key in [
+        "title",
+        "description_html",
+        "price",
+        "cost",
+        "barcode",
+        "weight",
+        "application",
+        "vendor",
+        "core_charge_product_code",
+    ]:
         value = _clean_text(from_jsonld.get(key, "")) or _clean_text(from_heuristic.get(key, ""))
         if value:
             merged[key] = value
@@ -1309,6 +1329,10 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
     output["title"] = _extract_meta_content(html, "og:title") or _extract_first(r"<title>([^<]+)</title>", html, flags=re.IGNORECASE)
     output["description_html"] = _extract_meta_content(html, "description")
     output["price"] = _extract_first(r'(?i)(?:\"price\"|price|msrp|retail)\D{0,20}([0-9]{1,6}(?:\.[0-9]{1,2})?)', context)
+    output["core_charge_product_code"] = _extract_first(
+        r"(?i)(?:core(?:\s*charge)?|corecharge)\D{0,28}(\$?\s*[0-9]{1,5}(?:\.[0-9]{1,2})?)",
+        context,
+    )
     output["weight"] = _extract_first(r'(?i)(?:weight|wt)\D{0,20}([0-9]{1,3}(?:\.[0-9]{1,3})?)', context)
     output["barcode"] = _extract_first(r'(?i)(?:upc|gtin|barcode|ean)\D{0,20}([0-9]{8,14})', context)
     output["vendor"] = _extract_meta_content(html, "og:site_name")
@@ -1507,7 +1531,18 @@ def _scrape_single_sku(
             else:
                 resolved_payload = {}
             resolved_payload = _merge_seed_payload(resolved_payload, resolved_seed_payload, page_url=resolved_url)
-            for key in ["title", "description_html", "media_urls", "price", "cost", "barcode", "weight", "application", "vendor"]:
+            for key in [
+                "title",
+                "description_html",
+                "media_urls",
+                "price",
+                "cost",
+                "barcode",
+                "weight",
+                "application",
+                "vendor",
+                "core_charge_product_code",
+            ]:
                 value = _clean_text(resolved_payload.get(key, "")) or _clean_text(search_payload.get(key, ""))
                 if value:
                     merged[key] = value

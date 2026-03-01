@@ -9,6 +9,7 @@ from product_prospector.core.pricing_rules import (
     find_vendor_discount_file,
     load_vendor_discounts,
 )
+from product_prospector.core.core_charge_codes import normalize_core_charge_product_code
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.product_model import Product
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
@@ -365,6 +366,27 @@ def _format_currency(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def _normalize_currency_text(value: str) -> str:
+    return _format_currency(_to_float(value))
+
+
+def _resolve_effective_price(product: Product) -> tuple[str, str]:
+    map_value = _to_float(product.map_price)
+    base_value = _to_float(product.price)
+    msrp_value = _to_float(product.msrp_price)
+    jobber_value = _to_float(product.jobber_price)
+
+    if map_value is not None:
+        return _format_currency(map_value), "map_price"
+    if base_value is not None:
+        return _format_currency(base_value), "price"
+    if msrp_value is not None:
+        return _format_currency(msrp_value), "msrp_price"
+    if jobber_value is not None:
+        return _format_currency(jobber_value), "jobber_price"
+    return "", "missing"
+
+
 def _infer_cost_if_missing(product: Product, discounts_root: Path) -> tuple[str, str]:
     price_value = _to_float(product.price)
     if price_value is None:
@@ -437,9 +459,19 @@ def normalize_product(
     if should("media_urls"):
         product.media_urls = _normalize_media_urls(product.media_urls)
     if should("price"):
-        product.price = _format_currency(_to_float(product.price))
+        product.map_price = _normalize_currency_text(product.map_price)
+        product.msrp_price = _normalize_currency_text(product.msrp_price)
+        product.jobber_price = _normalize_currency_text(product.jobber_price)
+        resolved_price, price_source = _resolve_effective_price(product)
+        product.price = resolved_price
+        product.field_sources["price_rule"] = price_source
     if should("weight"):
         product.weight = _normalize_weight(product.weight)
+    if mode != "update" or "core_charge_product_code" in selected:
+        product.core_charge_product_code = normalize_core_charge_product_code(
+            product.core_charge_product_code,
+            required_root=required_root,
+        )
     product.inventory = 3000000
 
     if mode != "update":
@@ -449,9 +481,18 @@ def normalize_product(
 
     if should("cost"):
         cost_value = _to_float(product.cost)
-        if cost_value is not None:
-            product.cost = _format_currency(cost_value)
-            product.field_sources["cost_inference"] = "already_present"
+        dealer_cost_value = _to_float(product.dealer_cost)
+        if dealer_cost_value is not None:
+            product.dealer_cost = _format_currency(dealer_cost_value)
+
+        known_costs = [value for value in [cost_value, dealer_cost_value] if value is not None]
+        if known_costs:
+            lowest_cost = min(known_costs)
+            product.cost = _format_currency(lowest_cost)
+            if dealer_cost_value is not None and (cost_value is None or dealer_cost_value <= cost_value):
+                product.field_sources["cost_inference"] = "dealer_lowest"
+            else:
+                product.field_sources["cost_inference"] = "already_present"
         else:
             inferred_cost, reason = _infer_cost_if_missing(product, required_root)
             if inferred_cost:

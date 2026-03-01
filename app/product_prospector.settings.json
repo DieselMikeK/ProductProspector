@@ -1,5 +1,5 @@
 {
-  "run_mode": "Create New",
+  "run_mode": "create_new_products",
   "year_policy": "replace",
   "carry_down_sku": false,
   "propose_title_year_update": false,

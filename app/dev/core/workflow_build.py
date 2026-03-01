@@ -11,6 +11,11 @@ from product_prospector.core.pricing_rules import (
     load_vendor_discounts,
     resolve_discount_candidates,
 )
+from product_prospector.core.pricing_priority_rules import (
+    PricePriorityRules,
+    classify_price_column_role,
+    load_price_priority_rules,
+)
 from product_prospector.core.product_model import Product
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.session_state import MODE_NEW, MODE_UPDATE, AppSession
@@ -51,6 +56,118 @@ def _to_float(value: object) -> float | None:
         return float(cleaned)
     except Exception:
         return None
+
+
+def _format_currency(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.2f}"
+
+
+def _is_dealer_column_name(value: object, price_rules: PricePriorityRules) -> bool:
+    return classify_price_column_role(value, price_rules) == "dealer"
+
+
+def _dealer_columns_for_sheet(mapping, columns: list[str], price_rules: PricePriorityRules) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+
+    def add(column: str) -> None:
+        key = _clean_text(column)
+        if not key or key in seen:
+            return
+        if key not in columns:
+            return
+        seen.add(key)
+        output.append(key)
+
+    mapped_dealer = _clean_text(getattr(mapping, "dealer_cost", ""))
+    if mapped_dealer:
+        add(mapped_dealer)
+
+    mapped_cost = _clean_text(getattr(mapping, "cost", ""))
+    if mapped_cost and _is_dealer_column_name(mapped_cost, price_rules=price_rules):
+        add(mapped_cost)
+
+    for column in columns:
+        if _is_dealer_column_name(column, price_rules=price_rules):
+            add(column)
+
+    return output
+
+
+def _lowest_currency_text(values: list[str]) -> str:
+    lowest: float | None = None
+    for value in values:
+        parsed = _to_float(value)
+        if parsed is None:
+            continue
+        if lowest is None or parsed < lowest:
+            lowest = parsed
+    return _format_currency(lowest)
+
+
+def _infer_price_fields_from_row(
+    row: pd.Series,
+    mapping,
+    price_rules: PricePriorityRules,
+) -> tuple[str, str, str, str]:
+    # Returns: (price, map_price, msrp_price, jobber_price)
+    base_price = _row_value(row, getattr(mapping, "price", ""))
+    map_price = _row_value(row, getattr(mapping, "map_price", ""))
+    msrp_price = _row_value(row, getattr(mapping, "msrp_price", ""))
+    jobber_price = _row_value(row, getattr(mapping, "jobber_price", ""))
+
+    for column_name in list(row.index):
+        if map_price and msrp_price and jobber_price and base_price:
+            break
+        value = _row_value(row, str(column_name))
+        if not value:
+            continue
+        column_role = classify_price_column_role(column_name, price_rules)
+        if not map_price and column_role == "map":
+            map_price = value
+            continue
+        if not msrp_price and column_role == "msrp":
+            msrp_price = value
+            continue
+        if not jobber_price and column_role == "jobber":
+            jobber_price = value
+            continue
+        if not base_price and column_role == "price":
+            base_price = value
+
+    return base_price, map_price, msrp_price, jobber_price
+
+
+def _choose_effective_price_text(
+    price: str,
+    map_price: str,
+    msrp_price: str,
+    jobber_price: str,
+    price_rules: PricePriorityRules,
+) -> str:
+    values_by_role = {
+        "map": map_price,
+        "jobber": jobber_price,
+        "msrp": msrp_price,
+        "price": price,
+    }
+    for role in price_rules.priority:
+        parsed = _to_float(values_by_role.get(role, ""))
+        if parsed is None:
+            continue
+        return _format_currency(parsed)
+    return ""
+
+
+def _row_has_any_mapped_value(row: pd.Series, columns: list[str]) -> bool:
+    for column in columns:
+        if not column:
+            continue
+        if _row_value(row, column):
+            return True
+    return False
 
 
 def _rows_from_session(session: AppSession) -> list[pd.Series]:
@@ -106,6 +223,7 @@ def _can_infer_cost_for_sku_rows(
     sku_rows: list[pd.Series],
     mapping,
     discounts_df: pd.DataFrame,
+    price_rules: PricePriorityRules,
     required_root: Path | None = None,
 ) -> bool:
     if not sku_rows:
@@ -125,7 +243,19 @@ def _can_infer_cost_for_sku_rows(
         if not type_value:
             type_value = _row_value(row, "type")
         if price_value is None:
-            price_value = _to_float(_row_value(row, getattr(mapping, "price", "")))
+            base_price, map_price, msrp_price, jobber_price = _infer_price_fields_from_row(
+                row,
+                mapping,
+                price_rules=price_rules,
+            )
+            effective_price = _choose_effective_price_text(
+                price=base_price,
+                map_price=map_price,
+                msrp_price=msrp_price,
+                jobber_price=jobber_price,
+                price_rules=price_rules,
+            )
+            price_value = _to_float(effective_price)
 
     if price_value is None or not vendor_value:
         return False
@@ -214,6 +344,13 @@ def detect_missing_required_fields(session: AppSession, required_root: Path | No
                 discounts_df = pd.DataFrame()
 
     mapping = session.source_mapping
+    price_rules = load_price_priority_rules(required_root)
+    dealer_columns = _dealer_columns_for_sheet(mapping, list(session.vendor_df.columns), price_rules=price_rules)
+    cost_columns = [
+        _clean_text(getattr(mapping, "cost", "")),
+        _clean_text(getattr(mapping, "dealer_cost", "")),
+        *dealer_columns,
+    ]
     missing: list[str] = []
     for field in required:
         mapped_column = getattr(mapping, field, "") if hasattr(mapping, field) else ""
@@ -226,15 +363,37 @@ def detect_missing_required_fields(session: AppSession, required_root: Path | No
                 break
 
             if field == "cost":
-                cost_mapped = bool(mapped_column and mapped_column in session.vendor_df.columns)
-                sku_has_value = cost_mapped and any(_row_value(row, mapped_column) for row in sku_rows)
+                sku_has_value = any(_row_has_any_mapped_value(row, cost_columns) for row in sku_rows)
                 if not sku_has_value:
                     sku_has_value = _can_infer_cost_for_sku_rows(
                         sku_rows=sku_rows,
                         mapping=mapping,
                         discounts_df=discounts_df,
+                        price_rules=price_rules,
                         required_root=required_root,
                     )
+                if not sku_has_value:
+                    field_has_gap = True
+                    break
+                continue
+
+            if field == "price":
+                sku_has_value = False
+                for row in sku_rows:
+                    base_price, map_price, msrp_price, jobber_price = _infer_price_fields_from_row(
+                        row,
+                        mapping,
+                        price_rules=price_rules,
+                    )
+                    if _choose_effective_price_text(
+                        price=base_price,
+                        map_price=map_price,
+                        msrp_price=msrp_price,
+                        jobber_price=jobber_price,
+                        price_rules=price_rules,
+                    ):
+                        sku_has_value = True
+                        break
                 if not sku_has_value:
                     field_has_gap = True
                     break
@@ -269,14 +428,19 @@ def build_products_from_session(
     session: AppSession,
     existing_shopify_index: dict[str, dict[str, str]] | None = None,
     scraped_records: dict[str, dict[str, str]] | None = None,
+    required_root: Path | None = None,
 ) -> tuple[list[Product], BuildStats]:
     mapping = session.source_mapping
+    price_rules = load_price_priority_rules(required_root)
     products: list[Product] = []
     stats = BuildStats()
     rows = _rows_from_session(session)
     stats.rows_considered = len(rows)
     existing_index = existing_shopify_index or {}
     scraped_index = scraped_records or {}
+    dealer_columns: list[str] = []
+    if session.vendor_df is not None and not session.vendor_df.empty:
+        dealer_columns = _dealer_columns_for_sheet(mapping, list(session.vendor_df.columns), price_rules=price_rules)
 
     for row in rows:
         sku = normalize_sku(_row_value(row, mapping.sku))
@@ -300,16 +464,40 @@ def build_products_from_session(
             _set_if_present(product, "vendor", existing.get("vendor", ""), "shopify")
             _set_if_present(product, "barcode", existing.get("barcode", ""), "shopify")
 
+        row_price, row_map_price, row_msrp_price, row_jobber_price = _infer_price_fields_from_row(
+            row,
+            mapping,
+            price_rules=price_rules,
+        )
+        effective_price = _choose_effective_price_text(
+            price=row_price,
+            map_price=row_map_price,
+            msrp_price=row_msrp_price,
+            jobber_price=row_jobber_price,
+            price_rules=price_rules,
+        )
+
+        mapped_dealer_cost = _row_value(row, getattr(mapping, "dealer_cost", ""))
+        inferred_dealer_cost = _lowest_currency_text([_row_value(row, column_name) for column_name in dealer_columns])
+        best_dealer_cost = _lowest_currency_text([mapped_dealer_cost, inferred_dealer_cost])
+        mapped_cost = _row_value(row, mapping.cost)
+        effective_cost = mapped_cost or best_dealer_cost
+
         spreadsheet_values = {
             "vendor": _row_value(row, mapping.vendor),
             "title": _row_value(row, mapping.title),
             "description_html": _row_value(row, mapping.description),
             "media_urls": _row_value(row, mapping.media),
-            "price": _row_value(row, mapping.price),
-            "cost": _row_value(row, mapping.cost),
+            "price": effective_price,
+            "map_price": row_map_price,
+            "msrp_price": row_msrp_price,
+            "jobber_price": row_jobber_price,
+            "cost": effective_cost,
+            "dealer_cost": best_dealer_cost,
             "barcode": _row_value(row, mapping.barcode),
             "weight": _row_value(row, mapping.weight),
             "application": _row_value(row, mapping.application),
+            "core_charge_product_code": _row_value(row, getattr(mapping, "core_charge_product_code", "")),
         }
 
         if session.mode == MODE_NEW:
@@ -317,6 +505,10 @@ def build_products_from_session(
                 _set_if_present(product, field_name, value, "spreadsheet")
         elif session.mode == MODE_UPDATE:
             selected = set(session.update_fields or [])
+            if "price" in selected:
+                selected.update({"map_price", "msrp_price", "jobber_price"})
+            if "cost" in selected:
+                selected.add("dealer_cost")
             if "category_code" in selected or "product_subtype" in selected or "google_product_type" in selected:
                 selected.add("type")
             for field_name, value in spreadsheet_values.items():
@@ -334,10 +526,15 @@ def build_products_from_session(
                     "description_html",
                     "media_urls",
                     "price",
+                    "map_price",
+                    "msrp_price",
+                    "jobber_price",
                     "cost",
+                    "dealer_cost",
                     "barcode",
                     "weight",
                     "application",
+                    "core_charge_product_code",
                 ]:
                     existing_value = _clean_text(getattr(product, field_name, ""))
                     if existing_value:
@@ -345,6 +542,10 @@ def build_products_from_session(
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
             elif session.mode == MODE_UPDATE:
                 selected = set(session.update_fields or [])
+                if "price" in selected:
+                    selected.update({"map_price", "msrp_price", "jobber_price"})
+                if "cost" in selected:
+                    selected.add("dealer_cost")
                 for field_name in selected:
                     existing_value = _clean_text(getattr(product, field_name, ""))
                     if existing_value:

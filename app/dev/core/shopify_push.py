@@ -608,6 +608,12 @@ def push_new_products_as_drafts(
             ("custom", "google_product_type", _clean_text(product.google_product_type), "single_line_text_field"),
             ("custom", "category_codes_4", _clean_text(product.category_code), "list.single_line_text_field"),
             ("custom", "product_subtype", _clean_text(product.product_subtype), "single_line_text_field"),
+            (
+                "custom",
+                "core_charge_product_code",
+                _clean_text(product.core_charge_product_code),
+                "single_line_text_field",
+            ),
             ("custom", "mpn", _clean_text(product.mpn) or sku, "single_line_text_field"),
             ("custom", "brand", brand_gid or brand_value, "metaobject_reference" if brand_gid else "single_line_text_field"),
         ]

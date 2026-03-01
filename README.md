@@ -1,6 +1,6 @@
 # Product Prospector
 
-A Windows desktop application for automotive aftermarket product-ops workflows. It normalizes inconsistent vendor spreadsheets, matches records against your live Shopify catalog, and pushes clean product listings as drafts — all from a native GUI.
+A desktop application for automotive aftermarket product-ops workflows. It normalizes inconsistent vendor spreadsheets, matches records against your live Shopify catalog, and pushes clean product listings as drafts — all from a native GUI.
 
 ---
 
@@ -79,7 +79,7 @@ ProductProspector/
 ### Prerequisites
 
 - Python 3.11+ (developed on CPython 3.14)
-- Windows (uses Tkinter native GUI)
+- Windows or macOS (uses Tkinter native GUI)
 
 ### Install dependencies
 
@@ -139,9 +139,9 @@ http://127.0.0.1:8787/callback
 
 ### From source (no console window)
 
-```powershell
+```bash
 cd app/dev
-pythonw run_product_prospector.pyw
+python run_product_prospector.pyw
 ```
 
 ### From source (with console for debugging)
@@ -155,6 +155,12 @@ python desktop_app.py
 
 ```powershell
 .\ProductProspector.exe
+```
+
+### Packaged macOS app
+
+```bash
+open app/dev/dist/ProductProspector.app
 ```
 
 ---
@@ -209,16 +215,25 @@ Key fields:
 
 ---
 
-## Building the EXE
+## Building packaged apps
 
-Uses PyInstaller with the included spec file:
+### Windows EXE
 
 ```powershell
 cd app/dev
-pyinstaller ProductProspector.spec
+powershell -ExecutionPolicy Bypass -File .\build_windows_exe.ps1
 ```
 
-The compiled binary outputs to `dist/` and should be moved to the project root.
+### macOS `.app`
+
+```bash
+cd app/dev
+./build_mac_app.sh
+```
+
+The build outputs to `app/dev/dist/`.
+
+Build on the target OS (Windows for `.exe`, macOS for `.app`). Source code is shared; no code conversion is required between platforms.
 
 ---
 

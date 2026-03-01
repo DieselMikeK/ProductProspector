@@ -1,6 +1,6 @@
 # Product Prospector
 
-Product Prospector is a Windows desktop app for product-ops workflows across inconsistent vendor spreadsheets.
+Product Prospector is a desktop app for product-ops workflows across inconsistent vendor spreadsheets.
 
 The first version is focused on:
 
@@ -32,16 +32,32 @@ python -m pip install -r requirements.txt
    - If Shopify shows `invalid_request` host mismatch, the host in `redirect_uri` must match your app URL host in Shopify settings.
    - Example local setup: app URL `http://127.0.0.1:8787` and redirect URL `http://127.0.0.1:8787/callback`.
 
-8. Run the desktop app from source (no console launcher):
+8. Run the desktop app from source:
 
-```powershell
-pythonw run_product_prospector.pyw
+```bash
+python run_product_prospector.pyw
 ```
 
-9. Or run the packaged EXE directly:
+9. Or run a packaged build directly:
 
 ```powershell
 .\ProductProspector.exe
+```
+
+```bash
+open dist/ProductProspector.app
+```
+
+## Build on Windows
+
+```powershell
+.\build_windows_exe.ps1
+```
+
+## Build on macOS
+
+```bash
+./build_mac_app.sh
 ```
 
 ## v1 Workflow

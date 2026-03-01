@@ -1,0 +1,38 @@
+{
+  "price_priority": ["map", "jobber", "msrp", "price"],
+  "column_aliases": {
+    "map": [
+      "map",
+      "minimum advertised price",
+      "m a p",
+      "m.a.p"
+    ],
+    "jobber": [
+      "jobber",
+      "jobber price",
+      "jobber net",
+      "jobber cost"
+    ],
+    "msrp": [
+      "msrp",
+      "retail",
+      "retail price",
+      "list price",
+      "suggested retail"
+    ],
+    "price": [
+      "price",
+      "unit price",
+      "sell price",
+      "our price"
+    ],
+    "dealer": [
+      "dealer",
+      "dealer cost",
+      "dealer price",
+      "dealer net",
+      "dealer t1",
+      "dealer t2"
+    ]
+  }
+}

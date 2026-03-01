@@ -1,5 +1,20 @@
 # Data Source Rules
 
+## Price Selection Rules
+
+Source file:
+- `required/rules/pricing_priority_rules.json`
+
+Interpretation rules:
+1. `price_priority` controls which discovered value becomes Shopify `price`.
+2. Current default order is:
+   - `map`
+   - `jobber`
+   - `msrp`
+   - `price`
+3. `column_aliases` defines header alias matching for each role.
+4. Vendor Mapping UI keeps a single `Price` mapping; MAP/Jobber/MSRP are resolved automatically from rules.
+
 ## Vendor Discount / Cost Rules
 
 Source file location:

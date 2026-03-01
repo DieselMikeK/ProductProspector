@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import queue
 from pathlib import Path
 import re
 import sys
@@ -75,9 +76,44 @@ def _resolve_runtime_root() -> Path:
 
 
 def _resolve_runtime_data_root(runtime_root: Path) -> Path:
-    app_dir = runtime_root / "app"
-    if app_dir.exists():
-        return app_dir
+    candidates: list[Path] = []
+
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        candidates.append(Path(meipass) / "app")
+
+    if sys.platform == "darwin":
+        candidates.append(runtime_root.parent / "Resources" / "app")
+
+    candidates.append(runtime_root / "app")
+    candidates.append(runtime_root)
+
+    for app_dir in candidates:
+        if app_dir.exists():
+            return app_dir
+    return runtime_root
+
+
+def _resolve_runtime_output_root(runtime_root: Path) -> Path:
+    if getattr(sys, "frozen", False):
+        # On macOS app bundles, write outputs next to the .app bundle.
+        if sys.platform == "darwin":
+            try:
+                app_bundle = runtime_root.parent.parent
+                host_dir = app_bundle.parent
+                if host_dir.exists():
+                    return host_dir
+            except Exception:
+                return runtime_root
+        return runtime_root
+
+    # In dev, runtime_root is "<repo>/app"; write outputs at repo root.
+    try:
+        repo_root = runtime_root.parent
+        if repo_root.exists():
+            return repo_root
+    except Exception:
+        pass
     return runtime_root
 
 
@@ -191,7 +227,25 @@ class ProductProspectorDesktopApp:
         self.vendor_source_is_sheet = False
         self.runtime_root = _resolve_runtime_root()
         self.runtime_data_root = _resolve_runtime_data_root(self.runtime_root)
+        self.runtime_output_root = _resolve_runtime_output_root(self.runtime_root)
+        self._window_icon_image: tk.PhotoImage | None = None
         self._header_logo_image: tk.PhotoImage | None = None
+        self._header_logo_label: ttk.Label | None = None
+        self._header_logo_target_width = 550
+        self._header_logo_frame_paths: list[Path] = []
+        self._header_logo_frames: list[tk.PhotoImage] = []
+        self._header_logo_frame_index = 0
+        self._header_logo_anim_job: str | None = None
+        self._header_logo_anim_delay_ms = 35
+        self._header_logo_anim_mode = "idle"
+        self._header_logo_intro_start_frame = 0
+        self._header_logo_intro_end_frame = 100
+        self._header_logo_loop_start_frame = 36
+        self._header_logo_loop_end_frame = 100
+        self._header_logo_finish_end_frame = 144
+        self._header_logo_segment_start = 0
+        self._header_logo_segment_end = 0
+        self._header_logo_finish_requested = False
         self._set_window_icon()
         self.required_root = self.runtime_data_root / "required"
         if not self.required_root.exists():
@@ -213,10 +267,13 @@ class ProductProspectorDesktopApp:
 
         self.shopify_connected = False
         self.shopify_connecting = False
+        self.shopify_ever_connected = bool(load_shopify_token() is not None)
         self.shopify_cache_ready = False
         self.shopify_cache_warmup_inflight = False
         self.shopify_cache_spinner_job: str | None = None
         self.shopify_cache_spinner_angle = 0
+        self._background_connect_running = False
+        self._shutdown_requested = False
         self.setup_widgets_enabled = False
         self.processing_inflight = False
         self._processing_request_id = 0
@@ -239,6 +296,7 @@ class ProductProspectorDesktopApp:
         self.vendor_image_column = StringVar(value="")
         self.vendor_price_column = StringVar(value="")
         self.vendor_cost_column = StringVar(value="")
+        self.vendor_core_charge_column = StringVar(value="")
         self.vendor_barcode_column = StringVar(value="")
         self.vendor_weight_column = StringVar(value="")
         self.vendor_vendor_column = StringVar(value="")
@@ -272,7 +330,11 @@ class ProductProspectorDesktopApp:
             "description_html": StringVar(value=""),
             "media_urls": StringVar(value=""),
             "price": StringVar(value=""),
+            "map_price": StringVar(value=""),
+            "msrp_price": StringVar(value=""),
+            "jobber_price": StringVar(value=""),
             "cost": StringVar(value=""),
+            "dealer_cost": StringVar(value=""),
             "inventory": StringVar(value="3000000"),
             "sku": StringVar(value=""),
             "barcode": StringVar(value=""),
@@ -285,6 +347,7 @@ class ProductProspectorDesktopApp:
             "mpn": StringVar(value=""),
             "brand": StringVar(value=""),
             "application": StringVar(value=""),
+            "core_charge_product_code": StringVar(value=""),
         }
         self.review_index_text = StringVar(value="Product 0 / 0")
         self.review_cost_rule_text = StringVar(value="")
@@ -312,6 +375,8 @@ class ProductProspectorDesktopApp:
         self.push_selected_skus: set[str] = set()
 
         self._mode_initialized = False
+        self._ui_task_queue: queue.Queue[tuple[object, tuple[object, ...], dict[str, object]]] = queue.Queue()
+        self._ui_task_pump_job: str | None = None
 
         self.run_mode.trace_add("write", self._on_run_mode_changed)
 
@@ -323,6 +388,7 @@ class ProductProspectorDesktopApp:
         self._refresh_input_metrics()
         self._mode_initialized = True
         self._update_tab_access()
+        self._schedule_ui_task_pump()
         self._start_background_api_bootstrap()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -332,36 +398,9 @@ class ProductProspectorDesktopApp:
 
         header_frame = ttk.Frame(root_frame)
         header_frame.pack(fill=X, pady=(0, 6))
-        logo_path = self.runtime_data_root / "logo.png"
-        if logo_path.exists():
-            try:
-                target_width = 550
-                try:
-                    from PIL import Image, ImageTk
-
-                    with Image.open(logo_path) as src:
-                        src_w, src_h = src.size
-                        safe_w = max(1, int(src_w))
-                        safe_h = max(1, int(src_h))
-                        target_height = max(1, int(round((safe_h * target_width) / safe_w)))
-                        resized = src.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                        self._header_logo_image = ImageTk.PhotoImage(resized)
-                except Exception:
-                    logo_image = tk.PhotoImage(file=str(logo_path))
-                    width = max(1, int(logo_image.width()))
-                    if width > target_width:
-                        scale_down = max(1, int(round(width / target_width)))
-                        logo_image = logo_image.subsample(scale_down, scale_down)
-                    elif width < target_width:
-                        scale_up = max(1, int(round(target_width / width)))
-                        logo_image = logo_image.zoom(scale_up, scale_up)
-                    self._header_logo_image = logo_image
-            except Exception:
-                self._header_logo_image = None
-        if self._header_logo_image is not None:
-            ttk.Label(header_frame, image=self._header_logo_image).pack(anchor="center")
-        else:
-            ttk.Label(header_frame, text="Product Prospector", font=("Segoe UI", 19, "bold")).pack(anchor="center")
+        self._header_logo_label = ttk.Label(header_frame)
+        self._header_logo_label.pack(anchor="center")
+        self._load_initial_header_logo()
 
         api_frame = ttk.Frame(root_frame)
         api_frame.pack(anchor="center", pady=(0, 8))
@@ -393,12 +432,264 @@ class ProductProspectorDesktopApp:
         self._build_preview_tab()
         self._build_export_tab()
 
-    def _set_window_icon(self) -> None:
-        icon_path = self.runtime_data_root / "icon.ico"
-        if not icon_path.exists():
+    def _schedule_ui_task_pump(self) -> None:
+        if self._ui_task_pump_job is not None:
             return
         try:
-            self.root.iconbitmap(default=str(icon_path))
+            self._ui_task_pump_job = self.root.after(20, self._drain_ui_task_queue)
+        except RuntimeError:
+            self._ui_task_pump_job = None
+
+    def _drain_ui_task_queue(self) -> None:
+        self._ui_task_pump_job = None
+        max_tasks = 240
+        for _ in range(max_tasks):
+            try:
+                callback, args, kwargs = self._ui_task_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if callable(callback):
+                    callback(*args, **kwargs)
+            except Exception:
+                continue
+        try:
+            if self.root.winfo_exists():
+                self._ui_task_pump_job = self.root.after(20, self._drain_ui_task_queue)
+        except RuntimeError:
+            self._ui_task_pump_job = None
+
+    def _run_on_ui_thread(self, callback, *args, **kwargs) -> None:
+        if threading.current_thread() is threading.main_thread():
+            try:
+                callback(*args, **kwargs)
+            except Exception:
+                pass
+            return
+        try:
+            self._ui_task_queue.put((callback, args, kwargs))
+        except Exception:
+            return
+
+    def _header_logo_sort_key(self, path: Path) -> tuple[int, int, str]:
+        stem = path.stem.lower()
+        match = re.search(r"(\d+)$", stem)
+        if match:
+            return (0, int(match.group(1)), path.name.lower())
+        return (1, 0, path.name.lower())
+
+    def _discover_header_logo_frames(self) -> list[Path]:
+        video_dir = self.runtime_data_root / "video"
+        if not video_dir.exists() or not video_dir.is_dir():
+            return []
+        allowed = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        frames = [path for path in video_dir.iterdir() if path.is_file() and path.suffix.lower() in allowed]
+        return sorted(frames, key=self._header_logo_sort_key)
+
+    def _load_logo_image(self, image_path: Path, target_width: int) -> tk.PhotoImage | None:
+        if not image_path.exists():
+            return None
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(image_path) as src:
+                src_w, src_h = src.size
+                safe_w = max(1, int(src_w))
+                safe_h = max(1, int(src_h))
+                resized_w = max(1, int(target_width))
+                resized_h = max(1, int(round((safe_h * resized_w) / safe_w)))
+                resized = src.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+                return ImageTk.PhotoImage(resized)
+        except Exception:
+            try:
+                fallback = tk.PhotoImage(file=str(image_path))
+            except Exception:
+                return None
+            width = max(1, int(fallback.width()))
+            if width > target_width:
+                scale_down = max(1, int(round(width / target_width)))
+                fallback = fallback.subsample(scale_down, scale_down)
+            elif width < target_width:
+                scale_up = max(1, int(round(target_width / width)))
+                fallback = fallback.zoom(scale_up, scale_up)
+            return fallback
+
+    def _apply_header_logo_image(self, image: tk.PhotoImage | None) -> None:
+        self._header_logo_image = image
+        if self._header_logo_label is None:
+            return
+        if image is None:
+            self._header_logo_label.configure(text="Product Prospector", image="", font=("Segoe UI", 19, "bold"))
+            return
+        self._header_logo_label.configure(image=image, text="", font="")
+
+    def _load_initial_header_logo(self) -> None:
+        self._header_logo_frame_paths = self._discover_header_logo_frames()
+        first_frame = self._header_logo_frame_paths[0] if self._header_logo_frame_paths else None
+        if first_frame is not None:
+            frame_image = self._load_logo_image(first_frame, self._header_logo_target_width)
+            if frame_image is not None:
+                self._apply_header_logo_image(frame_image)
+                return
+
+        logo_path = self.runtime_data_root / "logo.png"
+        self._apply_header_logo_image(self._load_logo_image(logo_path, self._header_logo_target_width))
+
+    def _load_header_logo_animation_frames(self) -> bool:
+        if self._header_logo_frames:
+            return True
+        if not self._header_logo_frame_paths:
+            self._header_logo_frame_paths = self._discover_header_logo_frames()
+        loaded: list[tk.PhotoImage] = []
+        for frame_path in self._header_logo_frame_paths:
+            frame_image = self._load_logo_image(frame_path, self._header_logo_target_width)
+            if frame_image is not None:
+                loaded.append(frame_image)
+        self._header_logo_frames = loaded
+        return bool(self._header_logo_frames)
+
+    def _cancel_header_logo_animation(self) -> None:
+        if self._header_logo_anim_job is None:
+            self._header_logo_anim_mode = "idle"
+            self._header_logo_finish_requested = False
+            return
+        try:
+            self.root.after_cancel(self._header_logo_anim_job)
+        except Exception:
+            pass
+        self._header_logo_anim_job = None
+        self._header_logo_anim_mode = "idle"
+        self._header_logo_finish_requested = False
+
+    def _resolve_header_logo_segment(self, start_frame: int, end_frame: int | None = None) -> tuple[int, int]:
+        total = len(self._header_logo_frames)
+        if total <= 0:
+            return (0, 0)
+        last_index = total - 1
+        safe_start = max(0, min(int(start_frame), last_index))
+        if end_frame is None:
+            safe_end = last_index
+        else:
+            safe_end = max(0, min(int(end_frame), last_index))
+        if safe_end < safe_start:
+            safe_start = 0
+            safe_end = last_index
+        return (safe_start, safe_end)
+
+    def _start_header_logo_intro_segment(self) -> None:
+        segment_start, segment_end = self._resolve_header_logo_segment(
+            self._header_logo_intro_start_frame,
+            self._header_logo_intro_end_frame,
+        )
+        self._header_logo_anim_mode = "intro"
+        self._header_logo_segment_start = segment_start
+        self._header_logo_segment_end = segment_end
+        self._header_logo_frame_index = segment_start
+
+    def _start_header_logo_loop_segment(self) -> None:
+        segment_start, segment_end = self._resolve_header_logo_segment(
+            self._header_logo_loop_start_frame,
+            self._header_logo_loop_end_frame,
+        )
+        self._header_logo_anim_mode = "loop"
+        self._header_logo_segment_start = segment_start
+        self._header_logo_segment_end = segment_end
+        self._header_logo_frame_index = segment_start
+
+    def _start_header_logo_finish_segment(self, from_frame: int) -> None:
+        segment_start, segment_end = self._resolve_header_logo_segment(
+            self._header_logo_loop_end_frame,
+            self._header_logo_finish_end_frame,
+        )
+        self._header_logo_anim_mode = "finish"
+        self._header_logo_segment_start = segment_start
+        self._header_logo_segment_end = segment_end
+        next_frame = max(segment_start, int(from_frame) + 1)
+        self._header_logo_frame_index = min(segment_end, next_frame)
+
+    def _play_header_logo_animation(self) -> None:
+        if not self._load_header_logo_animation_frames():
+            return
+        self._cancel_header_logo_animation()
+        self._header_logo_finish_requested = False
+        self._start_header_logo_intro_segment()
+        self._advance_header_logo_animation()
+
+    def _finish_header_logo_animation(self) -> None:
+        if self._header_logo_anim_mode not in {"intro", "loop", "finish"}:
+            return
+        if not self._header_logo_frames:
+            self._header_logo_anim_mode = "idle"
+            return
+        self._header_logo_finish_requested = True
+        if self._header_logo_anim_mode == "finish":
+            return
+        if self._header_logo_anim_job is None:
+            self._advance_header_logo_animation()
+
+    def _advance_header_logo_animation(self) -> None:
+        if not self._header_logo_frames:
+            self._header_logo_anim_job = None
+            self._header_logo_anim_mode = "idle"
+            self._header_logo_finish_requested = False
+            return
+        last_index = len(self._header_logo_frames) - 1
+        segment_start = max(0, min(self._header_logo_segment_start, last_index))
+        segment_end = max(segment_start, min(self._header_logo_segment_end, last_index))
+        if self._header_logo_anim_mode not in {"intro", "loop", "finish"}:
+            segment_start, segment_end = self._resolve_header_logo_segment(0, last_index)
+            self._header_logo_anim_mode = "finish"
+            self._header_logo_segment_start = segment_start
+            self._header_logo_segment_end = segment_end
+        index = max(segment_start, min(self._header_logo_frame_index, segment_end))
+        self._apply_header_logo_image(self._header_logo_frames[index])
+
+        if self._header_logo_anim_mode == "intro":
+            if index >= segment_end:
+                if self._header_logo_finish_requested:
+                    self._start_header_logo_finish_segment(index)
+                else:
+                    self._start_header_logo_loop_segment()
+            else:
+                self._header_logo_frame_index = index + 1
+            self._header_logo_anim_job = self.root.after(self._header_logo_anim_delay_ms, self._advance_header_logo_animation)
+            return
+
+        if self._header_logo_anim_mode == "loop":
+            if index >= segment_end:
+                if self._header_logo_finish_requested:
+                    self._start_header_logo_finish_segment(index)
+                else:
+                    self._header_logo_frame_index = segment_start
+            else:
+                self._header_logo_frame_index = index + 1
+            self._header_logo_anim_job = self.root.after(self._header_logo_anim_delay_ms, self._advance_header_logo_animation)
+            return
+
+        if index >= segment_end:
+            self._header_logo_anim_job = None
+            self._header_logo_anim_mode = "idle"
+            self._header_logo_finish_requested = False
+            return
+        self._header_logo_frame_index = index + 1
+        self._header_logo_anim_job = self.root.after(self._header_logo_anim_delay_ms, self._advance_header_logo_animation)
+
+    def _set_window_icon(self) -> None:
+        icon_path = self.runtime_data_root / "icon.ico"
+        if icon_path.exists() and sys.platform == "win32":
+            try:
+                self.root.iconbitmap(default=str(icon_path))
+                return
+            except Exception:
+                pass
+
+        # Tk on macOS/Linux can reliably consume PNGs via iconphoto.
+        logo_path = self.runtime_data_root / "logo.png"
+        if not logo_path.exists():
+            return
+        try:
+            self._window_icon_image = tk.PhotoImage(file=str(logo_path))
+            self.root.iconphoto(True, self._window_icon_image)
         except Exception:
             return
 
@@ -505,6 +796,13 @@ class ProductProspectorDesktopApp:
         self.vendor_barcode_combo = self._combo_row(mapping_grid, "Barcode", self.vendor_barcode_column, 2, column=1)
         self.vendor_weight_combo = self._combo_row(mapping_grid, "Weight", self.vendor_weight_column, 3, column=1)
         self.vendor_fitment_combo = self._combo_row(mapping_grid, "Application", self.vendor_fitment_column, 4, column=1)
+        self.vendor_core_charge_combo = self._combo_row(
+            mapping_grid,
+            "Core Charge",
+            self.vendor_core_charge_column,
+            5,
+            column=1,
+        )
 
         vendor_btn_row = ttk.Frame(self.vendor_mapping_wrap)
         vendor_btn_row.pack(anchor=W, pady=(8, 0))
@@ -577,6 +875,7 @@ class ProductProspectorDesktopApp:
             self.vendor_image_combo,
             self.vendor_price_combo,
             self.vendor_cost_combo,
+            self.vendor_core_charge_combo,
             self.vendor_sku_combo,
             self.vendor_barcode_combo,
             self.vendor_weight_combo,
@@ -648,8 +947,6 @@ class ProductProspectorDesktopApp:
 
         available = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
         self.push_selected_skus = {sku for sku in self.push_selected_skus if sku in available}
-        if not self.push_selected_skus and available:
-            self.push_selected_skus = set(available)
 
         # Keep review grid lightweight to avoid UI lockups on large/long text payloads.
         rows: list[dict[str, str]] = []
@@ -673,6 +970,20 @@ class ProductProspectorDesktopApp:
             )
         df = pd.DataFrame(rows)
         _tree_show_dataframe(self.review_table, df, max_rows=120)
+
+    def _toggle_review_table_push_selection(self) -> None:
+        products = self.session.products or []
+        available = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
+        if not available:
+            self.push_selected_skus = set()
+            self._refresh_review_table_async()
+            return
+        selected = {sku for sku in self.push_selected_skus if sku in available}
+        if len(selected) == len(available):
+            self.push_selected_skus = set()
+        else:
+            self.push_selected_skus = set(available)
+        self._refresh_review_table_async()
 
     def _lock_run_mode(self) -> None:
         self.run_mode_locked.set(True)
@@ -823,6 +1134,7 @@ class ProductProspectorDesktopApp:
         self._review_entry_row(form_grid, "MPN", "mpn", 5, 2)
         self._review_entry_row(form_grid, "Brand", "brand", 6, 2)
         self._review_entry_row(form_grid, "Application", "application", 7, 2)
+        self._review_entry_row(form_grid, "Core Charge Code", "core_charge_product_code", 8, 2)
 
         table_wrap = ttk.LabelFrame(self.export_inner, text="All Products", padding=8)
         table_wrap.pack(fill=BOTH, expand=True)
@@ -852,6 +1164,13 @@ class ProductProspectorDesktopApp:
         self.remap_barcode_combo = self._combo_row(remap_grid, "Barcode", self.vendor_barcode_column, 2, column=1)
         self.remap_weight_combo = self._combo_row(remap_grid, "Weight", self.vendor_weight_column, 3, column=1)
         self.remap_application_combo = self._combo_row(remap_grid, "Application", self.vendor_fitment_column, 4, column=1)
+        self.remap_core_charge_combo = self._combo_row(
+            remap_grid,
+            "Core Charge",
+            self.vendor_core_charge_column,
+            5,
+            column=1,
+        )
         remap_action = ttk.Frame(remap_wrap)
         remap_action.pack(fill=X, pady=(6, 0))
         ttk.Button(remap_action, text="Apply Remap & Reprocess", command=self._reprocess_from_review).pack(side=LEFT)
@@ -1101,6 +1420,8 @@ class ProductProspectorDesktopApp:
         self._processing_request_id += 1
         request_id = self._processing_request_id
         self._auto_open_review_after_processing = bool(auto_open_review)
+        if self.session.scrape_settings.vendor_search_url:
+            self._play_header_logo_animation()
         self._set_processing_busy(True)
         self.processing_status_text.set(f"Processing {len(target_skus)} SKU(s) in background...")
         try:
@@ -1126,6 +1447,7 @@ class ProductProspectorDesktopApp:
             if hasattr(self, "to_review_btn"):
                 self.to_review_btn.configure(state="disabled")
             return
+        self._finish_header_logo_animation()
         self._hide_review_busy_overlay()
         if hasattr(self, "to_review_btn") and self.session.processing_complete:
             self.to_review_btn.configure(state="normal")
@@ -1219,13 +1541,14 @@ class ProductProspectorDesktopApp:
                     retry_count=self.session.scrape_settings.retry_count,
                     delay_seconds=self.session.scrape_settings.delay_seconds,
                     scrape_images=self.session.scrape_settings.scrape_images,
-                    image_output_root=self.runtime_root / "images",
+                    image_output_root=self.runtime_output_root / "images",
                 )
 
             products, build_stats = build_products_from_session(
                 session=self.session,
                 existing_shopify_index=existing_index,
                 scraped_records=scrape_records,
+                required_root=self.required_root,
             )
 
             mapper = self.type_mapper
@@ -1360,10 +1683,7 @@ class ProductProspectorDesktopApp:
                 self._open_review_tab()
             self._auto_open_review_after_processing = False
 
-        try:
-            self.root.after(0, apply)
-        except RuntimeError:
-            return
+        self._run_on_ui_thread(apply)
 
     def _apply_scrape_diagnostics(
         self,
@@ -1431,7 +1751,12 @@ class ProductProspectorDesktopApp:
             "description_html",
             "media_urls",
             "price",
+            "map_price",
+            "msrp_price",
+            "jobber_price",
             "cost",
+            "dealer_cost",
+            "core_charge_product_code",
             "barcode",
             "weight",
             "application",
@@ -1538,7 +1863,11 @@ class ProductProspectorDesktopApp:
         media_text = self._read_review_field("media_urls")
         product.media_urls = [part.strip() for part in re.split(r"[|,\n]+", media_text) if part.strip()]
         product.price = self._read_review_field("price")
+        product.map_price = self._read_review_field("map_price")
+        product.msrp_price = self._read_review_field("msrp_price")
+        product.jobber_price = self._read_review_field("jobber_price")
         product.cost = self._read_review_field("cost")
+        product.dealer_cost = self._read_review_field("dealer_cost")
         try:
             product.inventory = int(float(self._read_review_field("inventory") or "3000000"))
         except Exception:
@@ -1554,6 +1883,7 @@ class ProductProspectorDesktopApp:
         product.mpn = self._read_review_field("mpn")
         product.brand = self._read_review_field("brand")
         product.application = self._read_review_field("application")
+        product.core_charge_product_code = self._read_review_field("core_charge_product_code")
         product.finalize_defaults()
         self.review_status_text.set(f"Saved product {self.review_index + 1}.")
 
@@ -1676,23 +2006,14 @@ class ProductProspectorDesktopApp:
         summary = ShopifyDraftPushSummary(requested=len(products))
 
         def on_existing_progress(done: int, total: int) -> None:
-            try:
-                self.root.after(
-                    0,
-                    lambda: self.review_busy_text.set(f"Checking existing SKUs in Shopify... {done}/{total}"),
-                )
-            except Exception:
-                pass
+            self._run_on_ui_thread(self.review_busy_text.set, f"Checking existing SKUs in Shopify... {done}/{total}")
 
         def on_push_progress(done: int, total: int, sku: str) -> None:
             label = f"Pushing draft products to Shopify... {done}/{total}"
             sku_text = normalize_sku(sku)
             if sku_text:
                 label += f" | {sku_text}"
-            try:
-                self.root.after(0, lambda: self.review_busy_text.set(label))
-            except Exception:
-                pass
+            self._run_on_ui_thread(self.review_busy_text.set, label)
 
         try:
             existing_skus, existing_error, existing_df = self._fetch_existing_shopify_skus(
@@ -1709,7 +2030,7 @@ class ProductProspectorDesktopApp:
                     products=products,
                     existing_skus=existing_skus,
                     include_images=include_images,
-                    image_root=self.runtime_root / "images",
+                    image_root=self.runtime_output_root / "images",
                     required_root=self.required_root,
                     progress_callback=on_push_progress,
                 )
@@ -1760,10 +2081,7 @@ class ProductProspectorDesktopApp:
 
             messagebox.showinfo(APP_TITLE, "\n".join(details))
 
-        try:
-            self.root.after(0, apply)
-        except RuntimeError:
-            return
+        self._run_on_ui_thread(apply)
 
     def _select_all_for_push(self) -> None:
         products = self.session.products or []
@@ -1778,6 +2096,14 @@ class ProductProspectorDesktopApp:
         if not self.session.products:
             return
         tree = self.review_table
+        region = tree.identify_region(event.x, event.y)
+        if region == "heading":
+            column_id = tree.identify_column(event.x)
+            if column_id == "#1":
+                self._toggle_review_table_push_selection()
+                return "break"
+            return
+
         row_id = tree.identify_row(event.y)
         column_id = tree.identify_column(event.x)
         if not row_id or column_id != "#1":
@@ -1792,6 +2118,9 @@ class ProductProspectorDesktopApp:
         self._refresh_review_table_async()
 
     def _start_background_api_bootstrap(self) -> None:
+        if self._background_connect_running or self._shutdown_requested:
+            return
+        self._background_connect_running = True
         worker = threading.Thread(target=self._background_api_bootstrap, daemon=True)
         worker.start()
 
@@ -1802,23 +2131,33 @@ class ProductProspectorDesktopApp:
             return 0
 
     def _initialize_shopify_cache_state(self) -> None:
-        self.shopify_cache_ready = self._cached_shopify_sku_count() > 0
+        cached_df = load_shopify_sku_cache()
+        self.shopify_cache_ready = cached_df is not None and not cached_df.empty
+        if self.shopify_cache_ready and (self.shopify_df_raw is None or self.shopify_df_raw.empty):
+            self.shopify_df_raw = cached_df
         self._set_shopify_cache_api_busy(False)
         self._refresh_new_mode_check_controls()
 
-    def _start_background_shopify_cache_warmup(self) -> None:
+    def _start_background_shopify_cache_warmup(self, force_refresh: bool = False) -> None:
         if self.shopify_cache_warmup_inflight:
             return
-        worker = threading.Thread(target=self._background_shopify_cache_warmup, daemon=True)
+        worker = threading.Thread(
+            target=self._background_shopify_cache_warmup,
+            kwargs={"force_refresh": bool(force_refresh)},
+            daemon=True,
+        )
         self.shopify_cache_warmup_inflight = True
         worker.start()
 
-    def _background_shopify_cache_warmup(self) -> None:
+    def _background_shopify_cache_warmup(self, force_refresh: bool = False) -> None:
         try:
             cached = load_shopify_sku_cache()
             if cached is not None and not cached.empty:
                 self.shopify_cache_ready = True
-                return
+                if self.shopify_df_raw is None or self.shopify_df_raw.empty:
+                    self.shopify_df_raw = cached
+                if not force_refresh:
+                    return
 
             config = load_shopify_config()
             if config is None:
@@ -1828,7 +2167,10 @@ class ProductProspectorDesktopApp:
             if token is None:
                 return
 
-            self._set_shopify_cache_api_busy(True, "Downloading Shopify SKU cache... 0 SKUs")
+            start_count = 0
+            if cached is not None and not cached.empty:
+                start_count = int(len(cached))
+            self._set_shopify_cache_api_busy(True, f"Downloading Shopify SKU cache... {start_count:,} SKUs")
 
             def on_catalog_progress(_page_count: int, row_count: int) -> None:
                 self._set_shopify_cache_api_busy(True, f"Downloading Shopify SKU cache... {row_count:,} SKUs")
@@ -1842,16 +2184,12 @@ class ProductProspectorDesktopApp:
                 return
             save_shopify_sku_cache(df)
             self.shopify_cache_ready = True
-            if self.shopify_df_raw is None or self.shopify_df_raw.empty:
-                self.shopify_df_raw = df
+            self.shopify_df_raw = df
         finally:
             self.shopify_cache_warmup_inflight = False
             self._set_shopify_cache_api_busy(False)
-            try:
-                self.root.after(0, self._refresh_new_mode_check_controls)
-                self.root.after(0, self._refresh_input_metrics)
-            except RuntimeError:
-                pass
+            self._run_on_ui_thread(self._refresh_new_mode_check_controls)
+            self._run_on_ui_thread(self._refresh_input_metrics)
 
     def _set_shopify_cache_api_busy(self, busy: bool, text: str = "") -> None:
         def apply() -> None:
@@ -1870,10 +2208,7 @@ class ProductProspectorDesktopApp:
                 self.shopify_cache_api_label.pack_forget()
             self.shopify_cache_api_text.set("")
 
-        try:
-            self.root.after(0, apply)
-        except RuntimeError:
-            return
+        self._run_on_ui_thread(apply)
 
     def _draw_shopify_cache_spinner_frame(self) -> None:
         canvas = self.shopify_cache_api_spinner
@@ -2002,99 +2337,151 @@ class ProductProspectorDesktopApp:
             elif connected:
                 self.shopify_status_label.configure(text="Shopify - Connected")
                 self._draw_shopify_dot(state="connected")
-                self.shopify_connect_button.configure(text="Reconnect", state="normal")
+                # Match Windows behavior: reconnect action is disabled when already connected.
+                self.shopify_connect_button.configure(text="Reconnect", state="disabled")
             else:
                 self.shopify_status_label.configure(text="Shopify - Not Connected")
                 self._draw_shopify_dot(state="disconnected")
-                self.shopify_connect_button.configure(text="Connect", state="normal")
+                prior_auth = self.shopify_ever_connected or (load_shopify_token() is not None)
+                self.shopify_connect_button.configure(text="Reconnect" if prior_auth else "Connect", state="normal")
             self.shopify_connected = connected
             if connected:
-                self._start_background_shopify_cache_warmup()
+                self.shopify_ever_connected = True
+            if connected:
+                # Avoid re-downloading full catalog on every reconnect.
+                # If cache is already present, warmup uses cached rows and returns quickly.
+                self._start_background_shopify_cache_warmup(force_refresh=not self.shopify_cache_ready)
             else:
                 self._set_shopify_cache_api_busy(False)
+                if self.shopify_ever_connected and not connecting and not self._shutdown_requested:
+                    self._start_background_api_bootstrap()
 
-        try:
-            self.root.after(0, apply)
-        except RuntimeError:
-            return
+        self._run_on_ui_thread(apply)
 
     def _connect_shopify_clicked(self) -> None:
         if self.shopify_connecting:
             return
-        worker = threading.Thread(target=self._connect_shopify_worker, kwargs={"allow_handshake": True}, daemon=True)
-        worker.start()
+        if self.shopify_connected:
+            return
+        # Run connect flow on the UI thread so status updates and prompts cannot silently fail.
+        # Background bootstrap/check flows still use worker threads.
+        try:
+            self._connect_shopify_worker(allow_handshake=True)
+        except Exception as exc:
+            self._set_shopify_status(connected=False)
+            messagebox.showerror(APP_TITLE, f"Shopify connect failed:\n{exc}")
+
+    def _set_shopify_auto_retrying(self) -> None:
+        def apply() -> None:
+            prior_auth = self.shopify_ever_connected or (load_shopify_token() is not None)
+            self.shopify_connecting = False
+            self.shopify_connected = False
+            if prior_auth:
+                self.shopify_status_label.configure(text="Shopify - Reconnecting...")
+                self._draw_shopify_dot(state="connected")
+            else:
+                self.shopify_status_label.configure(text="Shopify - Not Connected (auto retrying...)")
+                self._draw_shopify_dot(state="disconnected")
+            self.shopify_connect_button.configure(text="Reconnect" if prior_auth else "Connect", state="disabled")
+
+        self._run_on_ui_thread(apply)
 
     def _background_api_bootstrap(self) -> None:
-        self._connect_shopify_worker(allow_handshake=False)
-    def _connect_shopify_worker(self, allow_handshake: bool) -> None:
-        self._set_shopify_status(connected=False, connecting=True)
-        config = load_shopify_config()
-        if config is None:
-            self._set_shopify_status(connected=False)
-            if allow_handshake:
-                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, "Invalid config/shopify.json"))
-            return
+        attempt = 0
+        try:
+            while not self._shutdown_requested:
+                if self.shopify_connected:
+                    return
+                self._set_shopify_auto_retrying()
+                try:
+                    connected = bool(self._connect_shopify_worker(allow_handshake=False))
+                except Exception:
+                    connected = False
+                    self._set_shopify_status(connected=False)
+                if connected:
+                    return
+                attempt += 1
+                sleep_seconds = min(60.0, 2.0 + (attempt * 3.0))
+                end_at = time.monotonic() + sleep_seconds
+                while time.monotonic() < end_at:
+                    if self._shutdown_requested or self.shopify_connected:
+                        return
+                    time.sleep(0.2)
+        finally:
+            self._background_connect_running = False
 
-        if config.admin_api_access_token:
-            token_valid, reason = validate_access_token(config=config, access_token=config.admin_api_access_token)
-            if token_valid:
-                save_shopify_token(access_token=config.admin_api_access_token, scope="admin_api_access_token")
-                self._set_shopify_status(connected=True)
-                return
-            self._set_shopify_status(connected=False)
-            if allow_handshake:
-                self.root.after(
-                    0,
-                    lambda: messagebox.showerror(
+    def _connect_shopify_worker(self, allow_handshake: bool) -> bool:
+        try:
+            self._set_shopify_status(connected=False, connecting=True)
+            config = load_shopify_config()
+            if config is None:
+                self._set_shopify_status(connected=False)
+                if allow_handshake:
+                    self._run_on_ui_thread(messagebox.showerror, APP_TITLE, "Invalid config/shopify.json")
+                return False
+
+            if config.admin_api_access_token:
+                token_valid, reason = validate_access_token(config=config, access_token=config.admin_api_access_token)
+                if token_valid:
+                    save_shopify_token(access_token=config.admin_api_access_token, scope="admin_api_access_token")
+                    self._set_shopify_status(connected=True)
+                    return True
+                self._set_shopify_status(connected=False)
+                if allow_handshake:
+                    self._run_on_ui_thread(
+                        messagebox.showerror,
                         APP_TITLE,
                         "Configured admin_api_access_token is invalid.\n"
                         f"Validation error: {reason}",
-                    ),
-                )
-            return
+                    )
+                return False
 
-        existing_token = load_shopify_token()
-        if existing_token:
-            valid, _ = validate_access_token(config=config, access_token=existing_token.access_token)
-            if valid:
-                self._set_shopify_status(connected=True)
-                return
+            existing_token = load_shopify_token()
+            if existing_token:
+                valid, _ = validate_access_token(config=config, access_token=existing_token.access_token)
+                if valid:
+                    self._set_shopify_status(connected=True)
+                    return True
 
-        if config.auth_mode in {"auto", "client_credentials"}:
-            cc_result = exchange_client_credentials_for_token(config=config)
-            if cc_result.success:
-                save_shopify_token(access_token=cc_result.access_token, scope=cc_result.scope or "client_credentials")
-                self._set_shopify_status(connected=True)
-                return
-            if config.auth_mode == "client_credentials":
-                self._set_shopify_status(connected=False)
-                if allow_handshake:
-                    self.root.after(
-                        0,
-                        lambda: messagebox.showerror(
+            if config.auth_mode in {"auto", "client_credentials"}:
+                cc_result = exchange_client_credentials_for_token(config=config)
+                if cc_result.success:
+                    save_shopify_token(access_token=cc_result.access_token, scope=cc_result.scope or "client_credentials")
+                    self._set_shopify_status(connected=True)
+                    return True
+                if config.auth_mode == "client_credentials":
+                    self._set_shopify_status(connected=False)
+                    if allow_handshake:
+                        self._run_on_ui_thread(
+                            messagebox.showerror,
                             APP_TITLE,
                             "Shopify client_credentials failed.\n"
                             f"{cc_result.error}",
-                        ),
-                    )
-                return
+                        )
+                    return False
 
-        if not allow_handshake:
+            if not allow_handshake:
+                self._set_shopify_status(connected=False)
+                return False
+
+            if config.auth_mode not in {"auto", "oauth"}:
+                self._set_shopify_status(connected=False)
+                return False
+
+            handshake = perform_oauth_handshake(config)
+            if not handshake.success:
+                self._set_shopify_status(connected=False)
+                self._run_on_ui_thread(messagebox.showerror, APP_TITLE, f"Shopify connect failed:\n{handshake.error}")
+                return False
+
+            save_shopify_token(access_token=handshake.access_token, scope=handshake.scope)
+            self._set_shopify_status(connected=True)
+            return True
+        except Exception as exc:
             self._set_shopify_status(connected=False)
-            return
-
-        if config.auth_mode not in {"auto", "oauth"}:
-            self._set_shopify_status(connected=False)
-            return
-
-        handshake = perform_oauth_handshake(config)
-        if not handshake.success:
-            self._set_shopify_status(connected=False)
-            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Shopify connect failed:\n{handshake.error}"))
-            return
-
-        save_shopify_token(access_token=handshake.access_token, scope=handshake.scope)
-        self._set_shopify_status(connected=True)
+            if allow_handshake:
+                self._run_on_ui_thread(messagebox.showerror, APP_TITLE, f"Shopify connect failed:\n{exc}")
+            return False
 
     def _toggle_advanced_mode(self) -> None:
         return
@@ -2239,10 +2626,7 @@ class ProductProspectorDesktopApp:
         if threading.current_thread() is threading.main_thread():
             apply()
             return
-        try:
-            self.root.after(0, apply)
-        except RuntimeError:
-            return
+        self._run_on_ui_thread(apply)
 
     def _on_use_all_sheet_toggle(self) -> None:
         self._refresh_input_metrics()
@@ -2507,10 +2891,7 @@ class ProductProspectorDesktopApp:
                     f"{len(existing_ordered)} SKU(s) already exist and will be excluded: {preview}{more}"
                 )
 
-            try:
-                self.root.after(0, apply)
-            except RuntimeError:
-                return
+            self._run_on_ui_thread(apply)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2642,7 +3023,13 @@ class ProductProspectorDesktopApp:
         self.session.source_mapping.description = self.vendor_description_column.get().strip()
         self.session.source_mapping.media = self.vendor_image_column.get().strip()
         self.session.source_mapping.price = self.vendor_price_column.get().strip()
+        # Price source precedence comes from required/rules/pricing_priority_rules.json.
+        self.session.source_mapping.map_price = ""
+        self.session.source_mapping.msrp_price = ""
+        self.session.source_mapping.jobber_price = ""
         self.session.source_mapping.cost = self.vendor_cost_column.get().strip()
+        self.session.source_mapping.dealer_cost = ""
+        self.session.source_mapping.core_charge_product_code = self.vendor_core_charge_column.get().strip()
         self.session.source_mapping.sku = self.vendor_sku_column.get().strip()
         self.session.source_mapping.barcode = self.vendor_barcode_column.get().strip()
         self.session.source_mapping.weight = self.vendor_weight_column.get().strip()
@@ -2699,50 +3086,57 @@ class ProductProspectorDesktopApp:
 
         existing_create_skus: set[str] = set()
         if self.session.mode == MODE_NEW:
-            if not self.shopify_cache_ready:
-                if show_messages:
-                    messagebox.showinfo(
-                        APP_TITLE,
-                        "Shopify SKU cache is still downloading. Wait for it to finish, then run SKU checks.",
-                    )
-                return False
-
             target_scope = tuple(target_skus)
-            if self._duplicate_check_inflight and self._duplicate_check_active_workers <= 0:
-                self._set_duplicate_check_busy(False)
-            if self._duplicate_check_inflight:
-                elapsed = 0.0
-                if self._duplicate_check_started_at > 0:
-                    elapsed = time.monotonic() - self._duplicate_check_started_at
-                if elapsed > 120.0:
+            if not self.shopify_cache_ready:
+                # Do not block setup/processing when cache is not ready.
+                # Keep cache warmup running in background (when token/config allow).
+                self.duplicate_check_text.set(
+                    "Continuing without Shopify duplicate check. SKU cache sync will continue in background."
+                )
+                if target_scope == self.create_duplicate_scope:
+                    existing_create_skus = set(self.create_existing_skus)
+                self._start_background_shopify_cache_warmup()
+                threading.Thread(
+                    target=self._connect_shopify_worker,
+                    kwargs={"allow_handshake": False},
+                    daemon=True,
+                ).start()
+            else:
+                if self._duplicate_check_inflight and self._duplicate_check_active_workers <= 0:
                     self._set_duplicate_check_busy(False)
-                    self.duplicate_check_text.set("Previous duplicate check timed out and was reset.")
-                elif self._duplicate_check_pending_scope and self._duplicate_check_pending_scope != target_scope:
+                if self._duplicate_check_inflight:
+                    elapsed = 0.0
+                    if self._duplicate_check_started_at > 0:
+                        elapsed = time.monotonic() - self._duplicate_check_started_at
+                    if elapsed > 120.0:
+                        self._set_duplicate_check_busy(False)
+                        self.duplicate_check_text.set("Previous duplicate check timed out and was reset.")
+                    elif self._duplicate_check_pending_scope and self._duplicate_check_pending_scope != target_scope:
+                        self._queue_create_duplicate_check(target_skus)
+                        if show_messages:
+                            messagebox.showinfo(
+                                APP_TITLE,
+                                "A previous duplicate check was running for a different SKU scope.\n\nStarted a new check for your current scope. Press Save & Continue again when it completes.",
+                            )
+                        return False
+                    else:
+                        if show_messages:
+                            messagebox.showinfo(
+                                APP_TITLE,
+                                "Shopify duplicate check is still running in background.\n\nWait for status to finish, then press Save & Continue again.",
+                            )
+                        return False
+
+                if target_scope != self.create_duplicate_scope:
                     self._queue_create_duplicate_check(target_skus)
                     if show_messages:
                         messagebox.showinfo(
                             APP_TITLE,
-                            "A previous duplicate check was running for a different SKU scope.\n\nStarted a new check for your current scope. Press Save & Continue again when it completes.",
-                        )
-                    return False
-                else:
-                    if show_messages:
-                        messagebox.showinfo(
-                            APP_TITLE,
-                            "Shopify duplicate check is still running in background.\n\nWait for status to finish, then press Save & Continue again.",
+                            "Running Shopify duplicate check in background for your current SKU scope.\n\nPress Save & Continue again when it completes.",
                         )
                     return False
 
-            if target_scope != self.create_duplicate_scope:
-                self._queue_create_duplicate_check(target_skus)
-                if show_messages:
-                    messagebox.showinfo(
-                        APP_TITLE,
-                        "Running Shopify duplicate check in background for your current SKU scope.\n\nPress Save & Continue again when it completes.",
-                    )
-                return False
-
-            existing_create_skus = set(self.create_existing_skus)
+                existing_create_skus = set(self.create_existing_skus)
             if existing_create_skus:
                 target_skus = [sku for sku in target_skus if sku not in existing_create_skus]
                 if not target_skus:
@@ -2954,6 +3348,7 @@ class ProductProspectorDesktopApp:
             self.vendor_image_combo,
             self.vendor_price_combo,
             self.vendor_cost_combo,
+            self.vendor_core_charge_combo,
             self.vendor_barcode_combo,
             self.vendor_weight_combo,
             getattr(self, "remap_vendor_combo", None),
@@ -2962,6 +3357,7 @@ class ProductProspectorDesktopApp:
             getattr(self, "remap_media_combo", None),
             getattr(self, "remap_price_combo", None),
             getattr(self, "remap_cost_combo", None),
+            getattr(self, "remap_core_charge_combo", None),
             getattr(self, "remap_barcode_combo", None),
             getattr(self, "remap_weight_combo", None),
             getattr(self, "remap_application_combo", None),
@@ -2993,7 +3389,19 @@ class ProductProspectorDesktopApp:
 
         suggestions = suggest_columns(
             self.vendor_df_raw,
-            fields=["sku", "title", "description", "fitment", "years", "image_url", "price", "cost", "barcode"],
+            fields=[
+                "sku",
+                "title",
+                "description",
+                "fitment",
+                "years",
+                "image_url",
+                "price",
+                "map_price",
+                "cost",
+                "core_charge_product_code",
+                "barcode",
+            ],
         )
         self.vendor_vendor_column.set(
             self._suggest_vendor_column_by_keywords(["vendor", "brand", "manufacturer"]) or self.vendor_vendor_column.get()
@@ -3003,8 +3411,17 @@ class ProductProspectorDesktopApp:
         self.vendor_description_column.set(suggestions["description"].column or self.vendor_description_column.get())
         self.vendor_fitment_column.set(suggestions["fitment"].column or self.vendor_fitment_column.get())
         self.vendor_image_column.set(suggestions["image_url"].column or self.vendor_image_column.get())
-        self.vendor_price_column.set(suggestions["price"].column or self.vendor_price_column.get())
+        suggested_map_price = suggestions["map_price"].column or ""
+        suggested_base_price = suggestions["price"].column or ""
+        # Pricing rule uses MAP first, so keep Price aligned to MAP when we can detect it.
+        if suggested_map_price:
+            self.vendor_price_column.set(suggested_map_price)
+        else:
+            self.vendor_price_column.set(suggested_base_price or self.vendor_price_column.get())
         self.vendor_cost_column.set(suggestions["cost"].column or self.vendor_cost_column.get())
+        self.vendor_core_charge_column.set(
+            suggestions["core_charge_product_code"].column or self.vendor_core_charge_column.get()
+        )
         self.vendor_barcode_column.set(suggestions["barcode"].column or self.vendor_barcode_column.get())
 
         self.vendor_weight_column.set(
@@ -3277,6 +3694,14 @@ class ProductProspectorDesktopApp:
         self.only_rows_with_year_changes.set(settings.only_rows_with_year_changes)
 
     def _on_close(self) -> None:
+        self._shutdown_requested = True
+        self._cancel_header_logo_animation()
+        if self._ui_task_pump_job is not None:
+            try:
+                self.root.after_cancel(self._ui_task_pump_job)
+            except Exception:
+                pass
+            self._ui_task_pump_job = None
         self._stop_shopify_cache_spinner()
         self._hide_review_busy_overlay()
         settings = AppSettings(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import urllib.error
 import urllib.request
@@ -9,9 +10,40 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 
+def _frozen_bundle_app_dir(exe_dir: Path) -> Path | None:
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        candidates.append(Path(meipass) / "app")
+    if sys.platform == "darwin":
+        candidates.append(exe_dir.parent / "Resources" / "app")
+    candidates.append(exe_dir / "app")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
+        if sys.platform == "darwin":
+            app_dir = Path.home() / "Library" / "Application Support" / "ProductProspector"
+            app_dir.mkdir(parents=True, exist_ok=True)
+            (app_dir / "config").mkdir(parents=True, exist_ok=True)
+
+            bundle_app_dir = _frozen_bundle_app_dir(exe_dir)
+            if bundle_app_dir is not None:
+                template_src = bundle_app_dir / "config" / "shopify.json.template"
+                template_dst = app_dir / "config" / "shopify.json.template"
+                if template_src.exists() and not template_dst.exists():
+                    try:
+                        shutil.copy2(template_src, template_dst)
+                    except Exception:
+                        pass
+            return app_dir
+
         app_dir = exe_dir / "app"
         app_dir.mkdir(parents=True, exist_ok=True)
         return app_dir

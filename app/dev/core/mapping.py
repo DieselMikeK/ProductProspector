@@ -19,6 +19,7 @@ class ColumnSuggestion:
 FIELD_ALIASES: dict[str, list[str]] = {
     "sku": [
         "sku",
+        "sky",
         "part number",
         "part #",
         "item number",
@@ -34,9 +35,13 @@ FIELD_ALIASES: dict[str, list[str]] = {
     "fitment": ["fitment", "application", "apps", "vehicle", "compatibility", "fits", "fit"],
     "years": ["years", "year", "model years", "fitment years", "application years"],
     "price": ["price", "retail", "msrp", "list price"],
+    "msrp_price": ["msrp", "retail", "retail price", "list price", "suggested retail"],
+    "map_price": ["map", "minimum advertised price", "m a p", "m.a.p"],
+    "jobber_price": ["jobber", "jobber price", "jobber net", "jobber cost"],
+    "dealer_cost": ["dealer", "dealer price", "dealer cost", "dealer net", "dealer t1", "dealer t2"],
     "cost": ["cost", "dealer", "wholesale", "net price"],
     "map": ["map", "minimum advertised price"],
-    "jobber_price": ["jobber", "jobber price"],
+    "core_charge_product_code": ["core", "core charge", "corecharge", "core value"],
     "image_url": ["image", "image url", "image link", "picture", "photo", "img", "media"],
     "barcode": ["barcode", "upc", "ean", "gtin"],
     "product_number": ["product number", "part number", "manufacturer part", "mpn"],
@@ -102,10 +107,20 @@ def _score_values(field_name: str, values: list[str]) -> tuple[float, str]:
         ratio = hits / total
         return ratio, f"{hits}/{total} values contain parseable years."
 
-    if field_name in {"price", "cost", "map", "jobber_price"}:
+    if field_name in {"price", "cost", "map", "jobber_price", "msrp_price", "map_price", "dealer_cost"}:
         hits = sum(1 for item in sample if _looks_like_currency(item))
         ratio = hits / total
         return ratio, f"{hits}/{total} values look like currency."
+
+    if field_name == "core_charge_product_code":
+        hits = sum(
+            1
+            for item in sample
+            if bool(re.search(r"(?i)core", item))
+            or bool(re.search(r"\b[0-9]{2,5}\b", item.replace(",", "")))
+        )
+        ratio = hits / total
+        return ratio, f"{hits}/{total} values look like core-charge values."
 
     if field_name == "barcode":
         hits = sum(1 for item in sample if _looks_like_barcode(item))
@@ -172,4 +187,3 @@ def suggest_columns(
     for field in fields:
         suggestions[field] = suggest_column_for_field(df=df, field_name=field, excluded_columns=excluded_columns)
     return suggestions
-

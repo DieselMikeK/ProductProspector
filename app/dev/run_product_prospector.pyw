@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -9,10 +10,23 @@ from product_prospector.desktop_app import main
 
 
 def _show_error_dialog(message: str) -> None:
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.user32.MessageBoxW(0, message, "Product Prospector Error", 0x10)
+            return
+        except Exception:
+            pass
+
     try:
-        ctypes.windll.user32.MessageBoxW(0, message, "Product Prospector Error", 0x10)
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Product Prospector Error", message)
+        root.destroy()
     except Exception:
-        pass
+        print(message, file=sys.stderr)
 
 
 def _write_error_log(message: str) -> None:
