@@ -39,9 +39,9 @@ def _split_aliases(value: object) -> list[str]:
 def _request_graphql(config: ShopifyConfig, access_token: str, query: str, variables: dict) -> tuple[dict | None, str | None]:
     # Hard safety guard: this module is read-only by design.
     query_text = _clean_text(query).lower()
-    if "mutation" in query_text or "delete" in query_text or "update" in query_text:
+    if re.search(r"\bmutation\b", query_text):
         return None, "Read-only guard blocked non-query GraphQL operation."
-    if not query_text.startswith("query"):
+    if not re.match(r"^\s*query\b", query_text):
         return None, "Read-only guard requires GraphQL query operations only."
 
     url = f"https://{config.shop_domain}/admin/api/{config.api_version}/graphql.json"

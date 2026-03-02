@@ -3,10 +3,14 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir "..\.."))
 $AppDevDir = Join-Path $ProjectRoot "app\dev"
+$BundleRulesPath = Join-Path $ProjectRoot "app\BUNDLING_RULES.md"
 $VenvDir = Join-Path $AppDevDir ".venv-win-build"
 $PythonBin = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { "python" }
 
 Write-Host "Using Python: $PythonBin"
+if (Test-Path $BundleRulesPath) {
+  Write-Host "Bundling rules: $BundleRulesPath"
+}
 
 & $PythonBin -m venv $VenvDir
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
@@ -23,6 +27,7 @@ if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force }
 & $VenvPyInstaller `
   --noconfirm `
   --clean `
+  --onefile `
   --windowed `
   --name "ProductProspector" `
   --icon "..\icon.ico" `
@@ -40,4 +45,4 @@ if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force }
 Pop-Location
 
 Write-Host "Build complete:"
-Write-Host "  $AppDevDir\dist\ProductProspector\ProductProspector.exe"
+Write-Host "  $AppDevDir\dist\ProductProspector.exe"

@@ -13,6 +13,7 @@ from product_prospector.core.config_store import ShopifyConfig
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.product_model import Product
 from product_prospector.core.shopify_brand_metaobjects import resolve_brand_metaobject_gid
+from product_prospector.core.shopify_fitment_vehicle_metaobjects import resolve_fitment_vehicle_metaobject_gids
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
 
@@ -619,6 +620,15 @@ def push_new_products_as_drafts(
         brand_gid = profile_brand_gid or resolve_brand_metaobject_gid(brand_value, required_root=required_root)
         sku_no_prefix = _strip_known_sku_prefix(sku, profile_sku_prefix) or sku
         google_mpn_value = _strip_known_sku_prefix(_clean_text(product.mpn) or sku, profile_sku_prefix) or sku_no_prefix
+        fitment_vehicle_gids, fitment_vehicle_warnings = resolve_fitment_vehicle_metaobject_gids(
+            application_text=_clean_text(product.application),
+            required_root=required_root,
+            title_text=_clean_text(product.title),
+            description_text=_clean_text(product.description_html),
+        )
+        for warning in fitment_vehicle_warnings:
+            summary.warnings.append(f"{sku}: {warning}")
+        fitment_vehicle_gid_text = " | ".join(fitment_vehicle_gids)
 
         metafields = [
             ("custom", "application", _clean_text(product.application), "single_line_text_field"),
@@ -635,6 +645,7 @@ def push_new_products_as_drafts(
             ("mm-google-shopping", "mpn", google_mpn_value, "single_line_text_field"),
             ("custom", "enable_low_stock_message", "true", "single_line_text_field"),
             ("custom", "brand", brand_gid or brand_value, "metaobject_reference" if brand_gid else "single_line_text_field"),
+            ("fitment", "vehicles", fitment_vehicle_gid_text, "list.metaobject_reference"),
         ]
         for namespace, key, value, metafield_type in metafields:
             metafield_error = _upsert_product_metafield(

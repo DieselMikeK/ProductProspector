@@ -24,6 +24,14 @@ Place operational reference files here for the app to use.
       - `brand_gid` (or `gid`)
       - `brand_handle` (optional)
       - `aliases` (optional alternate names separated by `|` or `,`)
+  - Shopify fitment vehicle metaobject lookup file (optional, used for `fitment.vehicles` metafield push)
+    - Supported names include `ShopifyFitmentVehicleMetaobjects.csv` and `fitment_vehicle_metaobjects.csv`
+    - Recommended columns:
+      - `fitment_vehicle_name`
+      - `fitment_vehicle_gid` (or `gid`)
+      - `year` (optional but recommended)
+      - `make` (optional but recommended)
+      - `engine_liter` / `engine_family` / `engine_code` (optional matching helpers)
   - Vendor profile resolver file (recommended shared canonical mapping)
     - Supported names include `VendorProfiles.csv` and `vendor_profiles.csv`
     - Suggested columns:

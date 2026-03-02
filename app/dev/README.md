@@ -60,6 +60,13 @@ open dist/ProductProspector.app
 ./build_mac_app.sh
 ```
 
+## Download Shopify Metaobject Mappings
+
+```powershell
+python .\scripts\download_brand_metaobjects.py
+python .\scripts\download_fitment_vehicle_metaobjects.py
+```
+
 ## v1 Workflow
 
 1. Upload vendor file.
