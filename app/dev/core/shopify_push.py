@@ -127,6 +127,20 @@ def _safe_folder_name(value: str) -> str:
     return text or "SKU"
 
 
+def _strip_known_sku_prefix(sku: str, sku_prefix_hint: str = "") -> str:
+    normalized_sku = normalize_sku(sku)
+    prefix = normalize_sku(sku_prefix_hint)
+    if not normalized_sku:
+        return ""
+    if not prefix:
+        return normalized_sku
+    for sep in ("-", "_"):
+        token = f"{prefix}{sep}"
+        if normalized_sku.startswith(token) and len(normalized_sku) > len(token):
+            return normalized_sku[len(token) :]
+    return normalized_sku
+
+
 def _collect_local_images_for_sku(image_root: Path | None, sku: str, max_images: int = 20) -> list[Path]:
     if image_root is None:
         return []
@@ -587,6 +601,7 @@ def push_new_products_as_drafts(
                 if location_error:
                     summary.warnings.append(f"{sku}: inventory location not resolved ({location_error})")
             if location_id is not None:
+                # Use review/mapped inventory value; default to 3,000,000 if blank/invalid.
                 inventory_value = _to_int(product.inventory, 3_000_000)
                 inventory_error = _set_inventory_available(
                     config=config,
@@ -602,6 +617,8 @@ def push_new_products_as_drafts(
         profile_brand_name = _clean_text(vendor_profile.brand_name) if vendor_profile is not None else ""
         brand_value = _clean_text(product.brand) or profile_brand_name or normalized_vendor_value or shopify_vendor_value
         brand_gid = profile_brand_gid or resolve_brand_metaobject_gid(brand_value, required_root=required_root)
+        sku_no_prefix = _strip_known_sku_prefix(sku, profile_sku_prefix) or sku
+        google_mpn_value = _strip_known_sku_prefix(_clean_text(product.mpn) or sku, profile_sku_prefix) or sku_no_prefix
 
         metafields = [
             ("custom", "application", _clean_text(product.application), "single_line_text_field"),
@@ -615,6 +632,8 @@ def push_new_products_as_drafts(
                 "single_line_text_field",
             ),
             ("custom", "mpn", _clean_text(product.mpn) or sku, "single_line_text_field"),
+            ("mm-google-shopping", "mpn", google_mpn_value, "single_line_text_field"),
+            ("custom", "enable_low_stock_message", "true", "single_line_text_field"),
             ("custom", "brand", brand_gid or brand_value, "metaobject_reference" if brand_gid else "single_line_text_field"),
         ]
         for namespace, key, value, metafield_type in metafields:
