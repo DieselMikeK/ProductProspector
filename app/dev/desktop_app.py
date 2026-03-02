@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+from datetime import datetime, timezone
 import queue
 from pathlib import Path
 import re
@@ -23,7 +24,7 @@ from product_prospector.core.config_store import (
     save_shopify_token,
 )
 from product_prospector.core.io_utils import read_table_from_path
-from product_prospector.core.mapping import suggest_columns
+from product_prospector.core.mapping import suggest_column_for_field
 from product_prospector.core.normalization import normalize_product
 from product_prospector.core.pricing_rules import (
     DiscountMatch,
@@ -48,7 +49,7 @@ from product_prospector.core.shopify_catalog import fetch_shopify_catalog_datafr
 from product_prospector.core.shopify_catalog import fetch_shopify_catalog_for_skus
 from product_prospector.core.shopify_oauth import exchange_client_credentials_for_token, perform_oauth_handshake, validate_access_token
 from product_prospector.core.shopify_push import ShopifyDraftPushSummary, push_new_products_as_drafts
-from product_prospector.core.shopify_sku_cache import load_shopify_sku_cache, save_shopify_sku_cache
+from product_prospector.core.shopify_sku_cache import get_shopify_sku_cache_path, load_shopify_sku_cache, save_shopify_sku_cache
 from product_prospector.core.type_mapping_engine import TypeCategoryMapper
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
@@ -300,6 +301,9 @@ class ProductProspectorDesktopApp:
         self.vendor_barcode_column = StringVar(value="")
         self.vendor_weight_column = StringVar(value="")
         self.vendor_vendor_column = StringVar(value="")
+        self._vendor_mapping_trace_ready = False
+        self._vendor_mapping_enforce_inflight = False
+        self._vendor_mapping_enforcement_suspended = 0
 
         self.shopify_sku_column = StringVar(value="sku")
         self.shopify_title_column = StringVar(value="title")
@@ -356,6 +360,7 @@ class ProductProspectorDesktopApp:
         self.vendor_discounts_df: pd.DataFrame | None = None
         self.review_refresh_pending = False
         self.review_refresh_inflight = False
+        self.review_tab_unlocked = False
         self.review_table_refresh_job: str | None = None
         self.review_loaded_raw: dict[str, str] = {}
         self.review_loaded_display: dict[str, str] = {}
@@ -414,7 +419,20 @@ class ProductProspectorDesktopApp:
         self.shopify_cache_api_label = ttk.Label(api_frame, textvariable=self.shopify_cache_api_text, foreground="#1f4e79")
         self.shopify_connect_button = ttk.Button(api_frame, text="Connect", command=self._connect_shopify_clicked)
         self.shopify_connect_button.pack(side=LEFT, padx=(12, 0))
+        self.shopify_cache_newest_button = ttk.Button(
+            api_frame,
+            text="Download Newest SKUs",
+            command=self._download_newest_shopify_skus_clicked,
+        )
+        self.shopify_cache_newest_button.pack(side=LEFT, padx=(8, 0))
+        self.shopify_cache_redownload_button = ttk.Button(
+            api_frame,
+            text="Redownload All SKUs",
+            command=self._redownload_shopify_sku_cache_clicked,
+        )
+        self.shopify_cache_redownload_button.pack(side=LEFT, padx=(8, 0))
         self._draw_shopify_dot(state="disconnected")
+        self._refresh_shopify_cache_action_buttons()
 
         self.notebook = ttk.Notebook(root_frame)
         self.notebook.pack(fill=BOTH, expand=True)
@@ -887,6 +905,7 @@ class ProductProspectorDesktopApp:
         self._refresh_sku_action_labels()
         self._set_duplicate_check_busy(False)
         self._refresh_mode_lock_ui()
+        self._attach_vendor_mapping_traces()
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
         try:
@@ -918,6 +937,8 @@ class ProductProspectorDesktopApp:
             self.review_refresh_inflight = False
 
     def _open_review_tab(self) -> None:
+        self.review_tab_unlocked = True
+        self._update_tab_access()
         self.notebook.select(2)
         self._ensure_review_ready()
 
@@ -943,18 +964,25 @@ class ProductProspectorDesktopApp:
         if not products:
             self.push_selected_skus = set()
             _tree_show_dataframe(self.review_table, pd.DataFrame())
+            self._refresh_push_button_state()
             return
 
-        available = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
+        available = {
+            normalize_sku(getattr(product, "sku", ""))
+            for product in products
+            if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+        }
         self.push_selected_skus = {sku for sku in self.push_selected_skus if sku in available}
 
         # Keep review grid lightweight to avoid UI lockups on large/long text payloads.
         rows: list[dict[str, str]] = []
         for product in products[:120]:
             sku = normalize_sku(getattr(product, "sku", ""))
+            excluded = bool(getattr(product, "excluded", False))
+            exclusion_reason = str(getattr(product, "exclusion_reason", "") or "").strip()
             rows.append(
                 {
-                    "push": "[x]" if sku and sku in self.push_selected_skus else "[ ]",
+                    "push": "[-]" if excluded else ("[x]" if sku and sku in self.push_selected_skus else "[ ]"),
                     "sku": str(product.sku or ""),
                     "title": str(product.title or ""),
                     "price": str(product.price or ""),
@@ -966,10 +994,12 @@ class ProductProspectorDesktopApp:
                     "product_subtype": str(product.product_subtype or ""),
                     "application": str(product.application or ""),
                     "scrape_status": str(product.scrape_status or ""),
+                    "status": exclusion_reason or "ready",
                 }
             )
         df = pd.DataFrame(rows)
         _tree_show_dataframe(self.review_table, df, max_rows=120)
+        self._refresh_push_button_state()
 
     def _toggle_review_table_push_selection(self) -> None:
         products = self.session.products or []
@@ -1091,7 +1121,6 @@ class ProductProspectorDesktopApp:
         self.export_scrollbar = ttk.Scrollbar(self.tab_export, orient=VERTICAL, command=self.export_canvas.yview)
         self.export_scrollbar.pack(side=RIGHT, fill=Y)
         self.export_canvas.configure(yscrollcommand=self.export_scrollbar.set)
-
         self.export_inner = ttk.Frame(self.export_canvas, padding=10)
         self._export_inner_id = self.export_canvas.create_window((0, 0), window=self.export_inner, anchor="nw")
         self.export_inner.bind(
@@ -1205,6 +1234,21 @@ class ProductProspectorDesktopApp:
             fg="#111827",
             font=("Segoe UI", 10, "bold"),
         ).pack(side=LEFT, padx=(10, 0))
+
+    def _reorder_processing_preview_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        trailing = [
+            "excluded",
+            "exclusion_reason",
+            "scrape_status",
+            "scrape_fields_found",
+            "scrape_error",
+            "media_folder",
+        ]
+        trailing_present = [column for column in trailing if column in df.columns]
+        leading = [column for column in df.columns if column not in trailing_present]
+        return df.loc[:, [*leading, *trailing_present]]
 
     def _combo_row(self, parent, label: str, variable: StringVar, row: int, column: int = 0) -> ttk.Combobox:
         frame = ttk.Frame(parent)
@@ -1420,6 +1464,8 @@ class ProductProspectorDesktopApp:
         self._processing_request_id += 1
         request_id = self._processing_request_id
         self._auto_open_review_after_processing = bool(auto_open_review)
+        self.review_tab_unlocked = False
+        self._update_tab_access()
         if self.session.scrape_settings.vendor_search_url:
             self._play_header_logo_animation()
         self._set_processing_busy(True)
@@ -1634,25 +1680,32 @@ class ProductProspectorDesktopApp:
             self.push_selected_skus = {
                 normalize_sku(getattr(product, "sku", ""))
                 for product in normalized_products
-                if normalize_sku(getattr(product, "sku", ""))
+                if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
             }
             self.session.processing_complete = True
             self._update_tab_access()
+            self._refresh_push_button_state()
 
             preview_df = products_to_dataframe(normalized_products)
+            preview_df = self._reorder_processing_preview_columns(preview_df)
             _tree_show_dataframe(self.processing_preview, _safe_head(preview_df, rows=120))
 
             rows_considered = int(getattr(build_stats, "rows_considered", len(normalized_products)))
             rows_skipped_no_shopify_match = int(getattr(build_stats, "rows_skipped_no_shopify_match", 0))
             rows_skipped_missing_sku = int(getattr(build_stats, "rows_skipped_missing_sku", 0))
+            rows_flagged_gas = int(getattr(build_stats, "rows_flagged_gas", 0))
+            eligible_products = sum(1 for product in normalized_products if not bool(getattr(product, "excluded", False)))
             status_parts = [
                 f"Processing Complete - {len(normalized_products)} products processed.",
                 f"Rows considered: {rows_considered}",
+                f"Eligible for export/push: {eligible_products}",
             ]
             if rows_skipped_no_shopify_match:
                 status_parts.append(f"Skipped (no Shopify match): {rows_skipped_no_shopify_match}")
             if rows_skipped_missing_sku:
                 status_parts.append(f"Skipped (missing SKU): {rows_skipped_missing_sku}")
+            if rows_flagged_gas:
+                status_parts.append(f"Excluded (gas-only): {rows_flagged_gas}")
 
             if self.session.missing_fields:
                 status_parts.append(f"Missing fields: {', '.join(self.session.missing_fields)}")
@@ -1900,7 +1953,8 @@ class ProductProspectorDesktopApp:
         self._load_review_product(self.review_index + 1)
 
     def _export_review_products(self) -> None:
-        df = products_to_dataframe(self.session.products)
+        export_products = [product for product in (self.session.products or []) if not bool(getattr(product, "excluded", False))]
+        df = products_to_dataframe(export_products)
         if df.empty:
             messagebox.showinfo(APP_TITLE, "No processed products to export.")
             return
@@ -1924,6 +1978,14 @@ class ProductProspectorDesktopApp:
         if self.session.mode != MODE_NEW:
             self.push_shopify_btn.configure(state="disabled")
             return
+        eligible_count = sum(
+            1
+            for product in (self.session.products or [])
+            if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+        )
+        if eligible_count <= 0:
+            self.push_shopify_btn.configure(state="disabled")
+            return
         self.push_shopify_btn.configure(state="normal")
 
     def _push_to_shopify_clicked(self) -> None:
@@ -1941,7 +2003,11 @@ class ProductProspectorDesktopApp:
 
         self._save_current_review_product()
         selected = {normalize_sku(sku) for sku in self.push_selected_skus if normalize_sku(sku)}
-        products = [product for product in list(self.session.products or []) if normalize_sku(getattr(product, "sku", "")) in selected]
+        products = [
+            product
+            for product in list(self.session.products or [])
+            if normalize_sku(getattr(product, "sku", "")) in selected and not bool(getattr(product, "excluded", False))
+        ]
         if not products:
             messagebox.showwarning(APP_TITLE, "No selected rows to push. Check [x] next to at least one product.")
             return
@@ -2085,7 +2151,11 @@ class ProductProspectorDesktopApp:
 
     def _select_all_for_push(self) -> None:
         products = self.session.products or []
-        self.push_selected_skus = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
+        self.push_selected_skus = {
+            normalize_sku(getattr(product, "sku", ""))
+            for product in products
+            if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+        }
         self._refresh_review_table_async()
 
     def _clear_push_selection(self) -> None:
@@ -2111,6 +2181,14 @@ class ProductProspectorDesktopApp:
         sku_value = normalize_sku(tree.set(row_id, "sku"))
         if not sku_value:
             return
+        selected_product = None
+        for product in self.session.products:
+            if normalize_sku(getattr(product, "sku", "")) == sku_value:
+                selected_product = product
+                break
+        if selected_product is not None and bool(getattr(selected_product, "excluded", False)):
+            self.review_status_text.set(str(getattr(selected_product, "exclusion_reason", "") or "Excluded from push/export"))
+            return "break"
         if sku_value in self.push_selected_skus:
             self.push_selected_skus.remove(sku_value)
         else:
@@ -2136,7 +2214,121 @@ class ProductProspectorDesktopApp:
         if self.shopify_cache_ready and (self.shopify_df_raw is None or self.shopify_df_raw.empty):
             self.shopify_df_raw = cached_df
         self._set_shopify_cache_api_busy(False)
+        self._refresh_shopify_cache_action_buttons()
         self._refresh_new_mode_check_controls()
+
+    def _refresh_shopify_cache_action_buttons(self) -> None:
+        if not hasattr(self, "shopify_cache_newest_button"):
+            return
+        can_run = self.shopify_connected and not self.shopify_connecting and not self.shopify_cache_warmup_inflight
+        state = "normal" if can_run else "disabled"
+        self.shopify_cache_newest_button.configure(state=state)
+        self.shopify_cache_redownload_button.configure(state=state)
+
+    def _download_newest_shopify_skus_clicked(self) -> None:
+        if self.shopify_connecting or self.shopify_cache_warmup_inflight:
+            return
+        if not self.shopify_connected:
+            self._connect_shopify_clicked()
+            if not self.shopify_connected:
+                return
+        cached_df = load_shopify_sku_cache()
+        if cached_df is None or cached_df.empty:
+            self._start_background_shopify_cache_warmup(force_refresh=True)
+            return
+        self._start_background_shopify_cache_newest_refresh()
+
+    def _redownload_shopify_sku_cache_clicked(self) -> None:
+        if self.shopify_connecting or self.shopify_cache_warmup_inflight:
+            return
+        if not self.shopify_connected:
+            self._connect_shopify_clicked()
+            if not self.shopify_connected:
+                return
+        self._start_background_shopify_cache_warmup(force_refresh=True)
+
+    def _start_background_shopify_cache_newest_refresh(self) -> None:
+        if self.shopify_cache_warmup_inflight:
+            return
+        worker = threading.Thread(target=self._background_shopify_cache_newest_refresh, daemon=True)
+        self.shopify_cache_warmup_inflight = True
+        self._run_on_ui_thread(self._refresh_shopify_cache_action_buttons)
+        worker.start()
+
+    def _background_shopify_cache_newest_refresh(self) -> None:
+        try:
+            cached = load_shopify_sku_cache()
+            if cached is None:
+                cached = pd.DataFrame()
+            if cached.empty:
+                self._background_shopify_cache_warmup(force_refresh=True)
+                return
+
+            config = load_shopify_config()
+            if config is None:
+                return
+
+            token = load_shopify_token()
+            if token is None:
+                return
+
+            cache_path = get_shopify_sku_cache_path()
+            try:
+                last_sync_utc = datetime.fromtimestamp(cache_path.stat().st_mtime, tz=timezone.utc)
+                created_since = last_sync_utc.date().isoformat()
+            except Exception:
+                created_since = datetime.now(timezone.utc).date().isoformat()
+            search_query = f"created_at:>={created_since}"
+            start_count = int(len(cached))
+            self._set_shopify_cache_api_busy(
+                True,
+                f"Downloading newest Shopify SKUs since {created_since}... {start_count:,} cached",
+            )
+
+            def on_catalog_progress(_page_count: int, row_count: int) -> None:
+                self._set_shopify_cache_api_busy(
+                    True,
+                    f"Downloading newest Shopify SKUs since {created_since}... +{row_count:,}",
+                )
+
+            df, error = fetch_shopify_catalog_dataframe(
+                config=config,
+                access_token=token.access_token,
+                search_query=search_query,
+                progress_callback=on_catalog_progress,
+            )
+            if error:
+                df, error = fetch_shopify_catalog_dataframe(
+                    config=config,
+                    access_token=token.access_token,
+                    progress_callback=on_catalog_progress,
+                )
+                if error:
+                    return
+            if df is None or df.empty:
+                self.shopify_cache_ready = not cached.empty
+                self.shopify_df_raw = cached
+                return
+
+            merged = pd.concat([df, cached], ignore_index=True)
+            if "sku" not in merged.columns:
+                return
+            merged["sku"] = merged["sku"].astype(str).str.strip()
+            merged = merged[merged["sku"] != ""].copy()
+            merged["sku_norm"] = merged["sku"].str.upper()
+            merged = merged.drop_duplicates(subset=["sku_norm"], keep="first")
+            merged = merged.drop(columns=["sku_norm"], errors="ignore")
+            merged = merged.reset_index(drop=True)
+
+            save_shopify_sku_cache(merged)
+            self.shopify_cache_ready = True
+            self.shopify_df_raw = merged
+        finally:
+            self.shopify_cache_warmup_inflight = False
+            self._set_shopify_cache_api_busy(False)
+            self._run_on_ui_thread(self._refresh_shopify_cache_action_buttons)
+            self._run_on_ui_thread(self._refresh_new_mode_check_controls)
+            self._run_on_ui_thread(self._refresh_input_metrics)
 
     def _start_background_shopify_cache_warmup(self, force_refresh: bool = False) -> None:
         if self.shopify_cache_warmup_inflight:
@@ -2147,6 +2339,7 @@ class ProductProspectorDesktopApp:
             daemon=True,
         )
         self.shopify_cache_warmup_inflight = True
+        self._run_on_ui_thread(self._refresh_shopify_cache_action_buttons)
         worker.start()
 
     def _background_shopify_cache_warmup(self, force_refresh: bool = False) -> None:
@@ -2188,6 +2381,7 @@ class ProductProspectorDesktopApp:
         finally:
             self.shopify_cache_warmup_inflight = False
             self._set_shopify_cache_api_busy(False)
+            self._run_on_ui_thread(self._refresh_shopify_cache_action_buttons)
             self._run_on_ui_thread(self._refresh_new_mode_check_controls)
             self._run_on_ui_thread(self._refresh_input_metrics)
 
@@ -2347,6 +2541,7 @@ class ProductProspectorDesktopApp:
             self.shopify_connected = connected
             if connected:
                 self.shopify_ever_connected = True
+            self._refresh_shopify_cache_action_buttons()
             if connected:
                 # Avoid re-downloading full catalog on every reconnect.
                 # If cache is already present, warmup uses cached rows and returns quickly.
@@ -2383,6 +2578,7 @@ class ProductProspectorDesktopApp:
                 self.shopify_status_label.configure(text="Shopify - Not Connected (auto retrying...)")
                 self._draw_shopify_dot(state="disconnected")
             self.shopify_connect_button.configure(text="Reconnect" if prior_auth else "Connect", state="disabled")
+            self._refresh_shopify_cache_action_buttons()
 
         self._run_on_ui_thread(apply)
 
@@ -2994,7 +3190,7 @@ class ProductProspectorDesktopApp:
             self.notebook.tab(2, state="disabled")
             return
         self.notebook.tab(1, state="normal")
-        if self.session.processing_complete:
+        if self.session.processing_complete and self.review_tab_unlocked:
             self.notebook.tab(2, state="normal")
             return
         self.notebook.tab(2, state="disabled")
@@ -3017,6 +3213,7 @@ class ProductProspectorDesktopApp:
             if show_messages:
                 messagebox.showwarning(APP_TITLE, "Load a vendor spreadsheet before using all spreadsheet SKUs.")
             return False
+        self._enforce_unique_vendor_mappings()
 
         self.session.source_mapping.vendor = self.vendor_vendor_column.get().strip()
         self.session.source_mapping.title = self.vendor_title_column.get().strip()
@@ -3181,6 +3378,7 @@ class ProductProspectorDesktopApp:
         if not preserve_review_state:
             self.session.processing_complete = False
             self.session.products = []
+            self.review_tab_unlocked = False
         self.review_refresh_pending = False
         self.review_refresh_inflight = False
         if not preserve_review_state:
@@ -3336,6 +3534,90 @@ class ProductProspectorDesktopApp:
         self.input_metrics_text.set(
             f"Vendor SKUs: {vendor_skus} | Scoped SKUs: {scoped_skus} | Shopify Catalog SKUs: {shopify_rows}"
         )
+
+    def _vendor_mapping_var_pairs(self) -> list[tuple[str, StringVar]]:
+        return [
+            ("sku", self.vendor_sku_column),
+            ("title", self.vendor_title_column),
+            ("description", self.vendor_description_column),
+            ("price", self.vendor_price_column),
+            ("cost", self.vendor_cost_column),
+            ("fitment", self.vendor_fitment_column),
+            ("media", self.vendor_image_column),
+            ("vendor", self.vendor_vendor_column),
+            ("core_charge", self.vendor_core_charge_column),
+            ("barcode", self.vendor_barcode_column),
+            ("weight", self.vendor_weight_column),
+        ]
+
+    def _vendor_mapping_priority_order(self, preferred_field: str | None = None) -> list[str]:
+        base_order = [
+            "sku",
+            "title",
+            "description",
+            "price",
+            "cost",
+            "fitment",
+            "media",
+            "vendor",
+            "core_charge",
+            "barcode",
+            "weight",
+        ]
+        if not preferred_field or preferred_field not in base_order:
+            return base_order
+        if preferred_field == "sku":
+            return base_order
+        return ["sku", preferred_field, *[field for field in base_order if field not in {"sku", preferred_field}]]
+
+    def _attach_vendor_mapping_traces(self) -> None:
+        if self._vendor_mapping_trace_ready:
+            return
+        for field_name, variable in self._vendor_mapping_var_pairs():
+            variable.trace_add("write", lambda *_args, field_name=field_name: self._on_vendor_mapping_var_changed(field_name))
+        self._vendor_mapping_trace_ready = True
+
+    def _on_vendor_mapping_var_changed(self, field_name: str) -> None:
+        if self._vendor_mapping_enforcement_suspended > 0:
+            return
+        self._enforce_unique_vendor_mappings(preferred_field=field_name)
+
+    def _enforce_unique_vendor_mappings(self, preferred_field: str | None = None) -> None:
+        if self._vendor_mapping_enforcement_suspended > 0 or self._vendor_mapping_enforce_inflight:
+            return
+
+        mapping_vars = {name: var for name, var in self._vendor_mapping_var_pairs()}
+        order = self._vendor_mapping_priority_order(preferred_field=preferred_field)
+        if not order:
+            return
+
+        sku_before = mapping_vars["sku"].get().strip() if "sku" in mapping_vars else ""
+        cleared = 0
+
+        self._vendor_mapping_enforce_inflight = True
+        try:
+            seen: dict[str, str] = {}
+            for field_name in order:
+                variable = mapping_vars.get(field_name)
+                if variable is None:
+                    continue
+                value = variable.get().strip()
+                if not value:
+                    continue
+                if value in seen:
+                    variable.set("")
+                    cleared += 1
+                    continue
+                seen[value] = field_name
+        finally:
+            self._vendor_mapping_enforce_inflight = False
+
+        sku_after = mapping_vars["sku"].get().strip() if "sku" in mapping_vars else ""
+        if sku_before != sku_after:
+            self._on_vendor_sku_mapping_changed()
+        elif cleared > 0 and hasattr(self, "rules_status"):
+            self.rules_status.configure(text=f"Removed {cleared} duplicate vendor mapping(s).")
+
     def _bind_vendor_columns(self, columns: list[str]) -> None:
         normalized = [str(column) for column in columns]
         required = normalized
@@ -3373,60 +3655,136 @@ class ProductProspectorDesktopApp:
                 continue
             _combobox_set_values(widget, required)
 
-    def _suggest_vendor_column_by_keywords(self, keywords: list[str]) -> str | None:
+    def _suggest_vendor_column_by_keywords(
+        self,
+        keywords: list[str],
+        excluded_columns: set[str] | None = None,
+    ) -> str | None:
         if self.vendor_df_raw is None:
             return None
+        excluded = {str(column).strip() for column in (excluded_columns or set()) if str(column).strip()}
         lowered_keywords = [keyword.lower() for keyword in keywords]
         for column in self.vendor_df_raw.columns:
             name = str(column).lower()
+            column_text = str(column).strip()
+            if column_text and column_text in excluded:
+                continue
             if any(keyword in name for keyword in lowered_keywords):
-                return str(column)
+                return column_text
         return None
+
+    def _suggest_barcode_column(self, excluded_columns: set[str] | None = None) -> str | None:
+        if self.vendor_df_raw is None:
+            return None
+        excluded = {str(column).strip() for column in (excluded_columns or set()) if str(column).strip()}
+        columns = [str(column).strip() for column in self.vendor_df_raw.columns]
+        exact_aliases = {
+            "upc",
+            "upc code",
+            "barcode",
+            "bar code",
+            "ean",
+            "gtin",
+            "upc ean",
+            "ean upc",
+            "gtin upc",
+        }
+        contains_aliases = ["upc", "barcode", "ean", "gtin"]
+
+        def normalize_header(text: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+        for column in columns:
+            if not column or column in excluded:
+                continue
+            if normalize_header(column) in exact_aliases:
+                return column
+
+        for column in columns:
+            if not column or column in excluded:
+                continue
+            normalized = normalize_header(column)
+            if any(alias in normalized for alias in contains_aliases):
+                return column
+
+        suggestion = suggest_column_for_field(self.vendor_df_raw, field_name="barcode", excluded_columns=excluded)
+        picked = (suggestion.column or "").strip()
+        return picked or None
 
     def _auto_suggest_vendor(self) -> None:
         if self.vendor_df_raw is None or self.vendor_df_raw.empty:
             return
 
-        suggestions = suggest_columns(
-            self.vendor_df_raw,
-            fields=[
-                "sku",
-                "title",
-                "description",
-                "fitment",
-                "years",
-                "image_url",
-                "price",
-                "map_price",
-                "cost",
-                "core_charge_product_code",
-                "barcode",
-            ],
-        )
-        self.vendor_vendor_column.set(
-            self._suggest_vendor_column_by_keywords(["vendor", "brand", "manufacturer"]) or self.vendor_vendor_column.get()
-        )
-        self.vendor_sku_column.set(suggestions["sku"].column or self.vendor_sku_column.get())
-        self.vendor_title_column.set(suggestions["title"].column or self.vendor_title_column.get())
-        self.vendor_description_column.set(suggestions["description"].column or self.vendor_description_column.get())
-        self.vendor_fitment_column.set(suggestions["fitment"].column or self.vendor_fitment_column.get())
-        self.vendor_image_column.set(suggestions["image_url"].column or self.vendor_image_column.get())
-        suggested_map_price = suggestions["map_price"].column or ""
-        suggested_base_price = suggestions["price"].column or ""
-        # Pricing rule uses MAP first, so keep Price aligned to MAP when we can detect it.
-        if suggested_map_price:
-            self.vendor_price_column.set(suggested_map_price)
-        else:
-            self.vendor_price_column.set(suggested_base_price or self.vendor_price_column.get())
-        self.vendor_cost_column.set(suggestions["cost"].column or self.vendor_cost_column.get())
-        self.vendor_core_charge_column.set(
-            suggestions["core_charge_product_code"].column or self.vendor_core_charge_column.get()
-        )
-        self.vendor_barcode_column.set(suggestions["barcode"].column or self.vendor_barcode_column.get())
+        suggestion_order = [
+            "sku",
+            "title",
+            "description",
+            "fitment",
+            "image_url",
+            "map_price",
+            "price",
+            "cost",
+            "core_charge_product_code",
+        ]
+        suggestions: dict[str, str] = {}
+        used_columns: set[str] = set()
+        # Reserve UPC/Barcode-style columns for Barcode mapping first so they
+        # cannot be consumed by other fields.
+        barcode_column = self._suggest_barcode_column(excluded_columns=used_columns) or ""
+        if barcode_column:
+            used_columns.add(barcode_column)
+        for field_name in suggestion_order:
+            suggestion = suggest_column_for_field(self.vendor_df_raw, field_name=field_name, excluded_columns=used_columns)
+            column_name = (suggestion.column or "").strip()
+            suggestions[field_name] = column_name
+            if column_name:
+                used_columns.add(column_name)
+        if not barcode_column:
+            barcode_column = self._suggest_barcode_column(excluded_columns=used_columns) or ""
 
-        self.vendor_weight_column.set(
-            self._suggest_vendor_column_by_keywords(["weight", "lbs", "pounds"]) or self.vendor_weight_column.get()
+        vendor_column = self._suggest_vendor_column_by_keywords(
+            ["vendor", "brand", "manufacturer"],
+            excluded_columns=used_columns,
         )
+        if vendor_column:
+            used_columns.add(vendor_column)
+        weight_column = self._suggest_vendor_column_by_keywords(
+            ["weight", "lbs", "pounds"],
+            excluded_columns=used_columns,
+        )
+
+        valid_columns = {str(column).strip() for column in self.vendor_df_raw.columns}
+
+        def _existing_or_blank(variable: StringVar) -> str:
+            value = variable.get().strip()
+            if not value or value not in valid_columns:
+                return ""
+            return value
+
+        self._vendor_mapping_enforcement_suspended += 1
+        try:
+            self.vendor_vendor_column.set(vendor_column or _existing_or_blank(self.vendor_vendor_column))
+            sku_column = suggestions["sku"] or _existing_or_blank(self.vendor_sku_column)
+            if barcode_column and sku_column == barcode_column:
+                sku_column = ""
+            self.vendor_sku_column.set(sku_column)
+            self.vendor_title_column.set(suggestions["title"] or _existing_or_blank(self.vendor_title_column))
+            self.vendor_description_column.set(suggestions["description"] or _existing_or_blank(self.vendor_description_column))
+            self.vendor_fitment_column.set(suggestions["fitment"] or _existing_or_blank(self.vendor_fitment_column))
+            self.vendor_image_column.set(suggestions["image_url"] or _existing_or_blank(self.vendor_image_column))
+            # Pricing rule uses MAP first, so keep Price aligned to MAP when we can detect it.
+            suggested_price = suggestions["map_price"] or suggestions["price"]
+            self.vendor_price_column.set(suggested_price or _existing_or_blank(self.vendor_price_column))
+            self.vendor_cost_column.set(suggestions["cost"] or _existing_or_blank(self.vendor_cost_column))
+            self.vendor_core_charge_column.set(
+                suggestions["core_charge_product_code"] or _existing_or_blank(self.vendor_core_charge_column)
+            )
+            self.vendor_barcode_column.set(barcode_column or _existing_or_blank(self.vendor_barcode_column))
+            self.vendor_weight_column.set(weight_column or _existing_or_blank(self.vendor_weight_column))
+        finally:
+            self._vendor_mapping_enforcement_suspended = max(0, self._vendor_mapping_enforcement_suspended - 1)
+
+        self._enforce_unique_vendor_mappings()
 
         self.rules_status.configure(text="Vendor auto-suggestions applied for core mapping fields.")
         self._refresh_input_metrics()

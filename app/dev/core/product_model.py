@@ -69,6 +69,8 @@ class Product:
     scrape_fields_found: str = ""
     scrape_error: str = ""
     media_folder: str = ""
+    excluded: bool = False
+    exclusion_reason: str = ""
 
     def set_field(self, name: str, value: object, source: str) -> None:
         text = _clean_text(value)
@@ -85,6 +87,8 @@ class Product:
 
     def to_row(self) -> dict[str, str]:
         return {
+            "excluded": "yes" if bool(self.excluded) else "",
+            "exclusion_reason": _clean_text(self.exclusion_reason),
             "scrape_status": _clean_text(self.scrape_status),
             "scrape_fields_found": _clean_text(self.scrape_fields_found),
             "scrape_error": _clean_text(self.scrape_error),

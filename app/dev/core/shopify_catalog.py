@@ -10,8 +10,8 @@ from product_prospector.core.config_store import ShopifyConfig
 
 
 _CATALOG_QUERY = """
-query Catalog($cursor: String) {
-  products(first: 100, after: $cursor) {
+query Catalog($cursor: String, $search: String) {
+  products(first: 100, after: $cursor, query: $search) {
     pageInfo {
       hasNextPage
       endCursor
@@ -116,6 +116,7 @@ def fetch_shopify_catalog_dataframe(
     config: ShopifyConfig,
     access_token: str,
     max_pages: int = 250,
+    search_query: str | None = None,
     progress_callback=None,
 ) -> tuple[pd.DataFrame, str | None]:
     rows: list[dict[str, str]] = []
@@ -124,7 +125,12 @@ def fetch_shopify_catalog_dataframe(
 
     while page_count < max_pages:
         page_count += 1
-        data, error = _request_graphql(config=config, access_token=access_token, query=_CATALOG_QUERY, variables={"cursor": cursor})
+        data, error = _request_graphql(
+            config=config,
+            access_token=access_token,
+            query=_CATALOG_QUERY,
+            variables={"cursor": cursor, "search": search_query or None},
+        )
         if error:
             return pd.DataFrame(), error
 

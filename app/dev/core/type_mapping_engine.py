@@ -188,9 +188,11 @@ class TypeCategoryMapper:
                 product.field_sources["google_product_type"] = "type_rules_hint"
 
         dpp_match = None
-        if not explicit_hint:
+        # When a hint sets category but leaves subtype blank, allow DPP matching to
+        # still contribute subtype detail for the same category family.
+        if not explicit_hint or not explicit_hint.subtype:
             dpp_match = _match_dpp(self.dpp_entries, primary_tokens, secondary_tokens, context_phrase)
-        if dpp_match:
+        if dpp_match and not explicit_hint:
             if allow_category_overwrite or not product.category_code:
                 product.category_code = dpp_match.category
                 product.field_sources["category_code"] = "type_rules"
@@ -204,6 +206,13 @@ class TypeCategoryMapper:
             elif allow_category_overwrite:
                 product.product_subtype = ""
                 product.field_sources["product_subtype"] = "type_rules"
+        elif dpp_match and explicit_hint and not explicit_hint.subtype:
+            explicit_category = _normalize_phrase(explicit_hint.category)
+            dpp_category = _normalize_phrase(dpp_match.category)
+            if explicit_category and explicit_category == dpp_category and dpp_match.subtype:
+                if allow_category_overwrite or not product.product_subtype:
+                    product.product_subtype = dpp_match.subtype
+                    product.field_sources["product_subtype"] = "type_rules"
 
         if not explicit_hint or not explicit_hint.google_leaf:
             google_primary = set(primary_tokens)
@@ -219,6 +228,16 @@ class TypeCategoryMapper:
             if google_match and (allow_category_overwrite or not product.google_product_type):
                 product.google_product_type = google_match.leaf
                 product.field_sources["google_product_type"] = "type_rules"
+
+        fallback_subtype = _infer_subtype_from_context(
+            category_code=product.category_code,
+            category_type=product.type,
+            context_phrase=context_phrase,
+        )
+        if fallback_subtype and (allow_category_overwrite or not product.product_subtype):
+            if not _clean_text(product.product_subtype):
+                product.product_subtype = fallback_subtype
+                product.field_sources["product_subtype"] = "type_rules_fallback"
 
         if not product.mpn:
             product.mpn = product.sku
@@ -607,3 +626,36 @@ def _stem_token(token: str) -> str:
     if value.endswith("s") and len(value) > 3:
         return value[:-1]
     return value
+
+
+def _infer_subtype_from_context(category_code: str, category_type: str, context_phrase: str) -> str:
+    category_norm = _normalize_phrase(" ".join([_clean_text(category_code), _clean_text(category_type)]))
+    if "turbos accessories" not in category_norm:
+        return ""
+    return _infer_turbo_subtype_from_context(context_phrase)
+
+
+def _infer_turbo_subtype_from_context(context_phrase: str) -> str:
+    phrase = _normalize_phrase(context_phrase)
+    if not phrase:
+        return ""
+
+    explicit_complete = bool(
+        re.search(
+            r"\b(?:complete|drop in|drop-in|aggressor|hot street)\s+turbo(?:charger)?\b|\bvgt\s+turbo\b",
+            phrase,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_turbocharger = bool(re.search(r"\bturbocharger\b", phrase, flags=re.IGNORECASE))
+    if not explicit_complete and not has_turbocharger:
+        return ""
+
+    accessory_pattern = re.compile(
+        r"\b(?:blanket|electronics?|oil|coolant|line|lines|wheel|wheels|actuator|solenoid|housing|cartridge|chra|rebuild|repair|gasket|seal|clamp)\b",
+        flags=re.IGNORECASE,
+    )
+    if accessory_pattern.search(phrase) and not explicit_complete:
+        return ""
+
+    return "Complete Turbos"

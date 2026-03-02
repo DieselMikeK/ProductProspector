@@ -4,6 +4,8 @@ import concurrent.futures
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import time
 from io import BytesIO
 import urllib.error
@@ -13,6 +15,14 @@ from html import unescape
 from pathlib import Path
 
 from product_prospector.core.processing import normalize_sku
+
+
+_REQUEST_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+_REQUEST_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+_REQUEST_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 
 
 def _clean_text(value: object) -> str:
@@ -35,26 +45,121 @@ def _normalize_url(base_url: str, sku: str) -> str:
     return f"{url.rstrip('/')}/{urllib.parse.quote(sku)}"
 
 
+def _looks_like_bot_challenge(html: str) -> bool:
+    text = _clean_text(html).lower()
+    if not text:
+        return False
+    signals = [
+        "<title>just a moment",
+        "<title>verifying your connection",
+        "cf-browser-verification",
+        "__cf_chl",
+        "challenge-platform",
+        "/cdn-cgi/challenge-platform",
+        "id=\"challenge-running\"",
+        "id=\"challenge-error-text\"",
+    ]
+    return any(signal in text for signal in signals)
+
+
+def _fetch_html_with_curl(url: str, timeout: int = 30) -> tuple[str, str | None]:
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return "", "curl unavailable"
+
+    marker = "__CURL_HTTP_CODE__:"
+    command = [
+        curl_bin,
+        "--http1.1",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--compressed",
+        "--max-time",
+        str(max(5, int(timeout))),
+        "-A",
+        _REQUEST_USER_AGENT,
+        "-H",
+        f"Accept: {_REQUEST_ACCEPT}",
+        "-H",
+        f"Accept-Language: {_REQUEST_ACCEPT_LANGUAGE}",
+        url,
+        "-w",
+        f"\n{marker}%{{http_code}}",
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=max(10, int(timeout) + 5),
+            check=False,
+        )
+    except Exception as exc:
+        return "", str(exc)
+
+    output_text = completed.stdout or ""
+    if marker in output_text:
+        body_text, _, status_text = output_text.rpartition(marker)
+        try:
+            status_code = int(status_text.strip() or "0")
+        except Exception:
+            status_code = 0
+    else:
+        body_text = output_text
+        status_code = 0
+
+    if completed.returncode != 0:
+        error_text = _clean_text(completed.stderr)
+        if status_code >= 400:
+            return "", f"HTTP {status_code}"
+        return "", error_text or f"curl exit {completed.returncode}"
+
+    if status_code >= 400:
+        return "", f"HTTP {status_code}"
+
+    if not _clean_text(body_text):
+        return "", "empty response body"
+
+    return body_text, None
+
+
 def _fetch_html(url: str, timeout: int = 30) -> tuple[str, str | None]:
     request = urllib.request.Request(
         url=url,
         method="GET",
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": _REQUEST_USER_AGENT,
+            "Accept": _REQUEST_ACCEPT,
+            "Accept-Language": _REQUEST_ACCEPT_LANGUAGE,
         },
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
+        response_text = ""
+        try:
+            response_text = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            response_text = ""
+        if exc.code in {403, 429} or _looks_like_bot_challenge(response_text):
+            curl_text, curl_error = _fetch_html_with_curl(url, timeout=timeout)
+            if not curl_error:
+                return curl_text, None
         return "", f"HTTP {exc.code}"
     except Exception as exc:
         return "", str(exc)
 
     text = body.decode("utf-8", errors="ignore")
+    if _looks_like_bot_challenge(text):
+        curl_text, curl_error = _fetch_html_with_curl(url, timeout=timeout)
+        if not curl_error and not _looks_like_bot_challenge(curl_text):
+            return curl_text, None
+        return "", "Bot challenge page detected"
     return text, None
 
 
@@ -376,6 +481,266 @@ def _contains_compact_sku(text: str, sku: str) -> bool:
     if not compact_text:
         return False
     return compact_sku in compact_text
+
+
+def _json_loads_safe(value: str) -> object | None:
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def _parse_json_with_fallbacks(raw_text: str) -> object | None:
+    base = _clean_text(raw_text)
+    if not base:
+        return None
+
+    attempts: list[str] = []
+    for candidate in [
+        base,
+        _clean_text(unescape(base)),
+        _decode_script_text(base),
+        _decode_script_text(unescape(base)),
+    ]:
+        if candidate and candidate not in attempts:
+            attempts.append(candidate)
+
+    for candidate in attempts:
+        parsed = _json_loads_safe(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _iter_shopify_product_candidates_from_object(value: object) -> list[dict]:
+    candidates: list[dict] = []
+    if isinstance(value, dict):
+        if isinstance(value.get("product"), dict):
+            candidates.extend(_iter_shopify_product_candidates_from_object(value.get("product")))
+        variants = value.get("variants")
+        has_identity = bool(_clean_text(value.get("id", "")) or _clean_text(value.get("handle", "")) or _clean_text(value.get("title", "")))
+        if isinstance(variants, list) and has_identity:
+            candidates.append(value)
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                candidates.extend(_iter_shopify_product_candidates_from_object(child))
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_iter_shopify_product_candidates_from_object(item))
+    return candidates
+
+
+def _extract_embedded_shopify_products(html: str) -> list[dict]:
+    products: list[dict] = []
+    seen: set[str] = set()
+
+    def add_product(product: dict) -> None:
+        key = _clean_text(product.get("id", "")) or _clean_text(product.get("handle", "")).lower()
+        if not key:
+            key = json.dumps(product, sort_keys=True)[:1200]
+        if key in seen:
+            return
+        seen.add(key)
+        products.append(product)
+
+    attr_patterns = [
+        r'product-page-product\s*=\s*"([^"]+)"',
+        r"product-page-product\s*=\s*'([^']+)'",
+    ]
+    for pattern in attr_patterns:
+        for match in re.finditer(pattern, html, flags=re.IGNORECASE | re.DOTALL):
+            raw = _clean_text(match.group(1))
+            if not raw:
+                continue
+            parsed = _parse_json_with_fallbacks(raw)
+            if parsed is None:
+                continue
+            for product in _iter_shopify_product_candidates_from_object(parsed):
+                add_product(product)
+
+    for match in re.finditer(
+        r"<script[^>]+type=[\"']application/json[\"'][^>]*>(.*?)</script>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        raw = _clean_text(match.group(1))
+        if not raw:
+            continue
+        parsed = _parse_json_with_fallbacks(raw)
+        if parsed is None:
+            continue
+        for product in _iter_shopify_product_candidates_from_object(parsed):
+            add_product(product)
+
+    return products
+
+
+def _shopify_match_score_for_sku(product: dict, sku: str) -> int:
+    target = _compact_sku(sku)
+    if not target:
+        return 1
+
+    best_score = 0
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            for key in ["sku", "barcode", "id"]:
+                compact = _compact_sku(variant.get(key, ""))
+                if not compact:
+                    continue
+                if compact == target:
+                    best_score = max(best_score, 1000)
+                elif len(compact) >= 6 and len(target) >= 6 and (compact in target or target in compact):
+                    best_score = max(best_score, 700)
+    if best_score:
+        return best_score
+
+    title = _clean_text(product.get("title", ""))
+    if _contains_compact_sku(title, sku):
+        return 250
+    return 0
+
+
+def _extract_shopify_media_from_product(product: dict) -> list[str]:
+    media_values: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        text = _clean_text(value)
+        if not text or text in seen:
+            return
+        seen.add(text)
+        media_values.append(text)
+
+    images = product.get("images")
+    if isinstance(images, list):
+        for image in images:
+            add(image)
+
+    add(product.get("featured_image", ""))
+    add(product.get("image", ""))
+
+    media = product.get("media")
+    if isinstance(media, list):
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            media_type = _clean_text(item.get("media_type", "")).lower()
+            if media_type and "image" not in media_type:
+                continue
+            add(item.get("src", ""))
+            preview_image = item.get("preview_image")
+            if isinstance(preview_image, dict):
+                add(preview_image.get("src", ""))
+
+    return media_values
+
+
+def _format_shopify_price(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        amount = float(value)
+        if float(amount).is_integer():
+            amount = amount / 100.0
+        return f"{amount:.2f}"
+
+    text = _clean_text(value)
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^0-9.\-]", "", text.replace(",", ""))
+    if not cleaned:
+        return ""
+    try:
+        if re.fullmatch(r"-?\d+", cleaned):
+            amount = float(int(cleaned)) / 100.0
+        else:
+            amount = float(cleaned)
+    except Exception:
+        return ""
+    return f"{amount:.2f}"
+
+
+def _select_embedded_shopify_product(html: str, page_url: str, sku: str) -> dict | None:
+    candidates = _extract_embedded_shopify_products(html)
+    if not candidates:
+        return None
+
+    page_path = urllib.parse.urlparse(page_url).path.lower()
+    best: dict | None = None
+    best_rank = -1
+    for product in candidates:
+        rank = _shopify_match_score_for_sku(product, sku) if _clean_text(sku) else 1
+        if _clean_text(sku) and rank <= 0:
+            continue
+
+        handle = _clean_text(product.get("handle", "")).lower().strip("/")
+        if handle and f"/products/{handle}" in page_path:
+            rank += 120
+        if _clean_text(product.get("description", "")) or _clean_text(product.get("content", "")):
+            rank += 20
+        if _extract_shopify_media_from_product(product):
+            rank += 20
+        if rank > best_rank:
+            best = product
+            best_rank = rank
+    return best
+
+
+def _from_shopify_embedded_product(html: str, page_url: str, sku: str) -> dict[str, str]:
+    product = _select_embedded_shopify_product(html=html, page_url=page_url, sku=sku)
+    if product is None:
+        return {}
+
+    payload: dict[str, str] = {}
+    title = _clean_text(product.get("title", ""))
+    if title:
+        payload["title"] = title
+
+    description = _clean_text(product.get("description", "") or product.get("content", ""))
+    if description:
+        payload["description_html"] = description
+
+    vendor = _clean_text(product.get("vendor", ""))
+    if vendor:
+        payload["vendor"] = vendor
+
+    product_type = _clean_text(product.get("type", ""))
+    if product_type:
+        payload["type"] = product_type
+
+    price_value = (
+        _format_shopify_price(product.get("price"))
+        or _format_shopify_price(product.get("price_min"))
+        or _format_shopify_price(product.get("compare_at_price"))
+    )
+    if price_value:
+        payload["price"] = price_value
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        ranked_variants: list[tuple[int, dict]] = []
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            score = _shopify_match_score_for_sku({"variants": [variant]}, sku)
+            ranked_variants.append((score, variant))
+        ranked_variants.sort(key=lambda entry: entry[0], reverse=True)
+        for _, variant in ranked_variants:
+            barcode = _clean_text(variant.get("barcode", ""))
+            if barcode:
+                payload["barcode"] = barcode
+                break
+
+    media_values = _extract_shopify_media_from_product(product)
+    if media_values:
+        normalized_media = _normalize_media_values(media_values, page_url=page_url)
+        if normalized_media:
+            payload["media_urls"] = " | ".join(normalized_media)
+
+    return payload
 
 
 def _normalize_candidate_link(value: str, page_url: str) -> str:
@@ -915,6 +1280,195 @@ def _searchanise_candidates_from_search_page(
     return [], errors
 
 
+def _strip_html_tags(value: object) -> str:
+    text = _clean_text(unescape(value))
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    return _clean_text(text)
+
+
+def _extract_convermax_origins(html: str) -> list[str]:
+    text = _clean_text(html).replace("\\/", "/")
+    if not text:
+        return []
+    origins: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"https?://[a-z0-9.-]+\.myconvermax\.com", text, flags=re.IGNORECASE):
+        origin = _clean_text(match.group(0)).rstrip("/")
+        if not origin:
+            continue
+        lower = origin.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        origins.append(origin)
+    return origins
+
+
+def _fetch_convermax_items(origin: str, sku: str, max_results: int = 40) -> tuple[list[dict], str | None]:
+    query_url = (
+        f"{origin.rstrip('/')}/search.json"
+        f"?query={urllib.parse.quote(sku)}"
+        f"&pageSize={int(max_results)}"
+        "&pageNumber=0"
+    )
+    body, error = _fetch_html(query_url, timeout=30)
+    if error:
+        return [], f"{query_url} ({error})"
+    if not body:
+        return [], None
+    try:
+        payload = json.loads(body)
+    except Exception as exc:
+        return [], f"{query_url} (invalid json: {exc})"
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)], None
+    if not isinstance(payload, dict):
+        return [], None
+    items = payload.get("Items")
+    if not isinstance(items, list):
+        return [], None
+    return [item for item in items if isinstance(item, dict)], None
+
+
+def _collect_convermax_item_codes(item: dict) -> list[str]:
+    values: list[str] = []
+    for key in ["sku", "product_code", "mpn", "id"]:
+        value = _strip_html_tags(item.get(key, ""))
+        if value:
+            values.extend(_split_multi_value(value))
+    variant_ids = item.get("variant_ids")
+    if isinstance(variant_ids, list):
+        for value in variant_ids:
+            text = _strip_html_tags(value)
+            if text:
+                values.append(text)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        compact = _compact_sku(value)
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        deduped.append(value)
+    return deduped
+
+
+def _score_convermax_item(item: dict, sku: str) -> int:
+    target = _compact_sku(sku)
+    if not target:
+        return 0
+    score = 260
+
+    code_exact = False
+    code_partial = False
+    for value in _collect_convermax_item_codes(item):
+        compact = _compact_sku(value)
+        if compact == target:
+            code_exact = True
+            break
+        if target in compact:
+            code_partial = True
+    if code_exact:
+        score += 760
+    elif code_partial:
+        score += 280
+
+    title = _strip_html_tags(item.get("title", ""))
+    if _contains_compact_sku(title, sku):
+        score += 220
+
+    link = _clean_text(item.get("url", "") or item.get("link", ""))
+    if _contains_compact_sku(link, sku):
+        score += 210
+
+    handle = _clean_text(item.get("handle", ""))
+    if _contains_compact_sku(handle, sku):
+        score += 170
+
+    return score
+
+
+def _build_convermax_seed_payload(item: dict, page_url: str) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    title = _strip_html_tags(item.get("title", ""))
+    if title:
+        payload["title"] = title
+
+    description = _strip_html_tags(item.get("description", ""))
+    if description:
+        payload["description_html"] = description
+
+    price = _clean_text(item.get("price", ""))
+    if price:
+        payload["price"] = price
+
+    vendor = _strip_html_tags(item.get("vendor", ""))
+    if vendor:
+        payload["vendor"] = vendor
+
+    media_values: list[str] = []
+    for key in ["image", "image2", "image_link"]:
+        value = _clean_text(item.get(key, ""))
+        if value:
+            media_values.append(value)
+    images = item.get("images")
+    if isinstance(images, list):
+        media_values.extend([_clean_text(value) for value in images if _clean_text(value)])
+    if media_values:
+        normalized = _normalize_media_values(media_values, page_url=page_url)
+        if normalized:
+            payload["media_urls"] = " | ".join(normalized)
+
+    return payload
+
+
+def _convermax_candidates_from_search_page(
+    search_html: str,
+    page_url: str,
+    sku: str,
+) -> tuple[list[tuple[str, int, dict[str, str]]], list[str]]:
+    origins = _extract_convermax_origins(search_html)
+    if not origins:
+        return [], []
+
+    errors: list[str] = []
+    scored: dict[str, tuple[int, dict[str, str]]] = {}
+    for origin in origins:
+        items, item_error = _fetch_convermax_items(origin=origin, sku=sku, max_results=60)
+        if item_error:
+            errors.append(item_error)
+            continue
+        for item in items:
+            link = _clean_text(item.get("url", "") or item.get("link", ""))
+            candidate_url = _normalize_candidate_link(link, page_url=page_url) if link else ""
+            if not candidate_url and link:
+                candidate_url = _normalize_candidate_link(link, page_url=origin)
+            if not candidate_url:
+                handle = _clean_text(item.get("handle", ""))
+                if handle:
+                    candidate_url = _normalize_candidate_link(f"/products/{handle}", page_url=page_url)
+            if not candidate_url:
+                continue
+            score = _score_convermax_item(item, sku)
+            seed_payload = _build_convermax_seed_payload(item, page_url=candidate_url)
+            seed_payload["search_provider"] = "convermax"
+            existing = scored.get(candidate_url)
+            if existing is None or score > existing[0]:
+                scored[candidate_url] = (score, seed_payload)
+
+    if not scored:
+        return [], errors
+
+    ordered = sorted(
+        [(url, score, payload) for url, (score, payload) in scored.items()],
+        key=lambda entry: (-entry[1], len(entry[0])),
+    )
+    return ordered, errors
+
+
 def _merge_seed_payload(
     parsed_payload: dict[str, str],
     seed_payload: dict[str, str],
@@ -927,6 +1481,7 @@ def _merge_seed_payload(
         for key in [
             "title",
             "description_html",
+            "type",
             "price",
             "cost",
             "barcode",
@@ -962,20 +1517,23 @@ def _merge_seed_payload(
 
 def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: bool) -> dict[str, str]:
     merged: dict[str, str] = {}
+    from_shopify_embed = _from_shopify_embedded_product(html, page_url, sku)
     from_jsonld = _from_json_ld(html, page_url, sku)
     from_heuristic = _heuristic_extract(html, page_url, sku, scrape_images=scrape_images)
 
     # Media should combine sources so JSON-LD single-image does not suppress full gallery extraction.
+    embed_media = _split_multi_value(_clean_text(from_shopify_embed.get("media_urls", "")))
     json_media = _split_multi_value(_clean_text(from_jsonld.get("media_urls", "")))
     heuristic_media = _split_multi_value(_clean_text(from_heuristic.get("media_urls", "")))
-    if json_media or heuristic_media:
-        combined_media = _normalize_media_values(json_media + heuristic_media, page_url=page_url)
+    if embed_media or json_media or heuristic_media:
+        combined_media = _normalize_media_values(embed_media + json_media + heuristic_media, page_url=page_url)
         if combined_media:
             merged["media_urls"] = " | ".join(combined_media)
 
     for key in [
         "title",
         "description_html",
+        "type",
         "price",
         "cost",
         "barcode",
@@ -984,7 +1542,15 @@ def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: boo
         "vendor",
         "core_charge_product_code",
     ]:
-        value = _clean_text(from_jsonld.get(key, "")) or _clean_text(from_heuristic.get(key, ""))
+        if key == "application" and from_shopify_embed:
+            # Product-page embedded payload is authoritative; avoid noisy full-page fitment lines.
+            value = _clean_text(from_shopify_embed.get(key, "")) or _clean_text(from_jsonld.get(key, ""))
+        else:
+            value = (
+                _clean_text(from_shopify_embed.get(key, ""))
+                or _clean_text(from_jsonld.get(key, ""))
+                or _clean_text(from_heuristic.get(key, ""))
+            )
         if value:
             merged[key] = value
     return merged
@@ -1010,7 +1576,11 @@ def _score_image_candidate(url: str) -> int:
     return score
 
 
-def _extract_shopify_product_image_candidates(html: str) -> list[str]:
+def _extract_shopify_product_image_candidates(
+    html: str,
+    page_url: str = "",
+    sku: str = "",
+) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -1021,22 +1591,26 @@ def _extract_shopify_product_image_candidates(html: str) -> list[str]:
         seen.add(url)
         candidates.append(url)
 
-    pair_pattern = re.compile(
-        r'"(https://cdn\.shopify\.com/[^"]+?)"\s*,\s*"gid://shopify/(?:ProductImage|MediaImage)/\d+"',
-        flags=re.IGNORECASE,
-    )
-    url_pattern = re.compile(
-        r'https://cdn\.shopify\.com/[^"\'\s<>]+?\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?[^"\'\s<>]*)?',
-        flags=re.IGNORECASE,
-    )
-    for raw_script in _extract_json_scripts(html):
-        script = _decode_script_text(raw_script)
-        if not script or "gid://shopify/" not in script:
+    products = _extract_embedded_shopify_products(html)
+    if not products:
+        return candidates
+
+    ranked_products: list[tuple[int, dict]] = []
+    for product in products:
+        score = _shopify_match_score_for_sku(product, sku) if _clean_text(sku) else 1
+        if _clean_text(sku) and score <= 0:
             continue
-        for match in pair_pattern.finditer(script):
-            add(match.group(1))
-        for match in url_pattern.finditer(script):
-            add(match.group(0))
+        handle = _clean_text(product.get("handle", "")).lower().strip("/")
+        if handle and page_url and f"/products/{handle}" in urllib.parse.urlparse(page_url).path.lower():
+            score += 120
+        media_count = len(_extract_shopify_media_from_product(product))
+        score += min(40, media_count * 4)
+        ranked_products.append((score, product))
+
+    ranked_products.sort(key=lambda entry: entry[0], reverse=True)
+    for _, product in ranked_products[:2]:
+        for value in _extract_shopify_media_from_product(product):
+            add(value)
 
     return candidates
 
@@ -1073,6 +1647,26 @@ def _extract_script_gallery_candidates(html: str) -> list[str]:
     return candidates
 
 
+def _extract_gallery_scope_blocks(html: str) -> list[str]:
+    blocks: list[str] = []
+    seen: set[str] = set()
+    patterns = [
+        r'(?is)<(?:div|section|ul|ol)[^>]+(?:id|class)=["\'][^"\']*(?:product[^"\']*(?:media|gallery|image|thumb|carousel|slider)|(?:media|gallery|image|thumb|carousel|slider)[^"\']*product|product__media|product-gallery|media-gallery)[^"\']*["\'][^>]*>.*?</(?:div|section|ul|ol)>',
+        r'(?is)<(?:div|section|ul|ol)[^>]+(?:id|class)=["\'][^"\']*(?:thumbnail|thumbnails)[^"\']*["\'][^>]*>.*?</(?:div|section|ul|ol)>',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, html):
+            block = _clean_text(match.group(0))
+            if not block:
+                continue
+            key = str(hash(block))
+            if key in seen:
+                continue
+            seen.add(key)
+            blocks.append(block)
+    return blocks
+
+
 def _collect_gallery_image_candidates(html: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -1083,6 +1677,9 @@ def _collect_gallery_image_candidates(html: str) -> list[str]:
             return
         seen.add(url)
         candidates.append(url)
+
+    scope_blocks = _extract_gallery_scope_blocks(html)
+    source_blocks = scope_blocks if scope_blocks else [html]
 
     # Image and slideshow/gallery attributes used by many ecommerce themes.
     image_attr_patterns = [
@@ -1100,38 +1697,41 @@ def _collect_gallery_image_candidates(html: str) -> list[str]:
         r'(?i)data-(?:image|zoom-image|large-image|full|original|src|lazy|media)=["\']([^"\']+)["\']',
         r'(?i)style=["\'][^"\']*background-image\s*:\s*url\(([^)]+)\)',
     ]
-    for pattern in image_attr_patterns:
-        for match in re.finditer(pattern, html, flags=re.IGNORECASE):
-            raw = _clean_text(match.group(1))
-            if not raw:
+    for source in source_blocks:
+        for pattern in image_attr_patterns:
+            for match in re.finditer(pattern, source, flags=re.IGNORECASE):
+                raw = _clean_text(match.group(1))
+                if not raw:
+                    continue
+                if "srcset" in pattern:
+                    for url in _extract_srcset_urls(raw):
+                        add(url)
+                    continue
+                if "background-image" in pattern:
+                    cleaned = raw.strip("\"' ")
+                    add(cleaned)
+                    continue
+                add(raw)
+
+    # Some galleries store full-size image URLs in anchor href attributes.
+    for source in source_blocks:
+        for match in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', source, flags=re.IGNORECASE):
+            href = _clean_text(match.group(1))
+            if not href:
                 continue
-            if "srcset" in pattern:
-                for url in _extract_srcset_urls(raw):
-                    add(url)
-                continue
-            if "background-image" in pattern:
-                cleaned = raw.strip("\"' ")
-                add(cleaned)
-                continue
-            add(raw)
+            if re.search(r"\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?|$)", href, flags=re.IGNORECASE):
+                add(href)
 
-    for value in _extract_shopify_product_image_candidates(html):
-        add(value)
-
-    # Some galleries store the full-size image in anchor href.
-    for match in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
-        href = _clean_text(match.group(1))
-        if not href:
-            continue
-        if re.search(r"\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?|$)", href, flags=re.IGNORECASE):
-            add(href)
-
-    # Fallback for embedded JSON blobs with direct image URLs.
-    for match in re.finditer(r'https?://[^"\'\s<>]+?\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?[^"\'\s<>]*)?', html, flags=re.IGNORECASE):
-        add(match.group(0))
-
-    for value in _extract_script_gallery_candidates(html):
-        add(value)
+    if not candidates and not scope_blocks:
+        # Last-resort fallback when no gallery containers were found.
+        for value in _extract_script_gallery_candidates(html):
+            add(value)
+        for match in re.finditer(
+            r'https?://[^"\'\s<>]+?\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?[^"\'\s<>]*)?',
+            html,
+            flags=re.IGNORECASE,
+        ):
+            add(match.group(0))
 
     ranked = sorted(
         enumerate(candidates),
@@ -1167,10 +1767,9 @@ def _fetch_binary(url: str, timeout: int = 45) -> tuple[bytes, str, str | None]:
         url=url,
         method="GET",
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "User-Agent": _REQUEST_USER_AGENT,
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": _REQUEST_ACCEPT_LANGUAGE,
         },
     )
     try:
@@ -1327,7 +1926,7 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
     output: dict[str, str] = {}
 
     output["title"] = _extract_meta_content(html, "og:title") or _extract_first(r"<title>([^<]+)</title>", html, flags=re.IGNORECASE)
-    output["description_html"] = _extract_meta_content(html, "description")
+    output["description_html"] = _extract_meta_content(html, "description") or _extract_meta_content(html, "og:description")
     output["price"] = _extract_first(r'(?i)(?:\"price\"|price|msrp|retail)\D{0,20}([0-9]{1,6}(?:\.[0-9]{1,2})?)', context)
     output["core_charge_product_code"] = _extract_first(
         r"(?i)(?:core(?:\s*charge)?|corecharge)\D{0,28}(\$?\s*[0-9]{1,5}(?:\.[0-9]{1,2})?)",
@@ -1338,7 +1937,7 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
     output["vendor"] = _extract_meta_content(html, "og:site_name")
 
     if scrape_images:
-        shopify_media_values = _extract_shopify_product_image_candidates(html)
+        shopify_media_values = _extract_shopify_product_image_candidates(html, page_url=page_url, sku=sku)
         if shopify_media_values:
             normalized_media = _normalize_media_values(shopify_media_values, page_url)
         else:
@@ -1410,11 +2009,17 @@ def _scrape_single_sku(
             page_url=target_url,
             sku=sku,
         )
+        convermax_candidates, convermax_errors = _convermax_candidates_from_search_page(
+            search_html=search_html,
+            page_url=target_url,
+            sku=sku,
+        )
         candidate_seed_payloads: dict[str, dict[str, str]] = {}
         candidates = _extract_product_page_candidates(search_html, page_url=target_url, sku=sku)
-        if searchanise_candidates:
+        provider_candidates = list(searchanise_candidates[:20]) + list(convermax_candidates[:20])
+        if provider_candidates:
             merged_scores: dict[str, int] = {href: score for href, score in candidates}
-            for candidate_url, candidate_score, seed_payload in searchanise_candidates[:20]:
+            for candidate_url, candidate_score, seed_payload in provider_candidates:
                 existing_score = merged_scores.get(candidate_url, -9999)
                 if candidate_score > existing_score:
                     merged_scores[candidate_url] = candidate_score
@@ -1523,7 +2128,7 @@ def _scrape_single_sku(
             merged["product_url"] = resolved_url
         if resolved_seed_payload and resolved_url != target_url:
             provider = _clean_text(resolved_seed_payload.get("search_provider", ""))
-            merged["search_provider"] = provider or "searchanise"
+            merged["search_provider"] = provider or "search_seed"
 
         try:
             if resolved_html:
@@ -1535,6 +2140,7 @@ def _scrape_single_sku(
                 "title",
                 "description_html",
                 "media_urls",
+                "type",
                 "price",
                 "cost",
                 "barcode",
@@ -1552,8 +2158,9 @@ def _scrape_single_sku(
 
         if product_fetch_errors and resolved_url == target_url:
             merged["product_link_error"] = " | ".join(product_fetch_errors[:3])
-        if searchanise_errors and resolved_url == target_url:
-            merged["search_provider_error"] = " | ".join(searchanise_errors[:2])
+        provider_errors = list(searchanise_errors or []) + list(convermax_errors or [])
+        if provider_errors and resolved_url == target_url:
+            merged["search_provider_error"] = " | ".join(provider_errors[:3])
 
         resolved_path = urllib.parse.urlparse(resolved_url).path.lower()
         title_lower = _clean_text(merged.get("title", "")).lower()

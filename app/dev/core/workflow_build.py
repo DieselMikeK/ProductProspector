@@ -170,6 +170,69 @@ def _row_has_any_mapped_value(row: pd.Series, columns: list[str]) -> bool:
     return False
 
 
+_DIESEL_SIGNALS = [
+    r"\bdiesel\b",
+    r"\bcummins\b",
+    r"\bpowerstroke\b",
+    r"\bduramax\b",
+    r"\btdi\b",
+    r"\becodiesel\b",
+]
+
+_GAS_STRONG_SIGNALS = [
+    r"\bgasoline\b",
+    r"\bpetrol\b",
+    r"\bunleaded\b",
+    r"\bspark[\s-]*plug\b",
+    r"\bignition\b",
+    r"\bcoil[\s-]*pack\b",
+    r"\bdistributor\b",
+    r"\bcarb(?:uretor)?\b",
+    r"\bthrottle[\s-]*body\b",
+    r"\bhemi\b",
+    r"\becoboost\b",
+    r"\bcoyote\b",
+]
+
+_GAS_WEAK_SIGNAL = r"\bgas\b"
+_GAS_WEAK_EXCEPTIONS = [
+    r"\bexhaust\s+gas(?:es)?\b",
+    r"\begt\b",
+    r"\bgas\s+temperature\b",
+    r"\bgas\s+temp\b",
+    r"\bgas\s+pressure\b",
+]
+
+
+def _looks_like_gas_only_product(product: Product) -> bool:
+    context = " ".join(
+        [
+            _clean_text(product.title),
+            _clean_text(product.description_html),
+            _clean_text(product.type),
+            _clean_text(product.google_product_type),
+            _clean_text(product.category_code),
+            _clean_text(product.product_subtype),
+            _clean_text(product.application),
+            _clean_text(product.vendor),
+            _clean_text(product.tags),
+        ]
+    ).lower()
+    if not context:
+        return False
+
+    has_diesel_signal = any(re.search(pattern, context, flags=re.IGNORECASE) for pattern in _DIESEL_SIGNALS)
+    has_gas_strong_signal = any(re.search(pattern, context, flags=re.IGNORECASE) for pattern in _GAS_STRONG_SIGNALS)
+
+    weak_gas_signal = False
+    if re.search(_GAS_WEAK_SIGNAL, context, flags=re.IGNORECASE):
+        weak_gas_signal = not any(re.search(pattern, context, flags=re.IGNORECASE) for pattern in _GAS_WEAK_EXCEPTIONS)
+
+    if has_diesel_signal:
+        return False
+    return bool(has_gas_strong_signal or weak_gas_signal)
+
+
 def _rows_from_session(session: AppSession) -> list[pd.Series]:
     rows: list[pd.Series] = []
     if session.vendor_df is not None and not session.vendor_df.empty:
@@ -195,6 +258,7 @@ class BuildStats:
     rows_built: int = 0
     rows_skipped_missing_sku: int = 0
     rows_skipped_no_shopify_match: int = 0
+    rows_flagged_gas: int = 0
 
 
 def build_existing_shopify_index(shopify_df: pd.DataFrame | None) -> dict[str, dict[str, str]]:
@@ -525,6 +589,7 @@ def build_products_from_session(
                     "title",
                     "description_html",
                     "media_urls",
+                    "type",
                     "price",
                     "map_price",
                     "msrp_price",
@@ -553,6 +618,12 @@ def build_products_from_session(
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
 
         product.finalize_defaults()
+        if _looks_like_gas_only_product(product):
+            product.excluded = True
+            product.exclusion_reason = "Excluded: gas-only product detected"
+            product.field_sources["diesel_filter"] = "rule"
+            product.field_status["diesel_filter"] = "excluded_gas"
+            stats.rows_flagged_gas += 1
         products.append(product)
         stats.rows_built += 1
 

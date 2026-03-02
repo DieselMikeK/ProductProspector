@@ -1,4 +1,6 @@
 pattern,category,subtype,google_leaf,enabled,notes
 \bpie\s*cut(?:s)?\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,MBRP pie cut kits
 \b(cat[-\s]*back|turbo[-\s]*back|axle[-\s]*back|exhaust\s+system)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,Common exhaust system phrasing
+\b(?:hot\s+street|aggressor|drop[-\s]*in|complete)\s+turbo(?:charger)?\b|\bvgt\s+turbo\b,Turbos & Accessories,Complete Turbos,Motor Vehicle Engine Parts,1,Complete turbo products
+\bturbo(?![-\s]*back)\b|\bturbocharger\b|\bvgt\b|\bwastegate\b,Turbos & Accessories,,Motor Vehicle Engine Parts,1,Turbo category fallback
 \bexhaust\s+brake\b|\bengine\s+brake\b|\bpacbrake\b,Exhaust Brakes / Engine Brakes,,,1,Brake-specific override
