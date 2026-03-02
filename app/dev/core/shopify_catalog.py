@@ -10,8 +10,8 @@ from product_prospector.core.config_store import ShopifyConfig
 
 
 _CATALOG_QUERY = """
-query Catalog($cursor: String, $search: String) {
-  products(first: 100, after: $cursor, query: $search) {
+query Catalog($cursor: String, $search: String, $sortKey: ProductSortKeys, $reverse: Boolean) {
+  products(first: 100, after: $cursor, query: $search, sortKey: $sortKey, reverse: $reverse) {
     pageInfo {
       hasNextPage
       endCursor
@@ -117,6 +117,9 @@ def fetch_shopify_catalog_dataframe(
     access_token: str,
     max_pages: int = 250,
     search_query: str | None = None,
+    sort_key: str | None = None,
+    reverse: bool | None = None,
+    stop_when_page=None,
     progress_callback=None,
 ) -> tuple[pd.DataFrame, str | None]:
     rows: list[dict[str, str]] = []
@@ -129,13 +132,19 @@ def fetch_shopify_catalog_dataframe(
             config=config,
             access_token=access_token,
             query=_CATALOG_QUERY,
-            variables={"cursor": cursor, "search": search_query or None},
+            variables={
+                "cursor": cursor,
+                "search": search_query or None,
+                "sortKey": sort_key or None,
+                "reverse": reverse if reverse is not None else None,
+            },
         )
         if error:
             return pd.DataFrame(), error
 
         products = (data or {}).get("products") or {}
         edges = products.get("edges") or []
+        page_rows: list[dict[str, str]] = []
         for edge in edges:
             node = (edge or {}).get("node") or {}
             title = str(node.get("title", "")).strip()
@@ -151,21 +160,30 @@ def fetch_shopify_catalog_dataframe(
                 sku = str(variant.get("sku", "")).strip()
                 if not sku:
                     continue
-                rows.append(
-                    {
-                        "sku": sku,
-                        "title": title,
-                        "description": description,
-                        "fitment": fitment,
-                        "product_type": product_type,
-                        "vendor": vendor,
-                        "barcode": str(variant.get("barcode", "")).strip(),
-                    }
-                )
+                row = {
+                    "sku": sku,
+                    "title": title,
+                    "description": description,
+                    "fitment": fitment,
+                    "product_type": product_type,
+                    "vendor": vendor,
+                    "barcode": str(variant.get("barcode", "")).strip(),
+                }
+                page_rows.append(row)
+
+        if page_rows:
+            rows.extend(page_rows)
 
         if progress_callback is not None:
             try:
                 progress_callback(page_count, len(rows))
+            except Exception:
+                pass
+
+        if stop_when_page is not None:
+            try:
+                if bool(stop_when_page(page_rows, page_count, len(rows))):
+                    break
             except Exception:
                 pass
 

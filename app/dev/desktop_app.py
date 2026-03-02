@@ -2280,27 +2280,67 @@ class ProductProspectorDesktopApp:
                 created_since = datetime.now(timezone.utc).date().isoformat()
             search_query = f"created_at:>={created_since}"
             start_count = int(len(cached))
+            cached_skus = set(
+                cached["sku"]
+                .astype(str)
+                .map(normalize_sku)
+                .replace("", pd.NA)
+                .dropna()
+                .tolist()
+            )
+            overlap_state = {"known_streak": 0}
+            discovered_new_skus: set[str] = set()
             self._set_shopify_cache_api_busy(
                 True,
                 f"Downloading newest Shopify SKUs since {created_since}... {start_count:,} cached",
             )
 
-            def on_catalog_progress(_page_count: int, row_count: int) -> None:
+            def on_catalog_progress(page_count: int, row_count: int) -> None:
                 self._set_shopify_cache_api_busy(
                     True,
-                    f"Downloading newest Shopify SKUs since {created_since}... +{row_count:,}",
+                    (
+                        f"Scanning newest Shopify SKUs since {created_since}... "
+                        f"pages {page_count} | scanned {row_count:,} | new {len(discovered_new_skus):,}"
+                    ),
                 )
+
+            def stop_when_page(page_rows: list[dict[str, str]], _page_count: int, _row_count: int) -> bool:
+                page_skus = {
+                    normalize_sku(str((row or {}).get("sku", "")))
+                    for row in page_rows
+                    if normalize_sku(str((row or {}).get("sku", "")))
+                }
+                if not page_skus:
+                    overlap_state["known_streak"] += 1
+                    return overlap_state["known_streak"] >= 2
+
+                unseen = {sku for sku in page_skus if sku not in cached_skus and sku not in discovered_new_skus}
+                if unseen:
+                    discovered_new_skus.update(unseen)
+                    overlap_state["known_streak"] = 0
+                    return False
+
+                overlap_state["known_streak"] += 1
+                # Once we hit two consecutive pages that contain only already-cached SKUs,
+                # we've likely reached the overlap boundary and can stop early.
+                return overlap_state["known_streak"] >= 2
 
             df, error = fetch_shopify_catalog_dataframe(
                 config=config,
                 access_token=token.access_token,
                 search_query=search_query,
+                sort_key="CREATED_AT",
+                reverse=True,
+                stop_when_page=stop_when_page,
                 progress_callback=on_catalog_progress,
             )
             if error:
                 df, error = fetch_shopify_catalog_dataframe(
                     config=config,
                     access_token=token.access_token,
+                    sort_key="CREATED_AT",
+                    reverse=True,
+                    stop_when_page=stop_when_page,
                     progress_callback=on_catalog_progress,
                 )
                 if error:
@@ -2310,15 +2350,26 @@ class ProductProspectorDesktopApp:
                 self.shopify_df_raw = cached
                 return
 
-            merged = pd.concat([df, cached], ignore_index=True)
-            if "sku" not in merged.columns:
+            if "sku" not in df.columns:
                 return
-            merged["sku"] = merged["sku"].astype(str).str.strip()
-            merged = merged[merged["sku"] != ""].copy()
-            merged["sku_norm"] = merged["sku"].str.upper()
+
+            df = df.copy()
+            df["sku"] = df["sku"].astype(str).str.strip()
+            df = df[df["sku"] != ""].copy()
+            df["sku_norm"] = df["sku"].astype(str).map(normalize_sku)
+            df = df[df["sku_norm"] != ""].copy()
+            df = df.drop_duplicates(subset=["sku_norm"], keep="first")
+            new_rows = df[~df["sku_norm"].isin(cached_skus)].copy()
+            if new_rows.empty:
+                self.shopify_cache_ready = not cached.empty
+                self.shopify_df_raw = cached
+                return
+            new_rows = new_rows.drop(columns=["sku_norm"], errors="ignore")
+            merged = pd.concat([new_rows, cached], ignore_index=True)
+            merged["sku_norm"] = merged["sku"].astype(str).map(normalize_sku)
+            merged = merged[merged["sku_norm"] != ""].copy()
             merged = merged.drop_duplicates(subset=["sku_norm"], keep="first")
-            merged = merged.drop(columns=["sku_norm"], errors="ignore")
-            merged = merged.reset_index(drop=True)
+            merged = merged.drop(columns=["sku_norm"], errors="ignore").reset_index(drop=True)
 
             save_shopify_sku_cache(merged)
             self.shopify_cache_ready = True
