@@ -14,6 +14,7 @@ from product_prospector.core.processing import normalize_sku
 from product_prospector.core.product_model import Product
 from product_prospector.core.shopify_brand_metaobjects import resolve_brand_metaobject_gid
 from product_prospector.core.shopify_fitment_vehicle_metaobjects import resolve_fitment_vehicle_metaobject_gids
+from product_prospector.core.shopify_ymm_tags import resolve_ymm_tags
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
 
@@ -305,6 +306,230 @@ def _request_rest_json(
     return None, last_error
 
 
+def _request_graphql_json(
+    config: ShopifyConfig,
+    access_token: str,
+    query: str,
+    variables: dict,
+    timeout: int = 45,
+) -> tuple[dict | None, str | None]:
+    url = f"https://{config.shop_domain}/admin/api/{config.api_version}/graphql.json"
+    payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+    request = urllib.request.Request(
+        url=url,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Shopify-Access-Token": access_token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        return None, f"Shopify HTTP {exc.code}: {detail}"
+    except Exception as exc:
+        return None, str(exc)
+
+    try:
+        parsed = json.loads(raw or "{}")
+    except Exception:
+        return None, "Invalid JSON response from Shopify GraphQL."
+
+    errors = parsed.get("errors") or []
+    if errors:
+        messages: list[str] = []
+        for err in errors:
+            if isinstance(err, dict):
+                msg = _clean_text(err.get("message", ""))
+                if msg:
+                    messages.append(msg)
+        return None, "; ".join(messages) or "Shopify GraphQL returned errors."
+    return parsed.get("data") or {}, None
+
+
+_PUBLICATIONS_QUERY = """
+query ListPublications($cursor: String) {
+  publications(first: 100, after: $cursor) {
+    edges {
+      cursor
+      node {
+        id
+        name
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"""
+
+_PUBLISHABLE_PUBLISH_MUTATION = """
+mutation PublishProductToPublications($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+
+def _chunked(values: list[str], size: int) -> list[list[str]]:
+    if size <= 0:
+        return [values]
+    chunks: list[list[str]] = []
+    for index in range(0, len(values), size):
+        chunks.append(values[index : index + size])
+    return chunks
+
+
+def _load_all_publications(
+    config: ShopifyConfig,
+    access_token: str,
+) -> tuple[list[tuple[str, str]], str | None]:
+    publications: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    cursor = ""
+
+    while True:
+        data, error = _request_graphql_json(
+            config=config,
+            access_token=access_token,
+            query=_PUBLICATIONS_QUERY,
+            variables={"cursor": cursor or None},
+        )
+        if error:
+            return [], error
+
+        block = (data or {}).get("publications") or {}
+        edges = block.get("edges") or []
+        for edge in edges:
+            node = (edge or {}).get("node") or {}
+            publication_id = _clean_text(node.get("id", ""))
+            if not publication_id or publication_id in seen_ids:
+                continue
+            seen_ids.add(publication_id)
+            publication_name = _clean_text(node.get("name", "")) or publication_id
+            publications.append((publication_id, publication_name))
+
+        page_info = block.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = _clean_text(page_info.get("endCursor", ""))
+        if not cursor:
+            break
+
+    return publications, None
+
+
+def _publish_product_to_publications(
+    config: ShopifyConfig,
+    access_token: str,
+    product_gid: str,
+    publication_ids: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    clean_product_gid = _clean_text(product_gid)
+    if not clean_product_gid:
+        return ["missing product gid"]
+    targets = [_clean_text(item) for item in publication_ids if _clean_text(item)]
+    if not targets:
+        return []
+
+    # Keep mutation payloads reasonably small for stability.
+    for publication_chunk in _chunked(targets, 25):
+        input_items = [{"publicationId": publication_id} for publication_id in publication_chunk]
+        data, error = _request_graphql_json(
+            config=config,
+            access_token=access_token,
+            query=_PUBLISHABLE_PUBLISH_MUTATION,
+            variables={
+                "id": clean_product_gid,
+                "input": input_items,
+            },
+        )
+        if error:
+            errors.append(error)
+            continue
+
+        payload = (data or {}).get("publishablePublish") or {}
+        user_errors = payload.get("userErrors") or []
+        for user_error in user_errors:
+            message = _clean_text((user_error or {}).get("message", ""))
+            if message:
+                errors.append(message)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in errors:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(item)
+    return deduped
+
+
+_VARIANT_METAFIELD_DEFINITION_QUERY = """
+query VariantMetafieldDefinition($namespace: String!, $key: String!) {
+  metafieldDefinitions(first: 1, ownerType: PRODUCTVARIANT, namespace: $namespace, key: $key) {
+    nodes {
+      namespace
+      key
+      type { name }
+      validations { name value }
+    }
+  }
+}
+"""
+
+
+def _load_variant_metafield_definition(
+    config: ShopifyConfig,
+    access_token: str,
+    namespace: str,
+    key: str,
+) -> tuple[str, list[str], str | None]:
+    data, error = _request_graphql_json(
+        config=config,
+        access_token=access_token,
+        query=_VARIANT_METAFIELD_DEFINITION_QUERY,
+        variables={"namespace": _clean_text(namespace), "key": _clean_text(key)},
+    )
+    if error:
+        return "", [], error
+    nodes = (((data or {}).get("metafieldDefinitions") or {}).get("nodes")) or []
+    if not nodes:
+        return "", [], "definition not found"
+    node = nodes[0] or {}
+    type_name = _clean_text(((node.get("type") or {}).get("name")))
+    validations = node.get("validations") or []
+    choices: list[str] = []
+    for rule in validations:
+        if _clean_text((rule or {}).get("name", "")).lower() != "choices":
+            continue
+        raw = _clean_text((rule or {}).get("value", ""))
+        if not raw:
+            continue
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                choices = [_clean_text(item) for item in decoded if _clean_text(item)]
+            elif isinstance(decoded, str) and _clean_text(decoded):
+                choices = [_clean_text(decoded)]
+        except Exception:
+            choices = [_clean_text(item) for item in re.split(r"[|,;\n]+", raw) if _clean_text(item)]
+        break
+    return type_name, choices, None
+
+
 def _resolve_primary_location_id(config: ShopifyConfig, access_token: str) -> tuple[int | None, str | None]:
     data, error = _request_rest_json(
         config=config,
@@ -334,6 +559,8 @@ def _build_product_payload(product: Product, vendor_override: str = "") -> dict:
         "barcode": _clean_text(product.barcode),
         "price": _to_decimal_text(product.price),
         "inventory_management": "shopify",
+        # Always allow selling through zero inventory for this workflow.
+        "inventory_policy": "continue",
     }
     weight_lb = _to_weight_lb(product.weight)
     if weight_lb is not None:
@@ -487,6 +714,67 @@ def _upsert_product_metafield(
     return retry_error
 
 
+def _upsert_variant_metafield(
+    config: ShopifyConfig,
+    access_token: str,
+    variant_id: int,
+    namespace: str,
+    key: str,
+    value: str,
+    metafield_type: str,
+) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+
+    encoded_value, encode_error = _prepare_metafield_value(text, metafield_type)
+    if encode_error or encoded_value is None:
+        return encode_error or "unsupported metafield value"
+
+    payload = {
+        "metafield": {
+            "namespace": namespace,
+            "key": key,
+            "type": metafield_type,
+            "value": encoded_value,
+        }
+    }
+    _, error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="POST",
+        path=f"/variants/{variant_id}/metafields.json",
+        payload=payload,
+    )
+    if not error:
+        return None
+
+    expected_type = _extract_definition_type_from_error(error)
+    if not expected_type or expected_type == metafield_type:
+        return error
+
+    retried_value, retry_encode_error = _prepare_metafield_value(text, expected_type)
+    if retry_encode_error or retried_value is None:
+        return f"definition expects {expected_type}; {retry_encode_error or 'value conversion failed'}"
+
+    retry_payload = {
+        "metafield": {
+            "namespace": namespace,
+            "key": key,
+            "type": expected_type,
+            "value": retried_value,
+        }
+    }
+    _, retry_error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="POST",
+        path=f"/variants/{variant_id}/metafields.json",
+        payload=retry_payload,
+    )
+    return retry_error
+
+
 @dataclass
 class ShopifyDraftPushSummary:
     requested: int = 0
@@ -509,6 +797,39 @@ def push_new_products_as_drafts(
     summary = ShopifyDraftPushSummary(requested=len(products))
     if not products:
         return summary
+
+    publication_targets, publication_error = _load_all_publications(config=config, access_token=access_token)
+    publication_ids = [item[0] for item in publication_targets if _clean_text(item[0])]
+    publication_names = [item[1] for item in publication_targets if _clean_text(item[1])]
+    publish_to_all_channels_enabled = bool(publication_ids)
+    if publication_error:
+        summary.warnings.append(f"Sales channel publication lookup failed ({publication_error}).")
+    elif publication_ids:
+        summary.warnings.append(
+            f"Sales channel publication enabled for {len(publication_ids)} channel(s): {', '.join(publication_names[:10])}"
+        )
+    else:
+        summary.warnings.append("No Shopify publications found; sales channels could not be assigned.")
+
+    low_stock_type = "single_line_text_field"
+    low_stock_value = "True"
+    definition_type, definition_choices, definition_error = _load_variant_metafield_definition(
+        config=config,
+        access_token=access_token,
+        namespace="custom",
+        key="enable_low_stock_message",
+    )
+    if definition_type:
+        low_stock_type = definition_type
+    if definition_choices:
+        preferred = ""
+        for candidate in definition_choices:
+            if _clean_text(candidate).lower() == "true":
+                preferred = candidate
+                break
+        low_stock_value = _clean_text(preferred or definition_choices[0]) or low_stock_value
+    if definition_error:
+        summary.warnings.append(f"enable_low_stock_message definition lookup issue ({definition_error}); using fallback value.")
 
     existing_norm = {normalize_sku(value) for value in (existing_skus or set()) if normalize_sku(value)}
     location_id: int | None = None
@@ -533,6 +854,20 @@ def push_new_products_as_drafts(
         if not title:
             summary.failed_by_sku[sku] = "Missing title."
             continue
+
+        # Always prefer resolved YMM tags so Product Organization tags stay fitment-driven.
+        resolved_tags, tag_warnings = resolve_ymm_tags(
+            application_text=_clean_text(product.application),
+            required_root=required_root,
+            title_text=title,
+            description_text=_clean_text(product.description_html),
+        )
+        if resolved_tags:
+            product.tags = resolved_tags
+        else:
+            product.tags = []
+            if tag_warnings:
+                summary.warnings.append(f"{sku}: YMM tags not set ({tag_warnings[0]})")
 
         raw_vendor_value = _clean_text(product.vendor)
         normalized_vendor_value = normalize_vendor_from_rules(raw_vendor_value, required_root=required_root) or raw_vendor_value
@@ -571,6 +906,7 @@ def push_new_products_as_drafts(
         product_id_raw = created_product.get("id")
         variants = created_product.get("variants") or []
         first_variant = variants[0] if variants else {}
+        variant_id_raw = first_variant.get("id")
         inventory_item_id_raw = first_variant.get("inventory_item_id")
 
         try:
@@ -578,6 +914,31 @@ def push_new_products_as_drafts(
         except Exception:
             summary.failed_by_sku[sku] = "Shopify create succeeded but product id was missing."
             continue
+
+        if publish_to_all_channels_enabled:
+            product_gid = f"gid://shopify/Product/{product_id}"
+            publish_errors = _publish_product_to_publications(
+                config=config,
+                access_token=access_token,
+                product_gid=product_gid,
+                publication_ids=publication_ids,
+            )
+            if publish_errors:
+                combined = "; ".join(publish_errors)
+                summary.warnings.append(f"{sku}: sales channels not fully assigned ({combined})")
+                lowered = combined.lower()
+                if "only active products" in lowered and "publish" in lowered:
+                    summary.warnings.append(
+                        "Sales channel publish requires ACTIVE products in this shop. "
+                        "Auto channel assignment disabled for remaining draft products."
+                    )
+                    publish_to_all_channels_enabled = False
+
+        variant_id: int | None
+        try:
+            variant_id = int(variant_id_raw)
+        except Exception:
+            variant_id = None
 
         inventory_item_id: int | None
         try:
@@ -642,8 +1003,6 @@ def push_new_products_as_drafts(
                 "single_line_text_field",
             ),
             ("custom", "mpn", _clean_text(product.mpn) or sku, "single_line_text_field"),
-            ("mm-google-shopping", "mpn", google_mpn_value, "single_line_text_field"),
-            ("custom", "enable_low_stock_message", "true", "single_line_text_field"),
             ("custom", "brand", brand_gid or brand_value, "metaobject_reference" if brand_gid else "single_line_text_field"),
             ("fitment", "vehicles", fitment_vehicle_gid_text, "list.metaobject_reference"),
         ]
@@ -659,6 +1018,26 @@ def push_new_products_as_drafts(
             )
             if metafield_error:
                 summary.warnings.append(f"{sku}: metafield {namespace}.{key} not set ({metafield_error})")
+
+        variant_metafields = [
+            ("mm-google-shopping", "mpn", google_mpn_value, "single_line_text_field"),
+            ("custom", "enable_low_stock_message", low_stock_value, low_stock_type),
+        ]
+        if variant_id is None:
+            summary.warnings.append(f"{sku}: variant metafields not set (missing variant id).")
+        else:
+            for namespace, key, value, metafield_type in variant_metafields:
+                metafield_error = _upsert_variant_metafield(
+                    config=config,
+                    access_token=access_token,
+                    variant_id=variant_id,
+                    namespace=namespace,
+                    key=key,
+                    value=value,
+                    metafield_type=metafield_type,
+                )
+                if metafield_error:
+                    summary.warnings.append(f"{sku}: variant metafield {namespace}.{key} not set ({metafield_error})")
 
         if include_images and local_image_files:
             for file_path in local_image_files:

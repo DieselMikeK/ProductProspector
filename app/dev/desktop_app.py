@@ -66,8 +66,26 @@ from product_prospector.core.scraper_engine import scrape_vendor_records
 
 APP_TITLE = "Product Prospector"
 APP_GEOMETRY = "1440x920"
+APP_WINDOW_MARGIN_PX = 64
+APP_MIN_WINDOW_WIDTH = 1080
+APP_MIN_WINDOW_HEIGHT = 680
+HEADER_LOGO_VERTICAL_CROP_PX = 125
+HEADER_LOGO_VERTICAL_EXTRA_PADDING_PX = 25
 _SINGLE_INSTANCE_MUTEX = "Global\\ProductProspectorDesktopApp"
 _ERROR_ALREADY_EXISTS = 183
+INVENTORY_OWNER_VALUES = ["Andrew", "Alondra", "Mike K", "Michael V"]
+INVENTORY_BY_OWNER = {
+    "Andrew": 1_000_000,
+    "Alondra": 2_000_000,
+    "Mike K": 3_000_000,
+    "Michael V": 4_000_000,
+}
+DEFAULT_INVENTORY_OWNER = "Mike K"
+
+
+def _inventory_for_owner(owner_name: str) -> int:
+    owner = str(owner_name or "").strip()
+    return int(INVENTORY_BY_OWNER.get(owner, INVENTORY_BY_OWNER[DEFAULT_INVENTORY_OWNER]))
 
 
 def _resolve_runtime_root() -> Path:
@@ -220,6 +238,7 @@ class ProductProspectorDesktopApp:
         self.root = Tk()
         self.root.title(APP_TITLE)
         self.root.geometry(APP_GEOMETRY)
+        self._fit_window_to_screen()
 
         self.vendor_df_raw: pd.DataFrame | None = None
         self.shopify_df_raw: pd.DataFrame | None = None
@@ -233,6 +252,7 @@ class ProductProspectorDesktopApp:
         self._header_logo_image: tk.PhotoImage | None = None
         self._header_logo_label: ttk.Label | None = None
         self._header_logo_target_width = 550
+        self._header_logo_target_height: int | None = None
         self._header_logo_frame_paths: list[Path] = []
         self._header_logo_frames: list[tk.PhotoImage] = []
         self._header_logo_frame_index = 0
@@ -284,6 +304,8 @@ class ProductProspectorDesktopApp:
         self.run_mode_locked = BooleanVar(value=False)
         self.run_mode_summary_text = StringVar(value="")
         self.use_all_sheet_skus = BooleanVar(value=False)
+        self.inventory_owner = StringVar(value=DEFAULT_INVENTORY_OWNER)
+        self.inventory_owner_inventory_text = StringVar(value=f"Inventory default: {_inventory_for_owner(DEFAULT_INVENTORY_OWNER):,}")
 
         self.year_policy = StringVar(value="merge")
         self.carry_down_sku = BooleanVar(value=True)
@@ -339,7 +361,7 @@ class ProductProspectorDesktopApp:
             "jobber_price": StringVar(value=""),
             "cost": StringVar(value=""),
             "dealer_cost": StringVar(value=""),
-            "inventory": StringVar(value="3000000"),
+            "inventory": StringVar(value=str(_inventory_for_owner(DEFAULT_INVENTORY_OWNER))),
             "sku": StringVar(value=""),
             "barcode": StringVar(value=""),
             "weight": StringVar(value=""),
@@ -382,8 +404,11 @@ class ProductProspectorDesktopApp:
         self._mode_initialized = False
         self._ui_task_queue: queue.Queue[tuple[object, tuple[object, ...], dict[str, object]]] = queue.Queue()
         self._ui_task_pump_job: str | None = None
+        self._mousewheel_bindings_ready = False
 
         self.run_mode.trace_add("write", self._on_run_mode_changed)
+        self.inventory_owner.trace_add("write", self._on_inventory_owner_changed)
+        self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
 
         self._create_layout()
         self._initialize_shopify_cache_state()
@@ -404,7 +429,10 @@ class ProductProspectorDesktopApp:
         header_frame = ttk.Frame(root_frame)
         header_frame.pack(fill=X, pady=(0, 6))
         self._header_logo_label = ttk.Label(header_frame)
-        self._header_logo_label.pack(anchor="center")
+        self._header_logo_label.pack(
+            anchor="center",
+            pady=(HEADER_LOGO_VERTICAL_EXTRA_PADDING_PX, HEADER_LOGO_VERTICAL_EXTRA_PADDING_PX),
+        )
         self._load_initial_header_logo()
 
         api_frame = ttk.Frame(root_frame)
@@ -449,6 +477,75 @@ class ProductProspectorDesktopApp:
         self._build_setup_tab()
         self._build_preview_tab()
         self._build_export_tab()
+        self._bind_tab_canvas_mousewheel()
+
+    def _fit_window_to_screen(self) -> None:
+        match = re.match(r"^\s*(\d+)x(\d+)", APP_GEOMETRY or "")
+        default_width = int(match.group(1)) if match else 1440
+        default_height = int(match.group(2)) if match else 920
+        try:
+            screen_width = max(640, int(self.root.winfo_screenwidth() or default_width))
+            screen_height = max(480, int(self.root.winfo_screenheight() or default_height))
+        except Exception:
+            return
+
+        max_width = max(640, screen_width - APP_WINDOW_MARGIN_PX)
+        max_height = max(480, screen_height - APP_WINDOW_MARGIN_PX)
+        fitted_width = min(default_width, max_width)
+        fitted_height = min(default_height, max_height)
+        self.root.geometry(f"{fitted_width}x{fitted_height}")
+        self.root.minsize(
+            min(fitted_width, APP_MIN_WINDOW_WIDTH),
+            min(fitted_height, APP_MIN_WINDOW_HEIGHT),
+        )
+
+    def _bind_tab_canvas_mousewheel(self) -> None:
+        if self._mousewheel_bindings_ready:
+            return
+        self._mousewheel_bindings_ready = True
+        self.root.bind_all("<MouseWheel>", self._on_tab_canvas_mousewheel, add="+")
+        # Linux wheel events.
+        self.root.bind_all("<Button-4>", self._on_tab_canvas_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_tab_canvas_mousewheel, add="+")
+
+    def _active_tab_canvas(self) -> Canvas | None:
+        try:
+            current = self.notebook.select()
+        except Exception:
+            return None
+        if current == str(self.tab_setup) and hasattr(self, "setup_canvas"):
+            return self.setup_canvas
+        if current == str(self.tab_preview) and hasattr(self, "preview_canvas"):
+            return self.preview_canvas
+        if current == str(self.tab_export) and hasattr(self, "export_canvas"):
+            return self.export_canvas
+        return None
+
+    def _on_tab_canvas_mousewheel(self, event) -> str | None:
+        canvas = self._active_tab_canvas()
+        if canvas is None:
+            return None
+
+        delta_steps = 0
+        raw_delta = int(getattr(event, "delta", 0) or 0)
+        if raw_delta:
+            delta_steps = -int(raw_delta / 120)
+            if delta_steps == 0:
+                delta_steps = -1 if raw_delta > 0 else 1
+        else:
+            event_num = int(getattr(event, "num", 0) or 0)
+            if event_num == 4:
+                delta_steps = -1
+            elif event_num == 5:
+                delta_steps = 1
+
+        if delta_steps == 0:
+            return None
+        try:
+            canvas.yview_scroll(delta_steps, "units")
+            return "break"
+        except Exception:
+            return None
 
     def _schedule_ui_task_pump(self) -> None:
         if self._ui_task_pump_job is not None:
@@ -504,6 +601,66 @@ class ProductProspectorDesktopApp:
         frames = [path for path in video_dir.iterdir() if path.is_file() and path.suffix.lower() in allowed]
         return sorted(frames, key=self._header_logo_sort_key)
 
+    def _estimate_logo_render_height(self, image_path: Path, target_width: int) -> int:
+        if not image_path.exists():
+            return 0
+        try:
+            from PIL import Image
+
+            with Image.open(image_path) as src:
+                src = self._crop_logo_vertical_padding(src)
+                src_w, src_h = src.size
+                safe_w = max(1, int(src_w))
+                safe_h = max(1, int(src_h))
+                resized_w = max(1, int(target_width))
+                resized_h = max(1, int(round((safe_h * resized_w) / safe_w)))
+                return resized_h
+        except Exception:
+            return 0
+
+    def _prepare_header_logo_target_height(self) -> None:
+        if self._header_logo_target_height and self._header_logo_target_height > 0:
+            return
+
+        candidates: list[Path] = list(self._header_logo_frame_paths)
+        logo_path = self.runtime_data_root / "logo.png"
+        if logo_path.exists():
+            candidates.append(logo_path)
+
+        heights = [
+            self._estimate_logo_render_height(path, self._header_logo_target_width)
+            for path in candidates
+        ]
+        positive_heights = [height for height in heights if int(height) > 0]
+        if positive_heights:
+            self._header_logo_target_height = max(positive_heights)
+
+    def _normalize_logo_frame_size(self, image):
+        target_height = max(0, int(self._header_logo_target_height or 0))
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return image
+        if target_height <= 0:
+            self._header_logo_target_height = int(height)
+            return image
+        if height == target_height:
+            return image
+
+        try:
+            from PIL import Image
+        except Exception:
+            return image
+
+        source = image.convert("RGBA")
+        if height > target_height:
+            # Keep vertical anchoring stable so animation frames do not "bounce".
+            return source.crop((0, 0, width, target_height))
+
+        canvas = Image.new("RGBA", (width, target_height), (0, 0, 0, 0))
+        y_offset = 0
+        canvas.paste(source, (0, y_offset), source)
+        return canvas
+
     def _load_logo_image(self, image_path: Path, target_width: int) -> tk.PhotoImage | None:
         if not image_path.exists():
             return None
@@ -511,12 +668,14 @@ class ProductProspectorDesktopApp:
             from PIL import Image, ImageTk
 
             with Image.open(image_path) as src:
+                src = self._crop_logo_vertical_padding(src)
                 src_w, src_h = src.size
                 safe_w = max(1, int(src_w))
                 safe_h = max(1, int(src_h))
                 resized_w = max(1, int(target_width))
                 resized_h = max(1, int(round((safe_h * resized_w) / safe_w)))
                 resized = src.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+                resized = self._normalize_logo_frame_size(resized)
                 return ImageTk.PhotoImage(resized)
         except Exception:
             try:
@@ -524,13 +683,41 @@ class ProductProspectorDesktopApp:
             except Exception:
                 return None
             width = max(1, int(fallback.width()))
+            height = max(1, int(fallback.height()))
             if width > target_width:
                 scale_down = max(1, int(round(width / target_width)))
                 fallback = fallback.subsample(scale_down, scale_down)
+                height = max(1, int(fallback.height()))
             elif width < target_width:
                 scale_up = max(1, int(round(target_width / width)))
                 fallback = fallback.zoom(scale_up, scale_up)
+                height = max(1, int(fallback.height()))
+            if not self._header_logo_target_height:
+                self._header_logo_target_height = int(height)
             return fallback
+
+    def _crop_logo_vertical_padding(self, image):
+        crop_each = max(0, int(HEADER_LOGO_VERTICAL_CROP_PX))
+        if crop_each <= 0:
+            return image
+        try:
+            width, height = image.size
+            if height <= 1:
+                return image
+            # Apply a consistent crop per frame so frame-to-frame alpha differences
+            # cannot shift the rendered logo position.
+            crop_top = min(crop_each, max(0, int((height - 1) / 2)))
+            crop_bottom = min(crop_each, max(0, height - crop_top - 1))
+            if crop_top <= 0 and crop_bottom <= 0:
+                return image
+
+            new_top = crop_top
+            new_bottom = max(new_top + 1, height - crop_bottom)
+            if new_bottom <= new_top:
+                return image
+            return image.crop((0, new_top, width, new_bottom))
+        except Exception:
+            return image
 
     def _apply_header_logo_image(self, image: tk.PhotoImage | None) -> None:
         self._header_logo_image = image
@@ -543,6 +730,7 @@ class ProductProspectorDesktopApp:
 
     def _load_initial_header_logo(self) -> None:
         self._header_logo_frame_paths = self._discover_header_logo_frames()
+        self._prepare_header_logo_target_height()
         first_frame = self._header_logo_frame_paths[0] if self._header_logo_frame_paths else None
         if first_frame is not None:
             frame_image = self._load_logo_image(first_frame, self._header_logo_target_width)
@@ -558,6 +746,7 @@ class ProductProspectorDesktopApp:
             return True
         if not self._header_logo_frame_paths:
             self._header_logo_frame_paths = self._discover_header_logo_frames()
+        self._prepare_header_logo_target_height()
         loaded: list[tk.PhotoImage] = []
         for frame_path in self._header_logo_frame_paths:
             frame_image = self._load_logo_image(frame_path, self._header_logo_target_width)
@@ -732,6 +921,21 @@ class ProductProspectorDesktopApp:
         self.mode_area = ttk.Frame(self.setup_inner)
         self.mode_area.pack(fill=X, pady=(0, 8))
 
+        self.inventory_owner_wrap = ttk.LabelFrame(self.mode_area, text="Operator", padding=8)
+        self.inventory_owner_wrap.pack(fill=X, pady=(0, 8))
+        owner_row = ttk.Frame(self.inventory_owner_wrap)
+        owner_row.pack(fill=X)
+        ttk.Label(owner_row, text="Who are you?", width=18).pack(side=LEFT)
+        self.inventory_owner_combo = ttk.Combobox(
+            owner_row,
+            textvariable=self.inventory_owner,
+            values=INVENTORY_OWNER_VALUES,
+            state="readonly",
+            width=18,
+        )
+        self.inventory_owner_combo.pack(side=LEFT)
+        ttk.Label(owner_row, textvariable=self.inventory_owner_inventory_text, foreground="#1f4e79").pack(side=LEFT, padx=(10, 0))
+
         self.mode_selector_wrap = ttk.LabelFrame(self.mode_area, text="Run Mode", padding=8)
         self.mode_selector_wrap.pack(fill=X)
         ttk.Radiobutton(
@@ -753,7 +957,12 @@ class ProductProspectorDesktopApp:
         )
         ttk.Button(self.mode_summary_wrap, text="Change", command=self._unlock_run_mode).pack(side=LEFT, padx=(10, 0))
 
-        input_box = ttk.LabelFrame(self.setup_inner, text="SKUs In Scope", padding=8)
+        # Keep setup focused at startup; mode-specific workflow controls are hidden
+        # until a run mode is selected.
+        self.setup_workflow_wrap = ttk.Frame(self.setup_inner)
+        self.setup_workflow_wrap.pack(fill=X)
+
+        input_box = ttk.LabelFrame(self.setup_workflow_wrap, text="SKUs In Scope", padding=8)
         input_box.pack(fill=X, pady=(0, 8))
         ttk.Label(input_box, textvariable=self.sku_scope_help_text).pack(anchor=W)
 
@@ -796,7 +1005,7 @@ class ProductProspectorDesktopApp:
             foreground="#1f4e79",
         ).pack(anchor=W, pady=(6, 0))
 
-        self.vendor_mapping_wrap = ttk.LabelFrame(self.setup_inner, text="Vendor Mapping", padding=8)
+        self.vendor_mapping_wrap = ttk.LabelFrame(self.setup_workflow_wrap, text="Vendor Mapping", padding=8)
         mapping_grid = ttk.Frame(self.vendor_mapping_wrap)
         mapping_grid.pack(fill=X)
         mapping_grid.columnconfigure(0, weight=1)
@@ -834,10 +1043,10 @@ class ProductProspectorDesktopApp:
             foreground="#1f4e79",
         ).pack(anchor=W, pady=(6, 0))
 
-        self.vendor_preview_wrap = ttk.LabelFrame(self.setup_inner, text="Vendor Input Preview", padding=8)
+        self.vendor_preview_wrap = ttk.LabelFrame(self.setup_workflow_wrap, text="Vendor Input Preview", padding=8)
         self.vendor_preview = self._create_tree(self.vendor_preview_wrap, height_rows=10, expand=False, fill_mode=BOTH)
 
-        self.update_fields_wrap = ttk.LabelFrame(self.setup_inner, text="Fields To Update (Update Mode)", padding=8)
+        self.update_fields_wrap = ttk.LabelFrame(self.setup_workflow_wrap, text="Fields To Update (Update Mode)", padding=8)
         update_grid = ttk.Frame(self.update_fields_wrap)
         update_grid.pack(fill=X)
         ttk.Checkbutton(update_grid, text="Title", variable=self.update_title).grid(row=0, column=0, sticky=W, padx=(0, 16))
@@ -856,9 +1065,9 @@ class ProductProspectorDesktopApp:
             foreground="#1f4e79",
         ).pack(anchor=W, pady=(6, 0))
 
-        ttk.Label(self.setup_inner, textvariable=self.input_metrics_text, foreground="#1f4e79").pack(anchor=W)
-        ttk.Label(self.setup_inner, textvariable=self.source_status_text, foreground="#1f4e79").pack(anchor=W, pady=(2, 8))
-        self.duplicate_status_wrap = ttk.Frame(self.setup_inner)
+        ttk.Label(self.setup_workflow_wrap, textvariable=self.input_metrics_text, foreground="#1f4e79").pack(anchor=W)
+        ttk.Label(self.setup_workflow_wrap, textvariable=self.source_status_text, foreground="#1f4e79").pack(anchor=W, pady=(2, 8))
+        self.duplicate_status_wrap = ttk.Frame(self.setup_workflow_wrap)
         self.duplicate_status_wrap.pack(fill=X, pady=(0, 2))
         ttk.Label(self.duplicate_status_wrap, textvariable=self.duplicate_check_text, foreground="#1f4e79").pack(anchor=W)
         self.duplicate_check_progress = ttk.Progressbar(
@@ -868,13 +1077,13 @@ class ProductProspectorDesktopApp:
             maximum=100,
             value=0,
         )
-        self.rules_status = ttk.Label(self.setup_inner, text="", foreground="#1f4e79")
+        self.rules_status = ttk.Label(self.setup_workflow_wrap, text="", foreground="#1f4e79")
         self.rules_status.pack(anchor=W)
 
-        self.setup_status = ttk.Label(self.setup_inner, textvariable=self.setup_status_text, foreground="#1f4e79")
+        self.setup_status = ttk.Label(self.setup_workflow_wrap, textvariable=self.setup_status_text, foreground="#1f4e79")
         self.setup_status.pack(anchor=W)
 
-        continue_row = ttk.Frame(self.setup_inner)
+        continue_row = ttk.Frame(self.setup_workflow_wrap)
         continue_row.pack(fill=X, pady=(6, 6))
         self.setup_continue_btn = ttk.Button(
             continue_row,
@@ -906,6 +1115,15 @@ class ProductProspectorDesktopApp:
         self._set_duplicate_check_busy(False)
         self._refresh_mode_lock_ui()
         self._attach_vendor_mapping_traces()
+
+    def _set_setup_workflow_visible(self, visible: bool) -> None:
+        if not hasattr(self, "setup_workflow_wrap"):
+            return
+        if visible:
+            if not self.setup_workflow_wrap.winfo_manager():
+                self.setup_workflow_wrap.pack(fill=X)
+            return
+        self.setup_workflow_wrap.pack_forget()
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
         try:
@@ -976,7 +1194,7 @@ class ProductProspectorDesktopApp:
 
         # Keep review grid lightweight to avoid UI lockups on large/long text payloads.
         rows: list[dict[str, str]] = []
-        for product in products[:120]:
+        for product in products[:80]:
             sku = normalize_sku(getattr(product, "sku", ""))
             excluded = bool(getattr(product, "excluded", False))
             exclusion_reason = str(getattr(product, "exclusion_reason", "") or "").strip()
@@ -998,8 +1216,42 @@ class ProductProspectorDesktopApp:
                 }
             )
         df = pd.DataFrame(rows)
-        _tree_show_dataframe(self.review_table, df, max_rows=120)
+        _tree_show_dataframe(self.review_table, df, max_rows=80, max_cell_chars=180)
+        self._highlight_review_table_current_product()
         self._refresh_push_button_state()
+
+    def _find_product_index_by_sku(self, sku_value: str) -> int | None:
+        normalized_target = normalize_sku(sku_value)
+        if not normalized_target:
+            return None
+        for index, product in enumerate(self.session.products or []):
+            if normalize_sku(getattr(product, "sku", "")) == normalized_target:
+                return index
+        return None
+
+    def _highlight_review_table_current_product(self) -> None:
+        if not hasattr(self, "review_table"):
+            return
+        products = self.session.products or []
+        if not products:
+            return
+        if self.review_index < 0 or self.review_index >= len(products):
+            return
+        current_sku = normalize_sku(getattr(products[self.review_index], "sku", ""))
+        if not current_sku:
+            return
+        tree = self.review_table
+        for row_id in tree.get_children():
+            row_sku = normalize_sku(tree.set(row_id, "sku"))
+            if row_sku != current_sku:
+                continue
+            try:
+                tree.selection_set(row_id)
+                tree.focus(row_id)
+                tree.see(row_id)
+            except Exception:
+                pass
+            break
 
     def _toggle_review_table_push_selection(self) -> None:
         products = self.session.products or []
@@ -1022,6 +1274,7 @@ class ProductProspectorDesktopApp:
     def _unlock_run_mode(self) -> None:
         self.run_mode_locked.set(False)
         self.session.reset_for_new_run()
+        self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
         self.push_selected_skus = set()
         self.run_mode.set("")
         self.setup_status_text.set("Run mode unlocked. Choose mode to continue.")
@@ -1039,6 +1292,20 @@ class ProductProspectorDesktopApp:
             self.to_review_btn.configure(state="disabled")
         self._update_tab_access()
         self._refresh_mode_lock_ui()
+
+    def _on_inventory_owner_changed(self, *_args) -> None:
+        selected = self.inventory_owner.get().strip()
+        if selected not in INVENTORY_BY_OWNER:
+            selected = DEFAULT_INVENTORY_OWNER
+            if self.inventory_owner.get() != selected:
+                self.inventory_owner.set(selected)
+                return
+
+        inventory_value = _inventory_for_owner(selected)
+        self.session.inventory_default = inventory_value
+        self.inventory_owner_inventory_text.set(f"Inventory default: {inventory_value:,}")
+        if not self.session.products:
+            self.review_fields["inventory"].set(str(inventory_value))
 
     def _refresh_mode_lock_ui(self) -> None:
         mode_name = self.run_mode.get().strip()
@@ -1094,7 +1361,7 @@ class ProductProspectorDesktopApp:
 
         action_row = ttk.Frame(self.preview_inner)
         action_row.pack(fill=X, pady=(0, 8))
-        self.start_processing_btn = ttk.Button(action_row, text="Start Processing", command=self._start_processing_clicked)
+        self.start_processing_btn = ttk.Button(action_row, text="Start Prospecting", command=self._start_processing_clicked)
         self.start_processing_btn.pack(side=LEFT)
         self.to_review_btn = ttk.Button(
             action_row,
@@ -1446,8 +1713,11 @@ class ProductProspectorDesktopApp:
         self.session.scrape_settings.delay_seconds = delay
         self.session.scrape_settings.retry_count = retries
         self.session.scrape_settings.headless = bool(self.scrape_headless.get())
-        self.session.scrape_settings.scrape_images = bool(self.scrape_images.get())
+        # Images are always scrape-driven in this workflow.
+        self.scrape_images.set(True)
+        self.session.scrape_settings.scrape_images = True
         self.session.scrape_settings.force_scrape = bool(self.scrape_force.get())
+        self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
 
         target_skus = collect_session_skus(self.session)
         if not target_skus:
@@ -1607,12 +1877,14 @@ class ProductProspectorDesktopApp:
             )
 
             normalized_products = []
+            default_inventory = int(self.session.inventory_default or 3000000)
             for product in products:
                 normalized = normalize_product(
                     product=product,
                     required_root=self.required_root,
                     mode=self.session.mode,
                     update_fields=update_scope,
+                    default_inventory=default_inventory,
                 )
                 if self.session.mode == MODE_NEW or allow_category_overwrite:
                     normalized = mapper.apply(
@@ -1906,6 +2178,7 @@ class ProductProspectorDesktopApp:
             self.review_cost_rule_combo.configure(state="readonly")
         self.review_cost_rule_text.set(vendor_label)
         self.review_index_text.set(f"Product {index + 1} / {len(self.session.products)}")
+        self._highlight_review_table_current_product()
 
     def _save_current_review_product(self) -> None:
         if not self.session.products:
@@ -1921,10 +2194,11 @@ class ProductProspectorDesktopApp:
         product.jobber_price = self._read_review_field("jobber_price")
         product.cost = self._read_review_field("cost")
         product.dealer_cost = self._read_review_field("dealer_cost")
+        default_inventory = int(self.session.inventory_default or 3000000)
         try:
-            product.inventory = int(float(self._read_review_field("inventory") or "3000000"))
+            product.inventory = int(float(self._read_review_field("inventory") or str(default_inventory)))
         except Exception:
-            product.inventory = 3000000
+            product.inventory = default_inventory
         product.sku = self._read_review_field("sku").upper()
         product.barcode = self._read_review_field("barcode")
         product.weight = self._read_review_field("weight")
@@ -2176,11 +2450,21 @@ class ProductProspectorDesktopApp:
 
         row_id = tree.identify_row(event.y)
         column_id = tree.identify_column(event.x)
-        if not row_id or column_id != "#1":
+        if not row_id:
             return
         sku_value = normalize_sku(tree.set(row_id, "sku"))
         if not sku_value:
             return
+        if column_id != "#1":
+            target_index = self._find_product_index_by_sku(sku_value)
+            if target_index is None:
+                return
+            if target_index != self.review_index:
+                self._save_current_review_product()
+                self._load_review_product(target_index)
+            self.review_status_text.set(f"Loaded {sku_value} in Product Review.")
+            return
+
         selected_product = None
         for product in self.session.products:
             if normalize_sku(getattr(product, "sku", "")) == sku_value:
@@ -2737,6 +3021,7 @@ class ProductProspectorDesktopApp:
         mode = self.run_mode.get().strip()
         if not mode:
             self.run_mode_locked.set(False)
+            self._set_setup_workflow_visible(False)
             self.setup_status_text.set("Select a Run Mode to begin.")
             self.sku_scope_help_text.set("Enter SKUs that need to be updated or added.")
             self.create_existing_skus = set()
@@ -2754,6 +3039,7 @@ class ProductProspectorDesktopApp:
         if self._mode_initialized and not self.run_mode_locked.get():
             self.run_mode_locked.set(True)
 
+        self._set_setup_workflow_visible(True)
         if mode == RUN_MODE_UPDATE:
             self.session.mode = MODE_UPDATE
             self.sku_scope_help_text.set("Enter SKUs that need to be updated.")
@@ -3269,7 +3555,8 @@ class ProductProspectorDesktopApp:
         self.session.source_mapping.vendor = self.vendor_vendor_column.get().strip()
         self.session.source_mapping.title = self.vendor_title_column.get().strip()
         self.session.source_mapping.description = self.vendor_description_column.get().strip()
-        self.session.source_mapping.media = self.vendor_image_column.get().strip()
+        # Always keep media unmapped so image URLs are sourced from scraping.
+        self.session.source_mapping.media = ""
         self.session.source_mapping.price = self.vendor_price_column.get().strip()
         # Price source precedence comes from required/rules/pricing_priority_rules.json.
         self.session.source_mapping.map_price = ""
@@ -3282,6 +3569,7 @@ class ProductProspectorDesktopApp:
         self.session.source_mapping.barcode = self.vendor_barcode_column.get().strip()
         self.session.source_mapping.weight = self.vendor_weight_column.get().strip()
         self.session.source_mapping.application = self.vendor_fitment_column.get().strip()
+        self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
         if not has_sheet:
             self.session.source_mapping.sku = "sku"
 
@@ -3822,7 +4110,8 @@ class ProductProspectorDesktopApp:
             self.vendor_title_column.set(suggestions["title"] or _existing_or_blank(self.vendor_title_column))
             self.vendor_description_column.set(suggestions["description"] or _existing_or_blank(self.vendor_description_column))
             self.vendor_fitment_column.set(suggestions["fitment"] or _existing_or_blank(self.vendor_fitment_column))
-            self.vendor_image_column.set(suggestions["image_url"] or _existing_or_blank(self.vendor_image_column))
+            # Intentionally keep Media mapping blank so images are always scrape-driven.
+            self.vendor_image_column.set("")
             # Pricing rule uses MAP first, so keep Price aligned to MAP when we can detect it.
             suggested_price = suggestions["map_price"] or suggestions["price"]
             self.vendor_price_column.set(suggested_price or _existing_or_blank(self.vendor_price_column))
@@ -3837,7 +4126,7 @@ class ProductProspectorDesktopApp:
 
         self._enforce_unique_vendor_mappings()
 
-        self.rules_status.configure(text="Vendor auto-suggestions applied for core mapping fields.")
+        self.rules_status.configure(text="Vendor auto-suggestions applied. Media stays unmapped to force image scraping.")
         self._refresh_input_metrics()
         self._on_vendor_sku_mapping_changed()
 
@@ -4101,6 +4390,11 @@ class ProductProspectorDesktopApp:
         self.carry_down_sku.set(settings.carry_down_sku)
         self.propose_title_year_update.set(settings.propose_title_year_update)
         self.only_rows_with_year_changes.set(settings.only_rows_with_year_changes)
+        owner = str(getattr(settings, "inventory_owner", DEFAULT_INVENTORY_OWNER) or "").strip()
+        if owner not in INVENTORY_BY_OWNER:
+            owner = DEFAULT_INVENTORY_OWNER
+        self.inventory_owner.set(owner)
+        self._on_inventory_owner_changed()
 
     def _on_close(self) -> None:
         self._shutdown_requested = True
@@ -4119,6 +4413,7 @@ class ProductProspectorDesktopApp:
             carry_down_sku=self.carry_down_sku.get(),
             propose_title_year_update=self.propose_title_year_update.get(),
             only_rows_with_year_changes=self.only_rows_with_year_changes.get(),
+            inventory_owner=self.inventory_owner.get().strip() or DEFAULT_INVENTORY_OWNER,
         )
         try:
             save_app_settings(settings)
