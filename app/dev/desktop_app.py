@@ -69,8 +69,10 @@ APP_GEOMETRY = "1440x920"
 APP_WINDOW_MARGIN_PX = 64
 APP_MIN_WINDOW_WIDTH = 1080
 APP_MIN_WINDOW_HEIGHT = 680
-HEADER_LOGO_VERTICAL_CROP_PX = 125
-HEADER_LOGO_VERTICAL_EXTRA_PADDING_PX = 25
+HEADER_LOGO_VERTICAL_CROP_TOP_PX = 80
+HEADER_LOGO_VERTICAL_CROP_BOTTOM_PX = 100
+HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 50
+HEADER_LOGO_VERTICAL_BOTTOM_PADDING_PX = 25
 _SINGLE_INSTANCE_MUTEX = "Global\\ProductProspectorDesktopApp"
 _ERROR_ALREADY_EXISTS = 183
 INVENTORY_OWNER_VALUES = ["Andrew", "Alondra", "Mike K", "Michael V"]
@@ -431,7 +433,7 @@ class ProductProspectorDesktopApp:
         self._header_logo_label = ttk.Label(header_frame)
         self._header_logo_label.pack(
             anchor="center",
-            pady=(HEADER_LOGO_VERTICAL_EXTRA_PADDING_PX, HEADER_LOGO_VERTICAL_EXTRA_PADDING_PX),
+            pady=(HEADER_LOGO_VERTICAL_TOP_PADDING_PX, HEADER_LOGO_VERTICAL_BOTTOM_PADDING_PX),
         )
         self._load_initial_header_logo()
 
@@ -697,8 +699,9 @@ class ProductProspectorDesktopApp:
             return fallback
 
     def _crop_logo_vertical_padding(self, image):
-        crop_each = max(0, int(HEADER_LOGO_VERTICAL_CROP_PX))
-        if crop_each <= 0:
+        crop_top_target = max(0, int(HEADER_LOGO_VERTICAL_CROP_TOP_PX))
+        crop_bottom_target = max(0, int(HEADER_LOGO_VERTICAL_CROP_BOTTOM_PX))
+        if crop_top_target <= 0 and crop_bottom_target <= 0:
             return image
         try:
             width, height = image.size
@@ -706,8 +709,8 @@ class ProductProspectorDesktopApp:
                 return image
             # Apply a consistent crop per frame so frame-to-frame alpha differences
             # cannot shift the rendered logo position.
-            crop_top = min(crop_each, max(0, int((height - 1) / 2)))
-            crop_bottom = min(crop_each, max(0, height - crop_top - 1))
+            crop_top = min(crop_top_target, max(0, int((height - 1) / 2)))
+            crop_bottom = min(crop_bottom_target, max(0, height - crop_top - 1))
             if crop_top <= 0 and crop_bottom <= 0:
                 return image
 
