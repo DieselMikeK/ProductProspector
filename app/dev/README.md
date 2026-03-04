@@ -65,6 +65,7 @@ open dist/ProductProspector.app
 ```powershell
 python .\scripts\download_brand_metaobjects.py
 python .\scripts\download_fitment_vehicle_metaobjects.py
+python .\scripts\download_shopify_collections.py
 ```
 
 ## v1 Workflow

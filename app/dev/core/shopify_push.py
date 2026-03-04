@@ -13,8 +13,11 @@ from product_prospector.core.config_store import ShopifyConfig
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.product_model import Product
 from product_prospector.core.shopify_brand_metaobjects import resolve_brand_metaobject_gid
+from product_prospector.core.shopify_collections import (
+    resolve_collection_assignments,
+    resolve_collection_assignments_from_titles,
+)
 from product_prospector.core.shopify_fitment_vehicle_metaobjects import resolve_fitment_vehicle_metaobject_gids
-from product_prospector.core.shopify_ymm_tags import resolve_ymm_tags
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
 
@@ -63,25 +66,6 @@ def _to_weight_lb(value: object) -> float | None:
     if parsed <= 0:
         return None
     return parsed
-
-
-def _split_tags(value: object) -> list[str]:
-    if isinstance(value, list):
-        raw_items = [str(item) for item in value]
-    else:
-        raw_items = re.split(r"[|,;\n]+", _clean_text(value))
-    output: list[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        text = _clean_text(item)
-        if not text:
-            continue
-        lowered = text.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        output.append(text)
-    return output
 
 
 def _split_multi_value(value: object) -> list[str]:
@@ -552,7 +536,6 @@ def _resolve_primary_location_id(config: ShopifyConfig, access_token: str) -> tu
 def _build_product_payload(product: Product, vendor_override: str = "") -> dict:
     sku = normalize_sku(product.sku)
     title = _clean_text(product.title) or sku
-    tags = ", ".join(_split_tags(product.tags))
     vendor_value = _clean_text(vendor_override) or _clean_text(product.vendor)
     variant: dict[str, object] = {
         "sku": sku,
@@ -573,7 +556,6 @@ def _build_product_payload(product: Product, vendor_override: str = "") -> dict:
             "body_html": _clean_text(product.description_html),
             "vendor": vendor_value,
             "product_type": _clean_text(product.type),
-            "tags": tags,
             "status": "draft",
             "variants": [variant],
         }
@@ -650,6 +632,32 @@ def _set_inventory_available(
         path="/inventory_levels/set.json",
         payload=payload,
     )
+    return error
+
+
+def _add_product_to_collection(
+    config: ShopifyConfig,
+    access_token: str,
+    product_id: int,
+    collection_id: int,
+) -> str | None:
+    payload = {
+        "collect": {
+            "product_id": int(product_id),
+            "collection_id": int(collection_id),
+        }
+    }
+    _, error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="POST",
+        path="/collects.json",
+        payload=payload,
+    )
+    if not error:
+        return None
+    if "already exists" in error.lower():
+        return None
     return error
 
 
@@ -834,6 +842,7 @@ def push_new_products_as_drafts(
     existing_norm = {normalize_sku(value) for value in (existing_skus or set()) if normalize_sku(value)}
     location_id: int | None = None
     location_error: str | None = None
+    collection_mapping_missing_noted = False
 
     for index, product in enumerate(products, start=1):
         sku = normalize_sku(product.sku)
@@ -854,20 +863,6 @@ def push_new_products_as_drafts(
         if not title:
             summary.failed_by_sku[sku] = "Missing title."
             continue
-
-        # Always prefer resolved YMM tags so Product Organization tags stay fitment-driven.
-        resolved_tags, tag_warnings = resolve_ymm_tags(
-            application_text=_clean_text(product.application),
-            required_root=required_root,
-            title_text=title,
-            description_text=_clean_text(product.description_html),
-        )
-        if resolved_tags:
-            product.tags = resolved_tags
-        else:
-            product.tags = []
-            if tag_warnings:
-                summary.warnings.append(f"{sku}: YMM tags not set ({tag_warnings[0]})")
 
         raw_vendor_value = _clean_text(product.vendor)
         normalized_vendor_value = normalize_vendor_from_rules(raw_vendor_value, required_root=required_root) or raw_vendor_value
@@ -914,6 +909,40 @@ def push_new_products_as_drafts(
         except Exception:
             summary.failed_by_sku[sku] = "Shopify create succeeded but product id was missing."
             continue
+
+        manual_collections_text = _clean_text(getattr(product, "collections", ""))
+        if manual_collections_text:
+            collection_targets, collection_warnings = resolve_collection_assignments_from_titles(
+                collections_text=manual_collections_text,
+                required_root=required_root,
+            )
+        else:
+            collection_targets, collection_warnings = resolve_collection_assignments(
+                product_type=_clean_text(product.type),
+                application_text=_clean_text(product.application),
+                required_root=required_root,
+                title_text=_clean_text(product.title),
+                description_text=_clean_text(product.description_html),
+            )
+        for warning in collection_warnings:
+            if "mapping file not found or empty" in warning.lower():
+                if collection_mapping_missing_noted:
+                    continue
+                collection_mapping_missing_noted = True
+            summary.warnings.append(f"{sku}: collections not assigned ({warning})")
+        for target in collection_targets:
+            collection_id_text = _clean_text(target.get("collection_id", ""))
+            if not collection_id_text.isdigit():
+                continue
+            collection_title = _clean_text(target.get("collection_title", "")) or collection_id_text
+            collection_error = _add_product_to_collection(
+                config=config,
+                access_token=access_token,
+                product_id=product_id,
+                collection_id=int(collection_id_text),
+            )
+            if collection_error:
+                summary.warnings.append(f"{sku}: collection '{collection_title}' not assigned ({collection_error})")
 
         if publish_to_all_channels_enabled:
             product_gid = f"gid://shopify/Product/{product_id}"

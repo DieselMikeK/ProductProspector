@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 import queue
 from pathlib import Path
 import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
 
 import pandas as pd
@@ -47,6 +49,7 @@ from product_prospector.core.create_product_output import build_create_product_o
 from product_prospector.core.session_state import AppSession, MODE_NEW, MODE_UPDATE
 from product_prospector.core.shopify_catalog import fetch_shopify_catalog_dataframe
 from product_prospector.core.shopify_catalog import fetch_shopify_catalog_for_skus
+from product_prospector.core.shopify_collections import load_collection_records, resolve_collection_assignments
 from product_prospector.core.shopify_oauth import exchange_client_credentials_for_token, perform_oauth_handshake, validate_access_token
 from product_prospector.core.shopify_push import ShopifyDraftPushSummary, push_new_products_as_drafts
 from product_prospector.core.shopify_sku_cache import get_shopify_sku_cache_path, load_shopify_sku_cache, save_shopify_sku_cache
@@ -70,9 +73,9 @@ APP_WINDOW_MARGIN_PX = 64
 APP_MIN_WINDOW_WIDTH = 1080
 APP_MIN_WINDOW_HEIGHT = 680
 HEADER_LOGO_VERTICAL_CROP_TOP_PX = 80
-HEADER_LOGO_VERTICAL_CROP_BOTTOM_PX = 100
-HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 50
-HEADER_LOGO_VERTICAL_BOTTOM_PADDING_PX = 25
+HEADER_LOGO_VERTICAL_CROP_BOTTOM_PX = 40
+HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 25
+HEADER_LOGO_VERTICAL_BOTTOM_PADDING_PX = 0
 _SINGLE_INSTANCE_MUTEX = "Global\\ProductProspectorDesktopApp"
 _ERROR_ALREADY_EXISTS = 183
 INVENTORY_OWNER_VALUES = ["Andrew", "Alondra", "Mike K", "Michael V"]
@@ -88,6 +91,57 @@ DEFAULT_INVENTORY_OWNER = "Mike K"
 def _inventory_for_owner(owner_name: str) -> int:
     owner = str(owner_name or "").strip()
     return int(INVENTORY_BY_OWNER.get(owner, INVENTORY_BY_OWNER[DEFAULT_INVENTORY_OWNER]))
+
+
+def _normalize_url_for_open(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("www."):
+        return f"https://{text}"
+    if re.match(r"^https?://", text, flags=re.IGNORECASE):
+        return text
+    return ""
+
+
+def _open_url_in_chrome(url: str) -> bool:
+    target = _normalize_url_for_open(url)
+    if not target:
+        return False
+
+    if sys.platform == "win32":
+        local_app_data = Path(str(Path.home() / "AppData" / "Local"))
+        program_files = Path("C:/Program Files")
+        program_files_x86 = Path("C:/Program Files (x86)")
+        candidates = [
+            local_app_data / "Google/Chrome/Application/chrome.exe",
+            program_files / "Google/Chrome/Application/chrome.exe",
+            program_files_x86 / "Google/Chrome/Application/chrome.exe",
+        ]
+        for chrome_path in candidates:
+            if chrome_path.exists():
+                try:
+                    subprocess.Popen([str(chrome_path), target])
+                    return True
+                except Exception:
+                    continue
+        try:
+            subprocess.Popen(["chrome", target])
+            return True
+        except Exception:
+            pass
+
+    for binary in ["google-chrome", "chrome", "chromium", "chromium-browser"]:
+        try:
+            subprocess.Popen([binary, target])
+            return True
+        except Exception:
+            continue
+
+    try:
+        return bool(webbrowser.open(target, new=1, autoraise=True))
+    except Exception:
+        return False
 
 
 def _resolve_runtime_root() -> Path:
@@ -375,8 +429,18 @@ class ProductProspectorDesktopApp:
             "mpn": StringVar(value=""),
             "brand": StringVar(value=""),
             "application": StringVar(value=""),
+            "collections": StringVar(value=""),
             "core_charge_product_code": StringVar(value=""),
         }
+        self.review_collection_options: list[str] = []
+        self.review_collection_option_by_key: dict[str, str] = {}
+        self.review_collection_selected: list[str] = []
+        self.review_collections_query = StringVar(value="")
+        self.review_collections_tokens_wrap: tk.Frame | None = None
+        self.review_collections_entry: ttk.Entry | None = None
+        self.review_collections_suggestions_frame: ttk.Frame | None = None
+        self.review_collections_suggestions: tk.Listbox | None = None
+        self.review_collections_suggestion_values: list[str] = []
         self.review_index_text = StringVar(value="Product 0 / 0")
         self.review_cost_rule_text = StringVar(value="")
         self.review_cost_options: list[DiscountMatch] = []
@@ -407,10 +471,12 @@ class ProductProspectorDesktopApp:
         self._ui_task_queue: queue.Queue[tuple[object, tuple[object, ...], dict[str, object]]] = queue.Queue()
         self._ui_task_pump_job: str | None = None
         self._mousewheel_bindings_ready = False
+        self._review_collections_suggestion_hide_job: str | None = None
 
         self.run_mode.trace_add("write", self._on_run_mode_changed)
         self.inventory_owner.trace_add("write", self._on_inventory_owner_changed)
         self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
+        self._load_review_collection_options()
 
         self._create_layout()
         self._initialize_shopify_cache_state()
@@ -429,7 +495,7 @@ class ProductProspectorDesktopApp:
         root_frame.pack(fill=BOTH, expand=True)
 
         header_frame = ttk.Frame(root_frame)
-        header_frame.pack(fill=X, pady=(0, 6))
+        header_frame.pack(fill=X, pady=(0, 0))
         self._header_logo_label = ttk.Label(header_frame)
         self._header_logo_label.pack(
             anchor="center",
@@ -438,7 +504,7 @@ class ProductProspectorDesktopApp:
         self._load_initial_header_logo()
 
         api_frame = ttk.Frame(root_frame)
-        api_frame.pack(anchor="center", pady=(0, 8))
+        api_frame.pack(anchor="center", pady=(0, 0))
         ttk.Label(api_frame, text="API Connections:", font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 10))
         self.shopify_dot = Canvas(api_frame, width=16, height=16, highlightthickness=0, bd=0)
         self.shopify_dot.pack(side=LEFT)
@@ -1191,20 +1257,28 @@ class ProductProspectorDesktopApp:
         available = {
             normalize_sku(getattr(product, "sku", ""))
             for product in products
-            if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+            if normalize_sku(getattr(product, "sku", ""))
+            and not bool(getattr(product, "excluded", False))
+            and not bool(getattr(product, "remove_marked", False))
         }
         self.push_selected_skus = {sku for sku in self.push_selected_skus if sku in available}
 
         # Keep review grid lightweight to avoid UI lockups on large/long text payloads.
         rows: list[dict[str, str]] = []
-        for product in products[:80]:
+        display_products = products[:80]
+        for product in display_products:
             sku = normalize_sku(getattr(product, "sku", ""))
             excluded = bool(getattr(product, "excluded", False))
             exclusion_reason = str(getattr(product, "exclusion_reason", "") or "").strip()
+            remove_marked = bool(getattr(product, "remove_marked", False))
+            remove_reason = str(getattr(product, "remove_reason", "") or "").strip()
+            push_state = "[-]" if excluded else ("[ ]" if remove_marked else ("[x]" if sku and sku in self.push_selected_skus else "[ ]"))
             rows.append(
                 {
-                    "push": "[-]" if excluded else ("[x]" if sku and sku in self.push_selected_skus else "[ ]"),
+                    "push": push_state,
+                    "remove": "[x]" if remove_marked else "[ ]",
                     "sku": str(product.sku or ""),
+                    "product_url": str(getattr(product, "product_url", "") or ""),
                     "title": str(product.title or ""),
                     "price": str(product.price or ""),
                     "cost": str(product.cost or ""),
@@ -1215,11 +1289,30 @@ class ProductProspectorDesktopApp:
                     "product_subtype": str(product.product_subtype or ""),
                     "application": str(product.application or ""),
                     "scrape_status": str(product.scrape_status or ""),
-                    "status": exclusion_reason or "ready",
+                    "status": exclusion_reason or remove_reason or "ready",
                 }
             )
         df = pd.DataFrame(rows)
-        _tree_show_dataframe(self.review_table, df, max_rows=80, max_cell_chars=180)
+        _tree_show_dataframe(self.review_table, df, max_rows=80, max_cell_chars=3000)
+        if not df.empty:
+            try:
+                self.review_table.column("push", width=52, minwidth=52, stretch=False)
+                self.review_table.column("remove", width=68, minwidth=68, stretch=False)
+                self.review_table.column("product_url", width=320, minwidth=220, stretch=False)
+                self.review_table.tag_configure("gas_flag", background="#FDE2E1")
+                self.review_table.tag_configure("excluded", background="#F3F4F6", foreground="#6B7280")
+            except Exception:
+                pass
+
+            row_ids = self.review_table.get_children()
+            for idx, row_id in enumerate(row_ids):
+                if idx >= len(display_products):
+                    break
+                product = display_products[idx]
+                if bool(getattr(product, "excluded", False)):
+                    self.review_table.item(row_id, tags=("excluded",))
+                elif bool(getattr(product, "remove_recommended", False)):
+                    self.review_table.item(row_id, tags=("gas_flag",))
         self._highlight_review_table_current_product()
         self._refresh_push_button_state()
 
@@ -1231,6 +1324,30 @@ class ProductProspectorDesktopApp:
             if normalize_sku(getattr(product, "sku", "")) == normalized_target:
                 return index
         return None
+
+    def _find_product_by_sku(self, sku_value: str):
+        normalized_target = normalize_sku(sku_value)
+        if not normalized_target:
+            return None
+        for product in self.session.products or []:
+            if normalize_sku(getattr(product, "sku", "")) == normalized_target:
+                return product
+        return None
+
+    @staticmethod
+    def _tree_column_name(tree: ttk.Treeview, column_id: str) -> str:
+        if not column_id or not column_id.startswith("#"):
+            return ""
+        try:
+            index = int(column_id[1:]) - 1
+        except Exception:
+            return ""
+        if index < 0:
+            return ""
+        columns = list(tree["columns"])
+        if index >= len(columns):
+            return ""
+        return str(columns[index])
 
     def _highlight_review_table_current_product(self) -> None:
         if not hasattr(self, "review_table"):
@@ -1258,7 +1375,13 @@ class ProductProspectorDesktopApp:
 
     def _toggle_review_table_push_selection(self) -> None:
         products = self.session.products or []
-        available = {normalize_sku(getattr(product, "sku", "")) for product in products if normalize_sku(getattr(product, "sku", ""))}
+        available = {
+            normalize_sku(getattr(product, "sku", ""))
+            for product in products
+            if normalize_sku(getattr(product, "sku", ""))
+            and not bool(getattr(product, "excluded", False))
+            and not bool(getattr(product, "remove_marked", False))
+        }
         if not available:
             self.push_selected_skus = set()
             self._refresh_review_table_async()
@@ -1268,6 +1391,31 @@ class ProductProspectorDesktopApp:
             self.push_selected_skus = set()
         else:
             self.push_selected_skus = set(available)
+        self._refresh_review_table_async()
+
+    def _toggle_review_table_remove_selection(self) -> None:
+        products = self.session.products or []
+        removable = [
+            product
+            for product in products
+            if normalize_sku(getattr(product, "sku", ""))
+            and not bool(getattr(product, "excluded", False))
+        ]
+        if not removable:
+            self._refresh_review_table_async()
+            return
+
+        marked_count = sum(1 for product in removable if bool(getattr(product, "remove_marked", False)))
+        mark_all = marked_count != len(removable)
+        removed_from_push: set[str] = set()
+        for product in removable:
+            product.remove_marked = mark_all
+            if mark_all:
+                sku_value = normalize_sku(getattr(product, "sku", ""))
+                if sku_value:
+                    removed_from_push.add(sku_value)
+        if removed_from_push:
+            self.push_selected_skus = {sku for sku in self.push_selected_skus if sku not in removed_from_push}
         self._refresh_review_table_async()
 
     def _lock_run_mode(self) -> None:
@@ -1434,6 +1582,7 @@ class ProductProspectorDesktopApp:
         self._review_entry_row(form_grid, "Brand", "brand", 6, 2)
         self._review_entry_row(form_grid, "Application", "application", 7, 2)
         self._review_entry_row(form_grid, "Core Charge Code", "core_charge_product_code", 8, 2)
+        self._review_collections_row(form_grid, 9, 2)
 
         table_wrap = ttk.LabelFrame(self.export_inner, text="All Products", padding=8)
         table_wrap.pack(fill=BOTH, expand=True)
@@ -1444,7 +1593,12 @@ class ProductProspectorDesktopApp:
         ttk.Button(table_action_row, text="Load All Products Preview", command=self._refresh_review_table_async).pack(side=LEFT)
         ttk.Button(table_action_row, text="Select All for Push", command=self._select_all_for_push).pack(side=LEFT, padx=(8, 0))
         ttk.Button(table_action_row, text="Clear Push Selection", command=self._clear_push_selection).pack(side=LEFT, padx=(8, 0))
-        ttk.Label(table_action_row, text="Click the [x]/[ ] cell in the Push column to toggle rows.", foreground="#1f4e79").pack(side=LEFT, padx=(10, 0))
+        ttk.Button(table_action_row, text="Remove Marked", command=self._remove_marked_products).pack(side=LEFT, padx=(8, 0))
+        ttk.Label(
+            table_action_row,
+            text="Click the [x]/[ ] cell in Push or Remove to toggle rows.",
+            foreground="#1f4e79",
+        ).pack(side=LEFT, padx=(10, 0))
 
         remap_wrap = ttk.LabelFrame(self.export_inner, text="Remap Fields (Optional)", padding=8)
         remap_wrap.pack(fill=X, pady=(8, 0))
@@ -1560,6 +1714,325 @@ class ProductProspectorDesktopApp:
             pady=2,
         )
 
+    @staticmethod
+    def _collection_title_key(value: str) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _load_review_collection_options(self) -> None:
+        records = load_collection_records(required_root=self.required_root)
+        titles: list[str] = []
+        title_by_key: dict[str, str] = {}
+        for record in records:
+            title = str((record or {}).get("collection_title", "") or "").strip()
+            key = self._collection_title_key(title)
+            if not title or not key or key in title_by_key:
+                continue
+            title_by_key[key] = title
+            titles.append(title)
+        titles.sort(key=lambda item: item.lower())
+        self.review_collection_options = titles
+        self.review_collection_option_by_key = title_by_key
+
+    @staticmethod
+    def _collection_titles_text_from_targets(targets: list[dict]) -> str:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for target in targets:
+            title = str((target or {}).get("collection_title", "") or "").strip()
+            key = re.sub(r"\s+", " ", title).strip().lower()
+            if not title or not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(title)
+        return ", ".join(ordered)
+
+    def _review_collections_row(self, parent, row: int, col_offset: int) -> None:
+        ttk.Label(parent, text="Collections", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
+        frame.columnconfigure(0, weight=1)
+
+        tokens_wrap = tk.Frame(frame, bg="#F8FAFC", highlightthickness=1, highlightbackground="#CBD5E1", bd=0)
+        tokens_wrap.grid(row=0, column=0, sticky="ew")
+        self.review_collections_tokens_wrap = tokens_wrap
+
+        entry = ttk.Entry(frame, textvariable=self.review_collections_query)
+        entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        entry.bind("<KeyRelease>", self._on_review_collections_entry_keyrelease, add="+")
+        entry.bind("<Return>", self._on_review_collections_entry_return, add="+")
+        entry.bind("<Down>", self._on_review_collections_entry_down, add="+")
+        entry.bind("<Escape>", self._on_review_collections_entry_escape, add="+")
+        entry.bind("<FocusOut>", self._on_review_collections_entry_focus_out, add="+")
+        self.review_collections_entry = entry
+
+        suggestions_frame = ttk.Frame(frame)
+        suggestions_frame.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        suggestions_frame.columnconfigure(0, weight=1)
+        suggestions = tk.Listbox(suggestions_frame, height=6, activestyle="none", exportselection=False)
+        suggestions.grid(row=0, column=0, sticky="ew")
+        suggestions_scroll = ttk.Scrollbar(suggestions_frame, orient=VERTICAL, command=suggestions.yview)
+        suggestions_scroll.grid(row=0, column=1, sticky="ns")
+        suggestions.configure(yscrollcommand=suggestions_scroll.set)
+        suggestions.bind("<ButtonRelease-1>", self._on_review_collections_suggestion_activate, add="+")
+        suggestions.bind("<Double-1>", self._on_review_collections_suggestion_activate, add="+")
+        suggestions.bind("<Return>", self._on_review_collections_suggestion_activate, add="+")
+        suggestions.bind("<Escape>", self._on_review_collections_entry_escape, add="+")
+        suggestions.bind("<FocusOut>", self._on_review_collections_entry_focus_out, add="+")
+        suggestions_frame.grid_remove()
+        self.review_collections_suggestions_frame = suggestions_frame
+        self.review_collections_suggestions = suggestions
+        self.review_collections_suggestion_values = []
+        self._refresh_review_collection_chips()
+
+    def _selected_collection_keys(self) -> set[str]:
+        return {self._collection_title_key(item) for item in self.review_collection_selected if self._collection_title_key(item)}
+
+    def _sync_review_collections_field(self) -> None:
+        value = ", ".join(self.review_collection_selected)
+        self.review_fields["collections"].set(value)
+
+    def _set_review_collections_from_text(self, text: str) -> None:
+        values: list[str] = []
+        seen: set[str] = set()
+        for raw in re.split(r"[,\n]+", str(text or "")):
+            title = raw.strip()
+            if not title:
+                continue
+            canonical = self.review_collection_option_by_key.get(self._collection_title_key(title), title)
+            key = self._collection_title_key(canonical)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            values.append(canonical)
+        self.review_collection_selected = values
+        self._sync_review_collections_field()
+        self._refresh_review_collection_chips()
+        self._hide_review_collections_suggestions()
+        self.review_collections_query.set("")
+
+    def _remove_review_collection_token(self, title: str) -> None:
+        key = self._collection_title_key(title)
+        if not key:
+            return
+        self.review_collection_selected = [
+            item for item in self.review_collection_selected if self._collection_title_key(item) != key
+        ]
+        self._sync_review_collections_field()
+        self._refresh_review_collection_chips()
+        self._refresh_review_collections_suggestions()
+
+    def _add_review_collection_token(self, title: str) -> None:
+        canonical = self.review_collection_option_by_key.get(self._collection_title_key(title), title)
+        key = self._collection_title_key(canonical)
+        if not key:
+            return
+        if key in self._selected_collection_keys():
+            self.review_collections_query.set("")
+            self._hide_review_collections_suggestions()
+            return
+        self.review_collection_selected.append(canonical)
+        self._sync_review_collections_field()
+        self._refresh_review_collection_chips()
+        self.review_collections_query.set("")
+        self._hide_review_collections_suggestions()
+
+    def _refresh_review_collection_chips(self) -> None:
+        wrap = self.review_collections_tokens_wrap
+        if wrap is None:
+            return
+        for child in list(wrap.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        if not self.review_collection_selected:
+            hint = tk.Label(
+                wrap,
+                text="Start typing to search collections...",
+                bg="#F8FAFC",
+                fg="#64748B",
+                anchor="w",
+            )
+            hint.pack(fill=X, padx=8, pady=6)
+            return
+
+        for title in self.review_collection_selected:
+            key = self._collection_title_key(title)
+            is_known = key in self.review_collection_option_by_key
+            chip_bg = "#DBEAFE" if is_known else "#FEE2E2"
+            chip_fg = "#1E3A8A" if is_known else "#991B1B"
+            chip = tk.Frame(wrap, bg=chip_bg, highlightthickness=1, highlightbackground="#93C5FD", bd=0)
+            chip.pack(fill=X, padx=6, pady=3)
+            label = tk.Label(chip, text=title, bg=chip_bg, fg=chip_fg, anchor="w")
+            label.pack(side=LEFT, fill=X, expand=True, padx=(8, 6), pady=4)
+            remove = tk.Button(
+                chip,
+                text="x",
+                command=lambda value=title: self._remove_review_collection_token(value),
+                bg=chip_bg,
+                fg=chip_fg,
+                activebackground=chip_bg,
+                activeforeground=chip_fg,
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=6,
+                pady=0,
+                cursor="hand2",
+            )
+            remove.pack(side=RIGHT, padx=(0, 6), pady=2)
+
+    def _review_collection_matches(self, query: str) -> list[str]:
+        text = str(query or "").strip().lower()
+        if not text:
+            return []
+        selected_keys = self._selected_collection_keys()
+        starts: list[str] = []
+        contains: list[str] = []
+        for option in self.review_collection_options:
+            key = self._collection_title_key(option)
+            if key in selected_keys:
+                continue
+            option_low = option.lower()
+            if option_low.startswith(text):
+                starts.append(option)
+            elif text in option_low:
+                contains.append(option)
+        return [*starts, *contains]
+
+    def _show_review_collections_suggestions(self, values: list[str]) -> None:
+        frame = self.review_collections_suggestions_frame
+        listbox = self.review_collections_suggestions
+        if frame is None or listbox is None:
+            return
+        listbox.delete(0, END)
+        for value in values:
+            listbox.insert(END, value)
+        self.review_collections_suggestion_values = list(values)
+        if values:
+            frame.grid()
+            try:
+                listbox.selection_clear(0, END)
+                listbox.selection_set(0)
+                listbox.activate(0)
+            except Exception:
+                pass
+        else:
+            frame.grid_remove()
+
+    def _hide_review_collections_suggestions(self) -> None:
+        if self._review_collections_suggestion_hide_job is not None:
+            try:
+                self.root.after_cancel(self._review_collections_suggestion_hide_job)
+            except Exception:
+                pass
+            self._review_collections_suggestion_hide_job = None
+        if self.review_collections_suggestions_frame is not None:
+            self.review_collections_suggestions_frame.grid_remove()
+        self.review_collections_suggestion_values = []
+
+    def _refresh_review_collections_suggestions(self) -> None:
+        query = self.review_collections_query.get().strip().strip(",")
+        if not query:
+            self._hide_review_collections_suggestions()
+            return
+        matches = self._review_collection_matches(query)[:30]
+        self._show_review_collections_suggestions(matches)
+
+    def _commit_review_collection_query(self) -> bool:
+        raw = self.review_collections_query.get().strip()
+        query = raw.rstrip(",").strip()
+        if not query:
+            self.review_collections_query.set("")
+            self._hide_review_collections_suggestions()
+            return False
+        exact = self.review_collection_option_by_key.get(self._collection_title_key(query), "")
+        if exact:
+            self._add_review_collection_token(exact)
+            self.review_status_text.set(f"Added collection: {exact}")
+            return True
+        matches = self._review_collection_matches(query)
+        if len(matches) == 1:
+            self._add_review_collection_token(matches[0])
+            self.review_status_text.set(f"Added collection: {matches[0]}")
+            return True
+        self.review_status_text.set("Select a collection from the autocomplete list to avoid creating wrong names.")
+        self._refresh_review_collections_suggestions()
+        return False
+
+    def _on_review_collections_entry_keyrelease(self, event=None):
+        key = str(getattr(event, "keysym", "") or "")
+        if key in {"Return", "Up", "Down", "Escape", "Tab"}:
+            return
+        char = str(getattr(event, "char", "") or "")
+        if char == ",":
+            self._commit_review_collection_query()
+            return "break"
+        self._refresh_review_collections_suggestions()
+
+    def _on_review_collections_entry_return(self, _event=None):
+        listbox = self.review_collections_suggestions
+        frame = self.review_collections_suggestions_frame
+        if listbox is not None and frame is not None and bool(frame.winfo_ismapped()):
+            selection = listbox.curselection()
+            if selection:
+                index = int(selection[0])
+                if 0 <= index < len(self.review_collections_suggestion_values):
+                    self._add_review_collection_token(self.review_collections_suggestion_values[index])
+                    return "break"
+        self._commit_review_collection_query()
+        return "break"
+
+    def _on_review_collections_entry_down(self, _event=None):
+        listbox = self.review_collections_suggestions
+        frame = self.review_collections_suggestions_frame
+        if listbox is None or frame is None:
+            return
+        if not bool(frame.winfo_ismapped()):
+            self._refresh_review_collections_suggestions()
+        if bool(frame.winfo_ismapped()):
+            try:
+                listbox.focus_set()
+                if not listbox.curselection() and self.review_collections_suggestion_values:
+                    listbox.selection_set(0)
+                    listbox.activate(0)
+            except Exception:
+                pass
+            return "break"
+        return None
+
+    def _on_review_collections_entry_escape(self, _event=None):
+        self._hide_review_collections_suggestions()
+        return "break"
+
+    def _on_review_collections_entry_focus_out(self, _event=None):
+        if self._review_collections_suggestion_hide_job is not None:
+            try:
+                self.root.after_cancel(self._review_collections_suggestion_hide_job)
+            except Exception:
+                pass
+        self._review_collections_suggestion_hide_job = self.root.after(120, self._hide_review_collections_suggestions)
+
+    def _on_review_collections_suggestion_activate(self, _event=None):
+        listbox = self.review_collections_suggestions
+        if listbox is None:
+            return "break"
+        selection = listbox.curselection()
+        if not selection:
+            return "break"
+        index = int(selection[0])
+        if 0 <= index < len(self.review_collections_suggestion_values):
+            self._add_review_collection_token(self.review_collections_suggestion_values[index])
+            if self.review_collections_entry is not None:
+                try:
+                    self.review_collections_entry.focus_set()
+                except Exception:
+                    pass
+        return "break"
+
     def _review_cost_row(self, parent, row: int, col_offset: int) -> None:
         ttk.Label(parent, text="Cost", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
         frame = ttk.Frame(parent)
@@ -1576,6 +2049,14 @@ class ProductProspectorDesktopApp:
         self.review_cost_rule_combo.bind("<Button-1>", self._on_review_cost_dropdown_open, add="+")
         self.review_cost_rule_combo.configure(values=())
         self.review_cost_rule_combo.configure(state="disabled")
+        self.review_cost_apply_all_btn = ttk.Button(
+            frame,
+            text="v",
+            width=2,
+            command=self._apply_review_cost_rule_to_all_products,
+        )
+        self.review_cost_apply_all_btn.grid(row=0, column=2, sticky=W, padx=(6, 0))
+        self.review_cost_apply_all_btn.configure(state="disabled")
 
     def _parse_float_value(self, value: object) -> float | None:
         text = str(value or "").strip()
@@ -1642,12 +2123,16 @@ class ProductProspectorDesktopApp:
 
         if option_labels:
             self.review_cost_rule_combo.configure(state="readonly")
+            if hasattr(self, "review_cost_apply_all_btn"):
+                self.review_cost_apply_all_btn.configure(state="normal")
             if self.review_cost_rule_text.get() not in option_labels:
                 self.review_cost_rule_text.set(vendor_label)
             return
 
         self.review_cost_rule_text.set(vendor_label)
         self.review_cost_rule_combo.configure(state="disabled")
+        if hasattr(self, "review_cost_apply_all_btn"):
+            self.review_cost_apply_all_btn.configure(state="disabled")
 
     def _on_review_cost_rule_selected(self, _event=None) -> None:
         selected = self.review_cost_rule_text.get().strip()
@@ -1662,6 +2147,48 @@ class ProductProspectorDesktopApp:
         self.review_fields["cost"].set(f"{cost_value:.2f}")
         self.review_status_text.set(
             f"Applied discount {option.discount_percent:.2f}% from '{selected}' to calculate cost."
+        )
+
+    def _apply_review_cost_rule_to_all_products(self) -> None:
+        if not self.session.products:
+            return
+
+        self._on_review_cost_dropdown_open()
+        selected = self.review_cost_rule_text.get().strip()
+        option = self.review_cost_option_map.get(selected)
+        if option is None:
+            messagebox.showwarning(APP_TITLE, "Select a discount rule first, then use the down-arrow apply-all button.")
+            return
+
+        self._save_current_review_product()
+        updated = 0
+        skipped = 0
+        for product in self.session.products:
+            price_value = self._parse_float_value(getattr(product, "price", ""))
+            if price_value is None:
+                skipped += 1
+                continue
+            cost_value = calculate_cost_from_price(price=price_value, discount_percent=option.discount_percent)
+            product.cost = f"{cost_value:.2f}"
+            if isinstance(getattr(product, "field_sources", None), dict):
+                product.field_sources["cost"] = "review_discount_apply_all"
+            if isinstance(getattr(product, "field_status", None), dict):
+                product.field_status["cost"] = "ok"
+            updated += 1
+
+        if 0 <= self.review_index < len(self.session.products):
+            current_product = self.session.products[self.review_index]
+            self.review_fields["cost"].set(str(getattr(current_product, "cost", "") or ""))
+
+        self._schedule_review_table_refresh()
+        if updated <= 0:
+            self.review_status_text.set("No costs updated: all rows are missing valid prices.")
+            messagebox.showwarning(APP_TITLE, "No costs updated because prices are blank/invalid for all rows.")
+            return
+
+        suffix = f", skipped {skipped} with blank/invalid price" if skipped else ""
+        self.review_status_text.set(
+            f"Applied {option.discount_percent:.2f}% ('{selected}') to all products: updated {updated}{suffix}."
         )
 
     def _on_review_cost_dropdown_open(self, _event=None) -> None:
@@ -1680,6 +2207,7 @@ class ProductProspectorDesktopApp:
             "description_html": 4000,
             "media_urls": 2500,
             "application": 2000,
+            "collections": 2000,
         }
         limit = limits.get(field_name)
         if limit is None:
@@ -1689,6 +2217,8 @@ class ProductProspectorDesktopApp:
         return raw_value[:limit] + " ... [truncated for display]", True
 
     def _read_review_field(self, field_name: str) -> str:
+        if field_name == "collections":
+            return self.review_fields["collections"].get().strip()
         current = self.review_fields[field_name].get().strip()
         if self.review_loaded_truncated.get(field_name):
             displayed = self.review_loaded_display.get(field_name, "").strip()
@@ -1894,6 +2424,19 @@ class ProductProspectorDesktopApp:
                         product=normalized,
                         allow_category_overwrite=allow_category_overwrite,
                     )
+                # Recalculate default collections after final type/application mapping so review loads pre-populated.
+                existing_collections = str(getattr(normalized, "collections", "") or "").strip()
+                if self.session.mode == MODE_NEW and not existing_collections:
+                    collection_targets, _collection_warnings = resolve_collection_assignments(
+                        product_type=str(getattr(normalized, "type", "") or ""),
+                        application_text=str(getattr(normalized, "application", "") or ""),
+                        required_root=self.required_root,
+                        title_text=str(getattr(normalized, "title", "") or ""),
+                        description_text=str(getattr(normalized, "description_html", "") or ""),
+                    )
+                    auto_collections = self._collection_titles_text_from_targets(collection_targets)
+                    if auto_collections:
+                        normalized.collections = auto_collections
                 normalized.finalize_defaults()
                 normalized_products.append(normalized)
 
@@ -1955,7 +2498,9 @@ class ProductProspectorDesktopApp:
             self.push_selected_skus = {
                 normalize_sku(getattr(product, "sku", ""))
                 for product in normalized_products
-                if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+                if normalize_sku(getattr(product, "sku", ""))
+                and not bool(getattr(product, "excluded", False))
+                and not bool(getattr(product, "remove_marked", False))
             }
             self.session.processing_complete = True
             self._update_tab_access()
@@ -1969,7 +2514,11 @@ class ProductProspectorDesktopApp:
             rows_skipped_no_shopify_match = int(getattr(build_stats, "rows_skipped_no_shopify_match", 0))
             rows_skipped_missing_sku = int(getattr(build_stats, "rows_skipped_missing_sku", 0))
             rows_flagged_gas = int(getattr(build_stats, "rows_flagged_gas", 0))
-            eligible_products = sum(1 for product in normalized_products if not bool(getattr(product, "excluded", False)))
+            eligible_products = sum(
+                1
+                for product in normalized_products
+                if not bool(getattr(product, "excluded", False)) and not bool(getattr(product, "remove_marked", False))
+            )
             status_parts = [
                 f"Processing Complete - {len(normalized_products)} products processed.",
                 f"Rows considered: {rows_considered}",
@@ -1980,7 +2529,7 @@ class ProductProspectorDesktopApp:
             if rows_skipped_missing_sku:
                 status_parts.append(f"Skipped (missing SKU): {rows_skipped_missing_sku}")
             if rows_flagged_gas:
-                status_parts.append(f"Excluded (gas-only): {rows_flagged_gas}")
+                status_parts.append(f"Flagged possible gas/passenger (remove suggested): {rows_flagged_gas}")
 
             if self.session.missing_fields:
                 status_parts.append(f"Missing fields: {', '.join(self.session.missing_fields)}")
@@ -2136,12 +2685,15 @@ class ProductProspectorDesktopApp:
             self.review_index_text.set("Product 0 / 0")
             for var in self.review_fields.values():
                 var.set("")
+            self._set_review_collections_from_text("")
             self.review_cost_rule_text.set("")
             self.review_cost_options = []
             self.review_cost_option_map = {}
             if hasattr(self, "review_cost_rule_combo"):
                 self.review_cost_rule_combo.configure(values=())
                 self.review_cost_rule_combo.configure(state="disabled")
+            if hasattr(self, "review_cost_apply_all_btn"):
+                self.review_cost_apply_all_btn.configure(state="disabled")
             self._cancel_review_table_refresh()
             _tree_show_dataframe(self.review_table, pd.DataFrame())
             self.review_loaded_raw = {}
@@ -2172,6 +2724,7 @@ class ProductProspectorDesktopApp:
             self.review_loaded_display[field_name] = display
             self.review_loaded_truncated[field_name] = truncated
             var.set(display)
+        self._set_review_collections_from_text(self.review_loaded_raw.get("collections", ""))
         self.review_cost_option_map = {}
         self.review_cost_options = []
         self.review_cost_options_loaded_for_sku = ""
@@ -2179,6 +2732,8 @@ class ProductProspectorDesktopApp:
         if hasattr(self, "review_cost_rule_combo"):
             self.review_cost_rule_combo.configure(values=())
             self.review_cost_rule_combo.configure(state="readonly")
+        if hasattr(self, "review_cost_apply_all_btn"):
+            self.review_cost_apply_all_btn.configure(state="disabled")
         self.review_cost_rule_text.set(vendor_label)
         self.review_index_text.set(f"Product {index + 1} / {len(self.session.products)}")
         self._highlight_review_table_current_product()
@@ -2213,6 +2768,7 @@ class ProductProspectorDesktopApp:
         product.mpn = self._read_review_field("mpn")
         product.brand = self._read_review_field("brand")
         product.application = self._read_review_field("application")
+        product.collections = self._read_review_field("collections")
         product.core_charge_product_code = self._read_review_field("core_charge_product_code")
         product.finalize_defaults()
         self.review_status_text.set(f"Saved product {self.review_index + 1}.")
@@ -2230,7 +2786,11 @@ class ProductProspectorDesktopApp:
         self._load_review_product(self.review_index + 1)
 
     def _export_review_products(self) -> None:
-        export_products = [product for product in (self.session.products or []) if not bool(getattr(product, "excluded", False))]
+        export_products = [
+            product
+            for product in (self.session.products or [])
+            if not bool(getattr(product, "excluded", False)) and not bool(getattr(product, "remove_marked", False))
+        ]
         df = products_to_dataframe(export_products)
         if df.empty:
             messagebox.showinfo(APP_TITLE, "No processed products to export.")
@@ -2258,7 +2818,9 @@ class ProductProspectorDesktopApp:
         eligible_count = sum(
             1
             for product in (self.session.products or [])
-            if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+            if normalize_sku(getattr(product, "sku", ""))
+            and not bool(getattr(product, "excluded", False))
+            and not bool(getattr(product, "remove_marked", False))
         )
         if eligible_count <= 0:
             self.push_shopify_btn.configure(state="disabled")
@@ -2283,7 +2845,9 @@ class ProductProspectorDesktopApp:
         products = [
             product
             for product in list(self.session.products or [])
-            if normalize_sku(getattr(product, "sku", "")) in selected and not bool(getattr(product, "excluded", False))
+            if normalize_sku(getattr(product, "sku", "")) in selected
+            and not bool(getattr(product, "excluded", False))
+            and not bool(getattr(product, "remove_marked", False))
         ]
         if not products:
             messagebox.showwarning(APP_TITLE, "No selected rows to push. Check [x] next to at least one product.")
@@ -2431,7 +2995,9 @@ class ProductProspectorDesktopApp:
         self.push_selected_skus = {
             normalize_sku(getattr(product, "sku", ""))
             for product in products
-            if normalize_sku(getattr(product, "sku", "")) and not bool(getattr(product, "excluded", False))
+            if normalize_sku(getattr(product, "sku", ""))
+            and not bool(getattr(product, "excluded", False))
+            and not bool(getattr(product, "remove_marked", False))
         }
         self._refresh_review_table_async()
 
@@ -2439,26 +3005,107 @@ class ProductProspectorDesktopApp:
         self.push_selected_skus = set()
         self._refresh_review_table_async()
 
+    def _remove_marked_products(self) -> None:
+        products = list(self.session.products or [])
+        if not products:
+            return
+
+        self._save_current_review_product()
+        removed_count = 0
+        removed_skus: list[str] = []
+        remaining_products: list = []
+        for product in products:
+            if bool(getattr(product, "remove_marked", False)):
+                removed_count += 1
+                sku_value = normalize_sku(getattr(product, "sku", "")) or str(getattr(product, "sku", "")).strip()
+                if sku_value:
+                    removed_skus.append(sku_value)
+                continue
+            remaining_products.append(product)
+
+        if removed_count <= 0:
+            self.review_status_text.set("No rows are marked for removal.")
+            return
+
+        self.session.products = remaining_products
+        available = {
+            normalize_sku(getattr(product, "sku", ""))
+            for product in remaining_products
+            if normalize_sku(getattr(product, "sku", ""))
+            and not bool(getattr(product, "excluded", False))
+            and not bool(getattr(product, "remove_marked", False))
+        }
+        self.push_selected_skus = {sku for sku in self.push_selected_skus if sku in available}
+
+        if not self.session.products:
+            self._refresh_review_tab()
+            self._refresh_push_button_state()
+            self.review_status_text.set(f"Removed {removed_count} marked product(s).")
+            return
+
+        self.review_index = max(0, min(self.review_index, len(self.session.products) - 1))
+        self._load_review_product(self.review_index)
+        self._refresh_review_table_async()
+        self._refresh_push_button_state()
+        preview = ", ".join(removed_skus[:4])
+        more = "" if removed_count <= 4 else f", +{removed_count - 4} more"
+        if preview:
+            self.review_status_text.set(f"Removed {removed_count} marked product(s): {preview}{more}")
+        else:
+            self.review_status_text.set(f"Removed {removed_count} marked product(s).")
+
     def _on_review_table_click(self, event) -> None:
         if not self.session.products:
             return
         tree = self.review_table
         region = tree.identify_region(event.x, event.y)
+        column_id = tree.identify_column(event.x)
+        column_name = self._tree_column_name(tree, column_id)
         if region == "heading":
-            column_id = tree.identify_column(event.x)
-            if column_id == "#1":
+            if column_name == "push":
                 self._toggle_review_table_push_selection()
+                return "break"
+            if column_name == "remove":
+                self._toggle_review_table_remove_selection()
                 return "break"
             return
 
         row_id = tree.identify_row(event.y)
-        column_id = tree.identify_column(event.x)
         if not row_id:
             return
         sku_value = normalize_sku(tree.set(row_id, "sku"))
         if not sku_value:
             return
-        if column_id != "#1":
+        if column_name == "product_url":
+            product = self._find_product_by_sku(sku_value)
+            url_value = _normalize_url_for_open(str(getattr(product, "product_url", "") or "")) if product else ""
+            if not url_value:
+                self.review_status_text.set(f"No product URL available for {sku_value}.")
+                return "break"
+            if _open_url_in_chrome(url_value):
+                self.review_status_text.set(f"Opened URL for {sku_value} in browser.")
+            else:
+                self.review_status_text.set(f"Could not open URL for {sku_value}.")
+            return "break"
+
+        if column_name == "remove":
+            selected_product = self._find_product_by_sku(sku_value)
+            if selected_product is None:
+                return "break"
+            selected_product.remove_marked = not bool(getattr(selected_product, "remove_marked", False))
+            if bool(getattr(selected_product, "remove_marked", False)):
+                self.push_selected_skus.discard(sku_value)
+                reason = str(getattr(selected_product, "remove_reason", "") or "").strip()
+                if reason:
+                    self.review_status_text.set(f"Marked {sku_value} for removal. {reason}")
+                else:
+                    self.review_status_text.set(f"Marked {sku_value} for removal.")
+            else:
+                self.review_status_text.set(f"Unmarked {sku_value} for removal.")
+            self._refresh_review_table_async()
+            return "break"
+
+        if column_name != "push":
             target_index = self._find_product_index_by_sku(sku_value)
             if target_index is None:
                 return
@@ -2475,6 +3122,9 @@ class ProductProspectorDesktopApp:
                 break
         if selected_product is not None and bool(getattr(selected_product, "excluded", False)):
             self.review_status_text.set(str(getattr(selected_product, "exclusion_reason", "") or "Excluded from push/export"))
+            return "break"
+        if selected_product is not None and bool(getattr(selected_product, "remove_marked", False)):
+            self.review_status_text.set("Marked for removal. Uncheck Remove before selecting Push.")
             return "break"
         if sku_value in self.push_selected_skus:
             self.push_selected_skus.remove(sku_value)

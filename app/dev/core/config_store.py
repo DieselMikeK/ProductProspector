@@ -68,6 +68,7 @@ class AppSettings:
     carry_down_sku: bool = True
     propose_title_year_update: bool = True
     only_rows_with_year_changes: bool = True
+    inventory_owner: str = "Mike K"
 
 
 @dataclass
@@ -104,6 +105,7 @@ def load_app_settings() -> AppSettings:
         carry_down_sku=bool(raw.get("carry_down_sku", True)),
         propose_title_year_update=bool(raw.get("propose_title_year_update", True)),
         only_rows_with_year_changes=bool(raw.get("only_rows_with_year_changes", True)),
+        inventory_owner=str(raw.get("inventory_owner", "Mike K")),
     )
 
 
@@ -116,6 +118,7 @@ def save_app_settings(settings: AppSettings) -> None:
                 "carry_down_sku": settings.carry_down_sku,
                 "propose_title_year_update": settings.propose_title_year_update,
                 "only_rows_with_year_changes": settings.only_rows_with_year_changes,
+                "inventory_owner": settings.inventory_owner,
             },
             indent=2,
         ),

@@ -294,20 +294,10 @@ def _default_explicit_hints() -> list[ExplicitHint]:
     ]
 
 
-def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
-    candidates = [
-        rules_root / "type_mapping_hints.csv",
-        rules_root / "type_mapping_hints.xlsx",
-    ]
-    table = pd.DataFrame()
-    for path in candidates:
-        if not path.exists():
-            continue
-        table = _read_raw_table(path)
-        break
-
+def _load_explicit_hints_from_path(path: Path) -> list[ExplicitHint]:
+    table = _read_raw_table(path)
     if table.empty:
-        return _default_explicit_hints()
+        return []
 
     header_values = [_clean_text(value).lower() for value in table.iloc[0].tolist()]
     has_named_header = "pattern" in header_values and "category" in header_values
@@ -336,6 +326,34 @@ def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
             return True
         return text not in {"0", "false", "no", "off", "disabled", "disable"}
 
+    def _is_vendor_specific_hint(scope_value: str, notes_value: str) -> bool:
+        scope_text = _clean_text(scope_value).lower()
+        notes_text = _clean_text(notes_value).lower()
+        joined = " ".join(part for part in [scope_text, notes_text] if part)
+        if not joined:
+            return False
+        vendor_markers = [
+            "vendor-specific",
+            "vendor specific",
+            "vendor_only",
+            "vendor-only",
+            "vendor scoped",
+            "vendor-scoped",
+            "per vendor",
+            "per-vendor",
+            "vendor_specific",
+        ]
+        global_markers = [
+            "global",
+            "all vendors",
+            "all-vendors",
+            "catalog-wide",
+            "catalog wide",
+        ]
+        if not any(marker in joined for marker in vendor_markers):
+            return False
+        return not any(marker in joined for marker in global_markers)
+
     hints: list[ExplicitHint] = []
     for _, row in table.iterrows():
         pattern = _value(row, ["pattern", "col_0"])
@@ -343,7 +361,11 @@ def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
         subtype = _value(row, ["subtype", "product_subtype", "col_2"])
         google_leaf = _value(row, ["google_leaf", "google_product_type", "col_3"])
         enabled_value = _value(row, ["enabled", "active", "col_4"])
+        scope_value = _value(row, ["scope", "mapping_scope", "rule_scope", "hint_scope"])
+        notes_value = _value(row, ["notes", "note", "source", "col_5", "col_6"])
         if not _enabled(enabled_value):
+            continue
+        if _is_vendor_specific_hint(scope_value, notes_value):
             continue
         if not pattern or not category:
             continue
@@ -355,8 +377,37 @@ def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
                 google_leaf=google_leaf,
             )
         )
+    return hints
 
-    return hints or _default_explicit_hints()
+
+def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
+    candidate_groups = [
+        [
+            rules_root / "type_mapping_custom_hints.csv",
+            rules_root / "type_mapping_custom_hints.xlsx",
+        ],
+        [
+            rules_root / "type_mapping_hints.csv",
+            rules_root / "type_mapping_hints.xlsx",
+        ],
+    ]
+    merged_hints: list[ExplicitHint] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for group in candidate_groups:
+        selected_path: Path | None = None
+        for path in group:
+            if path.exists():
+                selected_path = path
+                break
+        if selected_path is None:
+            continue
+        for hint in _load_explicit_hints_from_path(selected_path):
+            key = (hint.pattern, hint.category, hint.subtype, hint.google_leaf)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_hints.append(hint)
+    return merged_hints or _default_explicit_hints()
 
 
 def _load_dpp_entries(path: Path) -> list[DppCategory]:

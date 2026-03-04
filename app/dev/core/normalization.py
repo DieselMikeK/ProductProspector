@@ -14,6 +14,7 @@ from product_prospector.core.pricing_rules import (
 from product_prospector.core.core_charge_codes import normalize_core_charge_product_code
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.product_model import Product
+from product_prospector.core.shopify_collections import resolve_collection_assignments
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import (
     normalize_vendor_name as normalize_vendor_from_rules,
@@ -190,6 +191,10 @@ def _detect_make_label(text: str) -> str:
         return "Ram"
     if re.search(r"\b(ford)\b", low):
         return "Ford"
+    if re.search(r"\b(jeep)\b", low):
+        return "Jeep"
+    if re.search(r"\b(nissan)\b", low):
+        return "Nissan"
     return ""
 
 
@@ -197,9 +202,9 @@ def _detect_engine_liter(text: str) -> str:
     source = _sanitize_text_for_parse(text)
     match = re.search(r"\b(\d\.\d)\s*l\b", source, flags=re.IGNORECASE)
     if not match:
-        match = re.search(r"\b(\d\.\d)\s*(?=(?:powerstroke|duramax|cummins)\b)", source, flags=re.IGNORECASE)
+        match = re.search(r"\b(\d\.\d)\s*(?=(?:power\s*stroke|powerstroke|duramax|cummins|ecodiesel)\b)", source, flags=re.IGNORECASE)
     if not match:
-        match = re.search(r"\b(?:powerstroke|duramax|cummins)\s*(\d\.\d)\b", source, flags=re.IGNORECASE)
+        match = re.search(r"\b(?:power\s*stroke|powerstroke|duramax|cummins|ecodiesel)\s*(\d\.\d)\b", source, flags=re.IGNORECASE)
     if not match:
         return ""
     return f"{match.group(1)}L"
@@ -273,13 +278,13 @@ def _normalize_make_key(value: str) -> str:
 
 def _normalize_engine_family_key(value: str) -> str:
     text = _sanitize_text_for_parse(value).lower()
-    if "powerstroke" in text:
+    if re.search(r"\bpower\s*stroke\b", text):
         return "powerstroke"
     if "duramax" in text:
         return "duramax"
     if "cummins" in text:
         return "cummins"
-    if "ecodiesel" in text:
+    if re.search(r"\beco\s*diesel\b", text):
         return "ecodiesel"
     return ""
 
@@ -478,7 +483,7 @@ def _detect_drive_family(text: str, make_label: str) -> str:
         if re.search(r"\b(2500\s*/\s*3500|2500|3500)\b", low) and "cummins" not in low:
             return "2500 / 3500"
         return "Cummins"
-    if "powerstroke" in low:
+    if re.search(r"\bpower\s*stroke\b", low):
         return "Powerstroke"
     if "duramax" in low:
         return "Duramax"
@@ -486,6 +491,8 @@ def _detect_drive_family(text: str, make_label: str) -> str:
         return "Cummins"
     if "ecodiesel" in low:
         return "EcoDiesel"
+    if make_label == "Jeep" and "gladiator" in low:
+        return "Gladiator"
     return ""
 
 
@@ -504,7 +511,343 @@ def _is_universal_fitment(text: str) -> bool:
     )
 
 
-def _build_fitment_suffix(
+def _detect_engine_family_token(text: str) -> str:
+    low = _sanitize_text_for_parse(text).lower()
+    if re.search(r"\bpower\s*stroke\b", low):
+        return "Powerstroke"
+    if "duramax" in low:
+        return "Duramax"
+    if "cummins" in low:
+        return "Cummins"
+    if "ecodiesel" in low:
+        return "EcoDiesel"
+    return ""
+
+
+def _extract_liter_tokens(text: str) -> list[str]:
+    source = _sanitize_text_for_parse(text)
+    if not source:
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\b(\d\.\d)\s*l\b", source, flags=re.IGNORECASE):
+        token = f"{match.group(1)}L"
+        if token in seen:
+            continue
+        seen.add(token)
+        values.append(token)
+    if values:
+        return values
+    inferred = _detect_engine_liter(source)
+    return [inferred] if inferred else []
+
+
+def _extract_model_tokens(text: str, make_label: str) -> list[str]:
+    source = _sanitize_text_for_parse(text)
+    low = source.lower()
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        token = _clean_text(value)
+        key = token.lower()
+        if not token or key in seen:
+            return
+        seen.add(key)
+        found.append(token)
+
+    if make_label == "Ram":
+        for token in ["1500", "2500", "3500", "4500", "5500"]:
+            if re.search(rf"\b{re.escape(token)}\b", low):
+                add(token)
+    elif make_label == "Ford":
+        if re.search(r"\bf[\s-]*150\b", low):
+            add("F-150")
+        if re.search(r"\bf[\s-]*250\b", low):
+            add("F-250")
+        if re.search(r"\bf[\s-]*350\b", low):
+            add("F-350")
+        if "super duty" in low:
+            add("Super Duty")
+    elif make_label == "GM":
+        if "2500hd" in low:
+            add("2500HD")
+        if "3500hd" in low:
+            add("3500HD")
+        for token in ["1500", "2500", "3500"]:
+            if re.search(rf"\b{re.escape(token)}\b", low):
+                add(token)
+        if "colorado" in low:
+            add("Colorado")
+        if "canyon" in low:
+            add("Canyon")
+    elif make_label == "Jeep":
+        if "gladiator" in low:
+            add("Gladiator")
+        if "wrangler" in low:
+            add("Wrangler")
+
+    return found
+
+
+def _parse_year_range_token(token: str) -> tuple[float, float] | None:
+    text = _clean_text(token)
+    if not text:
+        return None
+    if "-" in text:
+        start_token, end_token = text.split("-", 1)
+    else:
+        start_token = text
+        end_token = text
+    start = _year_token_to_value(start_token)
+    end = _year_token_to_value(end_token)
+    if start is None or end is None:
+        return None
+    return (min(start, end), max(start, end))
+
+
+def _format_short_year_value(value: float) -> str:
+    base_year = int(value)
+    short = f"{base_year % 100:02d}"
+    if abs(value - (base_year + 0.5)) < 0.01:
+        return f"{short}.5"
+    return short
+
+
+def _format_short_year_range(start: float, end: float) -> str:
+    start_text = _format_short_year_value(start)
+    end_text = _format_short_year_value(end)
+    if start_text == end_text:
+        return start_text
+    return f"{start_text}-{end_text}"
+
+
+def _sort_liter_tokens(tokens: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        value = _clean_text(token)
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+
+    def sort_key(value: str) -> tuple[float, str]:
+        match = re.search(r"(\d\.\d)", value)
+        if not match:
+            return (999.0, value.lower())
+        try:
+            return (float(match.group(1)), value.lower())
+        except Exception:
+            return (999.0, value.lower())
+
+    return sorted(unique, key=sort_key)
+
+
+def _looks_like_body_part(title: str, description: str) -> bool:
+    low = _sanitize_text_for_parse(" ".join([title, description])).lower()
+    if not low:
+        return False
+    # Keep this conservative; many engine parts include words like "cap/plug/cover".
+    body_patterns = [
+        r"\bbumper\b",
+        r"\bfender\b",
+        r"\bgrille\b",
+        r"\bgrill\b",
+        r"\bmirror\b",
+        r"\bbody\s*panel\b",
+        r"\btailgate\b",
+        r"\bheadlight\b",
+        r"\btail\s*light\b",
+        r"\bdoor\s*handle\b",
+        r"\brunning\s*board\b",
+        r"\bstep\s*bar\b",
+        r"\bmud\s*flap\b",
+        r"\bflare\b",
+    ]
+    return any(re.search(pattern, low) for pattern in body_patterns)
+
+
+def _has_contiguous_year_coverage(items: list[dict]) -> bool:
+    intervals: list[tuple[int, int]] = []
+    for item in items:
+        start = int(float(item.get("start", 0.0)))
+        end = int(float(item.get("end", 0.0)))
+        intervals.append((min(start, end), max(start, end)))
+    if not intervals:
+        return False
+    intervals.sort(key=lambda pair: (pair[0], pair[1]))
+    merged: list[list[int]] = [[intervals[0][0], intervals[0][1]]]
+    for start, end in intervals[1:]:
+        current = merged[-1]
+        if start <= current[1] + 1:
+            current[1] = max(current[1], end)
+        else:
+            merged.append([start, end])
+    return len(merged) == 1
+
+
+def _build_fitment_items(
+    application: str,
+    title: str,
+    description: str,
+    required_root: Path | None = None,
+) -> list[dict]:
+    source = _sanitize_text_for_parse(application)
+    if not source:
+        source = _sanitize_text_for_parse(" ".join([application, title, description]))
+    if not source:
+        return []
+
+    segments = [item.strip() for item in re.split(r"\s*\|\s*", source) if _clean_text(item)]
+    if not segments:
+        segments = [source]
+
+    fallback_context = _sanitize_text_for_parse(" ".join([application, title, description]))
+    rows: list[dict] = []
+    for segment_index, segment in enumerate(segments):
+        chunk = _sanitize_text_for_parse(segment)
+        if not chunk:
+            continue
+        segment_make = _detect_make_label(chunk) or _detect_make_label(fallback_context)
+        segment_family = _detect_engine_family_token(chunk) or _detect_drive_family(chunk, segment_make)
+        segment_liters = _extract_liter_tokens(chunk)
+        segment_models = _extract_model_tokens(chunk, segment_make)
+        parts = [item.strip() for item in re.split(r"\s*/\s*(?=\d{2,4}(?:\.5)?\s*[-/])", chunk) if _clean_text(item)]
+        if not parts:
+            parts = [chunk]
+
+        carry_make = segment_make
+        carry_family = segment_family
+        for part in parts:
+            year_tokens = _extract_year_ranges(part)
+            if not year_tokens:
+                continue
+
+            part_make = _detect_make_label(part) or carry_make or segment_make
+            part_family = _detect_engine_family_token(part) or _detect_drive_family(part, part_make) or carry_family or segment_family
+            part_liters = _extract_liter_tokens(part) or list(segment_liters)
+            if not part_liters and part_make:
+                inferred_liter = _infer_engine_liter_from_fitment(
+                    years=[year_tokens[0]],
+                    make_label=part_make,
+                    drive=part_family,
+                    context_text=" ".join([part, chunk, fallback_context]),
+                    required_root=required_root,
+                )
+                if inferred_liter:
+                    part_liters = [inferred_liter]
+            part_models = _extract_model_tokens(part, part_make) or list(segment_models)
+
+            for token in year_tokens:
+                parsed_range = _parse_year_range_token(token)
+                if parsed_range is None:
+                    continue
+                start, end = parsed_range
+                rows.append(
+                    {
+                        "segment_index": segment_index,
+                        "make_label": part_make,
+                        "family": part_family,
+                        "liters": _sort_liter_tokens(part_liters),
+                        "models": part_models,
+                        "start": start,
+                        "end": end,
+                    }
+                )
+            carry_make = part_make or carry_make
+            carry_family = part_family or carry_family
+
+    deduped: list[dict] = []
+    seen: set[tuple] = set()
+    for row in rows:
+        key = (
+            int(float(row.get("segment_index", 0))),
+            _clean_text(row.get("make_label", "")),
+            _clean_text(row.get("family", "")),
+            tuple(_sort_liter_tokens([_clean_text(item) for item in row.get("liters", [])])),
+            tuple([_clean_text(item) for item in row.get("models", [])]),
+            float(row.get("start", 0.0)),
+            float(row.get("end", 0.0)),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _format_fitment_for_make(items: list[dict], make_label: str, is_body_part: bool) -> str:
+    if not items:
+        return ""
+    ordered = sorted(items, key=lambda item: (float(item.get("start", 0.0)), float(item.get("end", 0.0))))
+
+    families = [_clean_text(item.get("family", "")) for item in ordered if _clean_text(item.get("family", ""))]
+    family = families[-1] if families else ""
+    all_liters = _sort_liter_tokens([_clean_text(lit) for item in ordered for lit in item.get("liters", []) if _clean_text(lit)])
+    all_models: list[str] = []
+    seen_models: set[str] = set()
+    for item in ordered:
+        for model in item.get("models", []):
+            token = _clean_text(model)
+            key = token.lower()
+            if not token or key in seen_models:
+                continue
+            seen_models.add(key)
+            all_models.append(token)
+
+    contiguous = _has_contiguous_year_coverage(ordered)
+    if contiguous:
+        start = min(float(item.get("start", 0.0)) for item in ordered)
+        end = max(float(item.get("end", 0.0)) for item in ordered)
+        year_text = _format_short_year_range(start, end)
+        parts: list[str] = [year_text, make_label]
+        if is_body_part:
+            if all_models:
+                parts.append(" / ".join(all_models))
+        else:
+            if all_liters:
+                parts.append(" / ".join(all_liters))
+            if family:
+                parts.append(family)
+        return re.sub(r"\s+", " ", " ".join([item for item in parts if _clean_text(item)])).strip()
+
+    segments: list[str] = []
+    for index, item in enumerate(ordered):
+        year_text = _format_short_year_range(float(item.get("start", 0.0)), float(item.get("end", 0.0)))
+        item_liters = _sort_liter_tokens([_clean_text(lit) for lit in item.get("liters", []) if _clean_text(lit)])
+        item_models: list[str] = []
+        seen_local_models: set[str] = set()
+        for model in item.get("models", []):
+            token = _clean_text(model)
+            key = token.lower()
+            if not token or key in seen_local_models:
+                continue
+            seen_local_models.add(key)
+            item_models.append(token)
+
+        if is_body_part:
+            model_text = " / ".join(item_models)
+            if index == 0:
+                piece = " ".join([year_text, make_label, model_text]).strip()
+            else:
+                piece = " ".join([year_text, model_text]).strip()
+            segments.append(re.sub(r"\s+", " ", piece).strip())
+            continue
+
+        liter_text = " / ".join(item_liters)
+        if index == 0:
+            piece = " ".join([year_text, make_label, liter_text]).strip()
+        else:
+            tail_family = family if index == (len(ordered) - 1) else ""
+            piece = " ".join([year_text, liter_text, tail_family]).strip()
+        segments.append(re.sub(r"\s+", " ", piece).strip())
+
+    return " / ".join([item for item in segments if _clean_text(item)]).strip()
+
+
+def _build_fitment_suffix_legacy(
     application: str,
     title: str,
     description: str,
@@ -517,8 +860,6 @@ def _build_fitment_suffix(
     years = _extract_year_ranges(application) or _extract_year_ranges(title) or _extract_year_ranges(description)
     make_label = _detect_make_label(combined)
     drive = _detect_drive_family(combined, make_label)
-    # Prefer deterministic year/make/family mapping over free-text detection so
-    # unrelated "6.7L" mentions in noisy page text cannot override fitment.
     liter = _infer_engine_liter_from_fitment(
         years=years,
         make_label=make_label,
@@ -527,7 +868,6 @@ def _build_fitment_suffix(
         required_root=required_root,
     )
     if not liter:
-        # Check cleaner fields first before the full combined blob.
         liter = _detect_engine_liter(application) or _detect_engine_liter(title) or _detect_engine_liter(combined)
 
     parts: list[str] = []
@@ -539,8 +879,64 @@ def _build_fitment_suffix(
         parts.append(liter)
     if drive:
         parts.append(drive)
-
     return " ".join([item for item in parts if item]).strip()
+
+
+def _build_fitment_suffix(
+    application: str,
+    title: str,
+    description: str,
+    required_root: Path | None = None,
+) -> str:
+    combined = " ".join([application, title, description]).strip()
+    if not combined or _is_universal_fitment(combined):
+        return ""
+
+    fitment_items = _build_fitment_items(
+        application=application,
+        title=title,
+        description=description,
+        required_root=required_root,
+    )
+    if not fitment_items:
+        return _build_fitment_suffix_legacy(
+            application=application,
+            title=title,
+            description=description,
+            required_root=required_root,
+        )
+
+    engine_families = {"Cummins", "Duramax", "Powerstroke", "EcoDiesel"}
+    has_liters = any(bool(item.get("liters", [])) for item in fitment_items)
+    has_engine_family = any(_clean_text(item.get("family", "")) in engine_families for item in fitment_items)
+    has_models = any(bool(item.get("models", [])) for item in fitment_items)
+    fitment_looks_like_body = has_models and not has_liters and not has_engine_family
+    is_body_part = fitment_looks_like_body or _looks_like_body_part(title=title, description=description)
+    grouped: dict[str, list[dict]] = {}
+    make_order: list[str] = []
+    for item in fitment_items:
+        make_label = _clean_text(item.get("make_label", "")) or _detect_make_label(combined)
+        if not make_label:
+            continue
+        if make_label not in grouped:
+            grouped[make_label] = []
+            make_order.append(make_label)
+        grouped[make_label].append(item)
+
+    formatted: list[str] = []
+    for make_label in make_order:
+        segment_text = _format_fitment_for_make(grouped.get(make_label, []), make_label=make_label, is_body_part=is_body_part)
+        if segment_text:
+            formatted.append(segment_text)
+
+    if formatted:
+        return " | ".join(formatted)
+    return _build_fitment_suffix_legacy(
+        application=application,
+        title=title,
+        description=description,
+        required_root=required_root,
+    )
 
 
 def _strip_vendor_tokens(text: str, vendor_tokens: list[str]) -> str:
@@ -581,9 +977,24 @@ def _build_concise_description(
     source = re.sub(r"\b\d{2,4}(?:\.5)?\s*[-/]\s*\d{2,4}(?:\.5)?\b", " ", source)
     source = re.sub(r"\b(?:ford|gm|gmc|chevy|chevrolet|ram|dodge)\b", " ", source, flags=re.IGNORECASE)
     source = re.sub(r"\b\d\.\d\s*l\b", " ", source, flags=re.IGNORECASE)
-    source = re.sub(r"\b\d\.\d\s*(?=(?:powerstroke|duramax|cummins)\b)", " ", source, flags=re.IGNORECASE)
-    source = re.sub(r"\b(?:powerstroke|duramax|cummins)\s*\d\.\d\b", " ", source, flags=re.IGNORECASE)
-    source = re.sub(r"\b(?:powerstroke|duramax|cummins|super\s*duty)\b", " ", source, flags=re.IGNORECASE)
+    source = re.sub(
+        r"\b\d\.\d\s*(?=(?:power\s*stroke|powerstroke|duramax|cummins|eco\s*diesel|ecodiesel)\b)",
+        " ",
+        source,
+        flags=re.IGNORECASE,
+    )
+    source = re.sub(
+        r"\b(?:power\s*stroke|powerstroke|duramax|cummins|eco\s*diesel|ecodiesel)\s*\d\.\d\b",
+        " ",
+        source,
+        flags=re.IGNORECASE,
+    )
+    source = re.sub(
+        r"\b(?:power\s*stroke|powerstroke|duramax|cummins|eco\s*diesel|ecodiesel|super\s*duty)\b",
+        " ",
+        source,
+        flags=re.IGNORECASE,
+    )
     # Vendor brand already carries diesel context; avoid repeating "diesel" in the product phrase.
     source = re.sub(r"\bdiesel\b", " ", source, flags=re.IGNORECASE)
     source = re.sub(r"\b(?:lly|lbz|lmm|lb7|l5p|lml|6r140|68rfe|48re|47re)(?:/[a-z0-9]+)*\b", " ", source, flags=re.IGNORECASE)
@@ -717,6 +1128,19 @@ def _normalize_weight(weight: str) -> str:
     return f"{value:.2f}"
 
 
+def _format_collection_titles(items: list[dict]) -> str:
+    titles: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        title = _clean_text((item or {}).get("collection_title", ""))
+        key = re.sub(r"\s+", " ", title).strip().lower()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        titles.append(title)
+    return ", ".join(titles)
+
+
 def _format_currency(value: float | None) -> str:
     if value is None:
         return ""
@@ -779,6 +1203,7 @@ def normalize_product(
     required_root: Path,
     mode: str = "new",
     update_fields: set[str] | None = None,
+    default_inventory: int | None = None,
 ) -> Product:
     selected = set(update_fields or [])
 
@@ -829,12 +1254,43 @@ def normalize_product(
             product.core_charge_product_code,
             required_root=required_root,
         )
-    product.inventory = 3000000
+    inventory_value: int | None = None
+    if default_inventory is not None:
+        try:
+            inventory_value = int(float(default_inventory))
+        except Exception:
+            inventory_value = None
+    if inventory_value is None or inventory_value <= 0:
+        try:
+            current_inventory = int(float(getattr(product, "inventory", 0)))
+        except Exception:
+            current_inventory = 0
+        inventory_value = current_inventory if current_inventory > 0 else 3000000
+    product.inventory = inventory_value
 
     if mode != "update":
         product.sku = _apply_vendor_sku_prefix(product.sku, profile_sku_prefix)
         if not _clean_text(product.brand) and profile_brand:
             product.brand = profile_brand
+        product.tags = []
+        product.field_sources.pop("tags", None)
+        product.field_sources.pop("tags_ymm_warning", None)
+
+    should_autofill_collections = mode != "update" or should("type") or should("application")
+    if should_autofill_collections and not _clean_text(getattr(product, "collections", "")):
+        collection_targets, collection_warnings = resolve_collection_assignments(
+            product_type=_clean_text(product.type),
+            application_text=_clean_text(product.application),
+            required_root=required_root,
+            title_text=_clean_text(product.title),
+            description_text=_clean_text(product.description_html),
+        )
+        product.collections = _format_collection_titles(collection_targets)
+        if product.collections:
+            product.field_sources["collections"] = "collection_rules"
+            product.field_sources.pop("collections_warning", None)
+        elif collection_warnings:
+            product.field_sources["collections_warning"] = "; ".join(collection_warnings[:2])
 
     if should("cost"):
         cost_value = _to_float(product.cost)

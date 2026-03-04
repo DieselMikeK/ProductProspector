@@ -203,8 +203,19 @@ _GAS_WEAK_EXCEPTIONS = [
     r"\bgas\s+pressure\b",
 ]
 
+_PASSENGER_CAR_SIGNALS: list[tuple[str, str]] = [
+    (r"\bmustang\b", "Mustang"),
+    (r"\bcamaro\b", "Camaro"),
+    (r"\bcorvette\b", "Corvette"),
+    (r"\bchallenger\b", "Challenger"),
+    (r"\bcharger\b", "Charger"),
+    (r"\bhellcat\b", "Hellcat"),
+    (r"\bmiata\b", "Miata"),
+    (r"\bgti\b", "GTI"),
+]
 
-def _looks_like_gas_only_product(product: Product) -> bool:
+
+def _gas_or_passenger_flag_reason(product: Product) -> str:
     context = " ".join(
         [
             _clean_text(product.title),
@@ -219,7 +230,16 @@ def _looks_like_gas_only_product(product: Product) -> bool:
         ]
     ).lower()
     if not context:
-        return False
+        return ""
+
+    passenger_hits = [
+        label for pattern, label in _PASSENGER_CAR_SIGNALS if re.search(pattern, context, flags=re.IGNORECASE)
+    ]
+    if passenger_hits:
+        preview = ", ".join(passenger_hits[:2])
+        if len(passenger_hits) > 2:
+            preview += ", ..."
+        return f"passenger model signal ({preview})"
 
     has_diesel_signal = any(re.search(pattern, context, flags=re.IGNORECASE) for pattern in _DIESEL_SIGNALS)
     has_gas_strong_signal = any(re.search(pattern, context, flags=re.IGNORECASE) for pattern in _GAS_STRONG_SIGNALS)
@@ -229,8 +249,12 @@ def _looks_like_gas_only_product(product: Product) -> bool:
         weak_gas_signal = not any(re.search(pattern, context, flags=re.IGNORECASE) for pattern in _GAS_WEAK_EXCEPTIONS)
 
     if has_diesel_signal:
-        return False
-    return bool(has_gas_strong_signal or weak_gas_signal)
+        return ""
+    if has_gas_strong_signal:
+        return "gas signal detected"
+    if weak_gas_signal:
+        return "gas keyword detected"
+    return ""
 
 
 def _rows_from_session(session: AppSession) -> list[pd.Series]:
@@ -562,6 +586,8 @@ def build_products_from_session(
             "weight": _row_value(row, mapping.weight),
             "application": _row_value(row, mapping.application),
             "core_charge_product_code": _row_value(row, getattr(mapping, "core_charge_product_code", "")),
+            "product_url": "",
+            "collections": "",
         }
 
         if session.mode == MODE_NEW:
@@ -581,7 +607,14 @@ def build_products_from_session(
                 _set_if_present(product, field_name, value, "spreadsheet")
             product.field_sources["update_scope"] = ",".join(sorted(selected))
 
-        scraped_values = scraped_index.get(sku, {})
+        scraped_values = dict(scraped_index.get(sku, {}) or {})
+        scraped_product_url = (
+            _clean_text(scraped_values.get("product_url", ""))
+            or _clean_text(scraped_values.get("source_url", ""))
+            or _clean_text(scraped_values.get("search_url", ""))
+        )
+        if scraped_product_url:
+            scraped_values["product_url"] = scraped_product_url
         if scraped_values:
             if session.mode == MODE_NEW:
                 for field_name in [
@@ -600,6 +633,7 @@ def build_products_from_session(
                     "weight",
                     "application",
                     "core_charge_product_code",
+                    "product_url",
                 ]:
                     existing_value = _clean_text(getattr(product, field_name, ""))
                     if existing_value:
@@ -618,11 +652,13 @@ def build_products_from_session(
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
 
         product.finalize_defaults()
-        if _looks_like_gas_only_product(product):
-            product.excluded = True
-            product.exclusion_reason = "Excluded: gas-only product detected"
+        gas_flag_reason = _gas_or_passenger_flag_reason(product)
+        if gas_flag_reason:
+            product.remove_recommended = True
+            product.remove_marked = True
+            product.remove_reason = f"Possible gas/passenger part: {gas_flag_reason}"
             product.field_sources["diesel_filter"] = "rule"
-            product.field_status["diesel_filter"] = "excluded_gas"
+            product.field_status["diesel_filter"] = "flagged_gas_passenger"
             stats.rows_flagged_gas += 1
         products.append(product)
         stats.rows_built += 1

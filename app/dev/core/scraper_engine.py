@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import time
 from io import BytesIO
 import urllib.error
@@ -88,16 +89,25 @@ def _fetch_html_with_curl(url: str, timeout: int = 30) -> tuple[str, str | None]
         f"\n{marker}%{{http_code}}",
     ]
 
+    run_kwargs: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "ignore",
+        "timeout": max(10, int(timeout) + 5),
+        "check": False,
+    }
+    if sys.platform == "win32":
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            run_kwargs["startupinfo"] = startupinfo
+            run_kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        except Exception:
+            pass
+
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=max(10, int(timeout) + 5),
-            check=False,
-        )
+        completed = subprocess.run(command, **run_kwargs)
     except Exception as exc:
         return "", str(exc)
 
@@ -1946,8 +1956,11 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
         output["media_urls"] = " | ".join(normalized_media[:30])
 
     application_lines: list[str] = []
+    # Scope fitment heuristics near the matched SKU to avoid unrelated recommendation tiles.
+    fitment_context = _find_context_near_sku(html, sku, span=12000)
+    fitment_source = fitment_context if _clean_text(fitment_context) else html
     # Remove script/style blocks before fitment heuristics so JSON/JS blobs do not pollute application text.
-    fitment_source = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+    fitment_source = re.sub(r"<script[\s\S]*?</script>", " ", fitment_source, flags=re.IGNORECASE)
     fitment_source = re.sub(r"<style[\s\S]*?</style>", " ", fitment_source, flags=re.IGNORECASE)
     fitment_text = re.sub(r"<[^>]+>", "\n", unescape(fitment_source))
     for line in fitment_text.splitlines():
@@ -1965,6 +1978,12 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
             application_lines.append(text)
         if len(application_lines) >= 4:
             break
+    title_text = _clean_text(output.get("title", ""))
+    if title_text and re.search(r"\b(19|20)\d{2}\b", title_text) and re.search(
+        r"(?i)(ford|chevy|chevrolet|gmc|gm|ram|dodge|duramax|cummins|powerstroke|diesel|jeep|nissan)",
+        title_text,
+    ):
+        application_lines.append(title_text)
     if application_lines:
         deduped: list[str] = []
         seen: set[str] = set()

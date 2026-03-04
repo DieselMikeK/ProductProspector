@@ -1,0 +1,15 @@
+pattern,category,subtype,google_leaf,enabled,notes
+\b(?:cold\s+charge\s+air\s+pipe(?:\s+kit)?|hot\s+charge\s+air\s+pipe(?:\s+kit)?|(?:hot|cold)\s+side\s+(?:intercooler\s+)?charge\s+pipe(?:\s+kit)?|intercooler\s+charge\s+pipe(?:\s+kit)?|charge\s+air\s+pipe(?:\s+kit)?)\b,Intercoolers / Radiators / Condensers,Intercooler Pipes / Hoses,Motor Vehicle Engine Parts,1,Custom override for charge air/intercooler pipe products
+\b(?:back\s+exhaust)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,"Auto-trained global alias (support=100, precision=1.0000, vendors=7)"
+\b(?:exhaust\s+system)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,"Auto-trained global alias (support=97, precision=1.0000, vendors=6)"
+\b(?:fuel\s+lift\s+pump)\b,Fuel Related,Lift Pumps,Motor Vehicle Fuel Systems,1,"Auto-trained global alias (support=81, precision=1.0000, vendors=5)"
+\b(?:coolant\s+hose)\b,Intercoolers / Radiators / Condensers,Coolant Hoses,Motor Vehicle Engine Parts,1,"Auto-trained global alias (support=70, precision=1.0000, vendors=7)"
+\b(?:exhaust\s+kit)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,"Auto-trained global alias (support=55, precision=1.0000, vendors=7)"
+\b(?:single\s+outlet\s+exhaust)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,"Auto-trained global alias (support=47, precision=1.0000, vendors=4)"
+\b(?:transmission\s+rebuild)\b,Automatic Transmission,Rebuild Kits,Motor Vehicle Transmission & Drivetrain Parts,1,"Auto-trained global alias (support=43, precision=1.0000, vendors=3)"
+\b(?:cold\s+air\s+intake\s+system)\b,Cold Air Intakes & Air Filters,Cold Air Intakes,Motor Vehicle Engine Parts,1,"Auto-trained global alias (support=41, precision=1.0000, vendors=4)"
+\b(?:arm\s+lift\s+kit)\b,Suspension & Steering,Lift & Leveling Kits,Motor Vehicle Suspension Parts,1,"Auto-trained global alias (support=36, precision=1.0000, vendors=3)"
+\b(?:remanufactured\s+fuel)\b,Fuel Related,Injector Related,Motor Vehicle Fuel Systems,1,"Auto-trained global alias (support=36, precision=1.0000, vendors=3)"
+\b(?:transmission\s+line)\b,Intercoolers / Radiators / Condensers,Transmission Lines,Motor Vehicle Transmission & Drivetrain Parts,1,"Auto-trained global alias (support=33, precision=1.0000, vendors=3)"
+\b(?:brake\s+pad\s+set)\b,Brakes,Brake Pads,Motor Vehicle Braking,1,"Auto-trained global alias (support=23, precision=1.0000, vendors=4)"
+\b(?:radius\s+arm\s+suspension)\b,Suspension & Steering,Lift & Leveling Kits,Motor Vehicle Suspension Parts,1,"Auto-trained global alias (support=21, precision=1.0000, vendors=3)"

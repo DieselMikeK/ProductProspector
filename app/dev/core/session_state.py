@@ -52,6 +52,7 @@ class AppSession:
     update_fields: list[str] = field(default_factory=list)
     scrape_settings: ScrapeSettings = field(default_factory=ScrapeSettings)
     products: list[Product] = field(default_factory=list)
+    inventory_default: int = 3000000
     setup_complete: bool = False
     processing_complete: bool = False
 
@@ -63,5 +64,6 @@ class AppSession:
         self.missing_fields = []
         self.update_fields = []
         self.products = []
+        self.inventory_default = 3000000
         self.setup_complete = False
         self.processing_complete = False

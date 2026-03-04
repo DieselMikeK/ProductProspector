@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 PRODUCT_EXPORT_COLUMNS = [
     "sku",
+    "product_url",
     "title",
     "description_html",
     "media_urls",
@@ -26,6 +27,7 @@ PRODUCT_EXPORT_COLUMNS = [
     "mpn",
     "brand",
     "application",
+    "collections",
     "tags",
     "metafields",
 ]
@@ -50,6 +52,7 @@ class Product:
     dealer_cost: str = ""
     inventory: int = 3000000
     sku: str = ""
+    product_url: str = ""
     barcode: str = ""
     weight: str = ""
     vendor: str = ""
@@ -61,6 +64,7 @@ class Product:
     mpn: str = ""
     brand: str = ""
     application: str = ""
+    collections: str = ""
     tags: list[str] = field(default_factory=list)
     metafields: dict[str, str] = field(default_factory=dict)
     field_sources: dict[str, str] = field(default_factory=dict)
@@ -69,6 +73,9 @@ class Product:
     scrape_fields_found: str = ""
     scrape_error: str = ""
     media_folder: str = ""
+    remove_recommended: bool = False
+    remove_marked: bool = False
+    remove_reason: str = ""
     excluded: bool = False
     exclusion_reason: str = ""
 
@@ -93,7 +100,11 @@ class Product:
             "scrape_fields_found": _clean_text(self.scrape_fields_found),
             "scrape_error": _clean_text(self.scrape_error),
             "media_folder": _clean_text(self.media_folder),
+            "remove_recommended": "yes" if bool(self.remove_recommended) else "",
+            "remove_marked": "yes" if bool(self.remove_marked) else "",
+            "remove_reason": _clean_text(self.remove_reason),
             "sku": _clean_text(self.sku),
+            "product_url": _clean_text(self.product_url),
             "title": _clean_text(self.title),
             "description_html": _clean_text(self.description_html),
             "media_urls": " | ".join([item for item in self.media_urls if _clean_text(item)]),
@@ -115,6 +126,7 @@ class Product:
             "mpn": _clean_text(self.mpn),
             "brand": _clean_text(self.brand),
             "application": _clean_text(self.application),
+            "collections": _clean_text(self.collections),
             "tags": " | ".join([item for item in self.tags if _clean_text(item)]),
             "metafields": str(self.metafields) if self.metafields else "",
         }
