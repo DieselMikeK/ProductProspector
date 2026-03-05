@@ -533,7 +533,7 @@ def _resolve_primary_location_id(config: ShopifyConfig, access_token: str) -> tu
         return None, "Invalid Shopify location id."
 
 
-def _build_product_payload(product: Product, vendor_override: str = "") -> dict:
+def _build_product_payload(product: Product, vendor_override: str = "", operator_tag: str = "") -> dict:
     sku = normalize_sku(product.sku)
     title = _clean_text(product.title) or sku
     vendor_value = _clean_text(vendor_override) or _clean_text(product.vendor)
@@ -560,6 +560,20 @@ def _build_product_payload(product: Product, vendor_override: str = "") -> dict:
             "variants": [variant],
         }
     }
+    tag_values: list[str] = []
+    seen_tags: set[str] = set()
+    for raw_tag in list(getattr(product, "tags", []) or []):
+        tag = _clean_text(raw_tag)
+        key = tag.lower()
+        if not tag or key in seen_tags:
+            continue
+        seen_tags.add(key)
+        tag_values.append(tag)
+    operator_value = _clean_text(operator_tag)
+    if operator_value and operator_value.lower() not in seen_tags:
+        tag_values.append(operator_value)
+    if tag_values:
+        payload["product"]["tags"] = ", ".join(tag_values)
     media_urls = _normalize_media_urls(product.media_urls)
     if media_urls:
         payload["product"]["images"] = [{"src": url} for url in media_urls]
@@ -800,6 +814,7 @@ def push_new_products_as_drafts(
     include_images: bool = True,
     image_root: Path | None = None,
     required_root: Path | None = None,
+    operator_tag: str = "",
     progress_callback=None,
 ) -> ShopifyDraftPushSummary:
     summary = ShopifyDraftPushSummary(requested=len(products))
@@ -812,10 +827,6 @@ def push_new_products_as_drafts(
     publish_to_all_channels_enabled = bool(publication_ids)
     if publication_error:
         summary.warnings.append(f"Sales channel publication lookup failed ({publication_error}).")
-    elif publication_ids:
-        summary.warnings.append(
-            f"Sales channel publication enabled for {len(publication_ids)} channel(s): {', '.join(publication_names[:10])}"
-        )
     else:
         summary.warnings.append("No Shopify publications found; sales channels could not be assigned.")
 
@@ -881,7 +892,11 @@ def push_new_products_as_drafts(
         ) or (
             _clean_text(vendor_profile.canonical_vendor) if vendor_profile is not None else ""
         ) or normalized_vendor_value or raw_vendor_value
-        create_payload = _build_product_payload(product, vendor_override=shopify_vendor_value)
+        create_payload = _build_product_payload(
+            product,
+            vendor_override=shopify_vendor_value,
+            operator_tag=operator_tag,
+        )
         if not include_images or local_image_files:
             product_payload = create_payload.get("product") or {}
             if isinstance(product_payload, dict) and "images" in product_payload:

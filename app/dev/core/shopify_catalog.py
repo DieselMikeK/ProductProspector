@@ -18,6 +18,7 @@ query Catalog($cursor: String, $search: String, $sortKey: ProductSortKeys, $reve
     }
     edges {
       node {
+        id
         title
         description
         productType
@@ -51,6 +52,7 @@ query VariantsBySku($cursor: String, $search: String!) {
         sku
         barcode
         product {
+          id
           title
           description
           productType
@@ -64,6 +66,19 @@ query VariantsBySku($cursor: String, $search: String!) {
   }
 }
 """
+
+
+def _extract_numeric_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return text
+    if "/" in text:
+        tail = text.rsplit("/", 1)[-1].strip()
+        if tail.isdigit():
+            return tail
+    return ""
 
 
 def _request_graphql(config: ShopifyConfig, access_token: str, query: str, variables: dict) -> tuple[dict | None, str | None]:
@@ -162,6 +177,7 @@ def fetch_shopify_catalog_dataframe(
                     continue
                 row = {
                     "sku": sku,
+                    "product_id": _extract_numeric_id(node.get("id", "")),
                     "title": title,
                     "description": description,
                     "fitment": fitment,
@@ -195,7 +211,9 @@ def fetch_shopify_catalog_dataframe(
             break
 
     if not rows:
-        return pd.DataFrame(columns=["sku", "title", "description", "fitment", "product_type", "vendor", "barcode"]), None
+        return pd.DataFrame(
+            columns=["sku", "product_id", "title", "description", "fitment", "product_type", "vendor", "barcode"]
+        ), None
 
     df = pd.DataFrame(rows)
     df["sku_norm"] = df["sku"].astype(str).str.strip().str.upper()
@@ -230,7 +248,9 @@ def fetch_shopify_catalog_for_skus(
 ) -> tuple[pd.DataFrame, str | None]:
     normalized_skus = [_normalize_sku(sku) for sku in skus if _normalize_sku(sku)]
     if not normalized_skus:
-        return pd.DataFrame(columns=["sku", "title", "description", "fitment", "product_type", "vendor", "barcode"]), None
+        return pd.DataFrame(
+            columns=["sku", "product_id", "title", "description", "fitment", "product_type", "vendor", "barcode"]
+        ), None
 
     rows: list[dict[str, str]] = []
     for start in range(0, len(normalized_skus), batch_size):
@@ -268,6 +288,7 @@ def fetch_shopify_catalog_for_skus(
                 rows.append(
                     {
                         "sku": sku,
+                        "product_id": _extract_numeric_id(product.get("id", "")),
                         "title": title,
                         "description": description,
                         "fitment": fitment,
@@ -285,7 +306,9 @@ def fetch_shopify_catalog_for_skus(
                 break
 
     if not rows:
-        return pd.DataFrame(columns=["sku", "title", "description", "fitment", "product_type", "vendor", "barcode"]), None
+        return pd.DataFrame(
+            columns=["sku", "product_id", "title", "description", "fitment", "product_type", "vendor", "barcode"]
+        ), None
 
     df = pd.DataFrame(rows)
     df["sku_norm"] = df["sku"].astype(str).str.strip().str.upper()

@@ -41,6 +41,20 @@ def _clean_text(value: object) -> str:
 
 @dataclass
 class Product:
+    record_type: str = "Product"
+    parent_has_variants: bool = False
+    product_gid: str = ""
+    product_id: str = ""
+    variant_gid: str = ""
+    variant_id: str = ""
+    inventory_item_gid: str = ""
+    inventory_item_id: str = ""
+    variant_option_summary: str = ""
+    variant_google_mpn: str = ""
+    variant_enable_low_stock_message: str = ""
+    variant_weight_unit: str = ""
+    original_variant_weight_value: str = ""
+    original_variant_weight_unit: str = ""
     title: str = ""
     description_html: str = ""
     media_urls: list[str] = field(default_factory=list)
@@ -94,6 +108,11 @@ class Product:
 
     def to_row(self) -> dict[str, str]:
         return {
+            "record_type": _clean_text(self.record_type) or "Product",
+            "parent_has_variants": "yes" if bool(self.parent_has_variants) else "",
+            "product_id": _clean_text(self.product_id),
+            "variant_id": _clean_text(self.variant_id),
+            "variant_option_summary": _clean_text(self.variant_option_summary),
             "excluded": "yes" if bool(self.excluded) else "",
             "exclusion_reason": _clean_text(self.exclusion_reason),
             "scrape_status": _clean_text(self.scrape_status),
@@ -127,6 +146,9 @@ class Product:
             "brand": _clean_text(self.brand),
             "application": _clean_text(self.application),
             "collections": _clean_text(self.collections),
+            "variant_google_mpn": _clean_text(self.variant_google_mpn),
+            "variant_enable_low_stock_message": _clean_text(self.variant_enable_low_stock_message),
+            "variant_weight_unit": _clean_text(self.variant_weight_unit),
             "tags": " | ".join([item for item in self.tags if _clean_text(item)]),
             "metafields": str(self.metafields) if self.metafields else "",
         }

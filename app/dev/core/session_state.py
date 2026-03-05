@@ -47,12 +47,13 @@ class AppSession:
     vendor_df: pd.DataFrame | None = None
     source_mapping: SourceMapping = field(default_factory=SourceMapping)
     pasted_skus: list[str] = field(default_factory=list)
+    target_product_ids: list[str] = field(default_factory=list)
     target_skus: list[str] = field(default_factory=list)
     missing_fields: list[str] = field(default_factory=list)
     update_fields: list[str] = field(default_factory=list)
     scrape_settings: ScrapeSettings = field(default_factory=ScrapeSettings)
     products: list[Product] = field(default_factory=list)
-    inventory_default: int = 3000000
+    inventory_default: int = 5000000
     setup_complete: bool = False
     processing_complete: bool = False
 
@@ -60,10 +61,11 @@ class AppSession:
         self.vendor_df = None
         self.source_mapping = SourceMapping()
         self.pasted_skus = []
+        self.target_product_ids = []
         self.target_skus = []
         self.missing_fields = []
         self.update_fields = []
         self.products = []
-        self.inventory_default = 3000000
+        self.inventory_default = 5000000
         self.setup_complete = False
         self.processing_complete = False
