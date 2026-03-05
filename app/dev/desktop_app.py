@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
 
@@ -87,20 +88,56 @@ HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 25
 HEADER_LOGO_VERTICAL_BOTTOM_PADDING_PX = 0
 _SINGLE_INSTANCE_MUTEX = "Global\\ProductProspectorDesktopApp"
 _ERROR_ALREADY_EXISTS = 183
-INVENTORY_OWNER_VALUES = ["Gravel Gus", "Andrew", "Alondra", "Mike K", "Michael V"]
+INVENTORY_OWNER_VALUES = [
+    "Sure-Shot Josh McGosh",
+    "Gold-Slew Andrew McGrew",
+    "Silver-Rock Alondra Knox",
+    "Big-Strike Mike Wild",
+    "Pay-Streak Michael Vee",
+]
 INVENTORY_BY_OWNER = {
-    "Gravel Gus": 5_000_000,
-    "Andrew": 1_000_000,
-    "Alondra": 2_000_000,
-    "Mike K": 3_000_000,
-    "Michael V": 4_000_000,
+    "Sure-Shot Josh McGosh": 5_000_000,
+    "Gold-Slew Andrew McGrew": 1_000_000,
+    "Silver-Rock Alondra Knox": 2_000_000,
+    "Big-Strike Mike Wild": 3_000_000,
+    "Pay-Streak Michael Vee": 4_000_000,
 }
-DEFAULT_INVENTORY_OWNER = "Gravel Gus"
+OWNER_TAG_BY_OWNER = {
+    "Sure-Shot Josh McGosh": "Josh",
+    "Gold-Slew Andrew McGrew": "Andrew",
+    "Silver-Rock Alondra Knox": "Alondra",
+    "Big-Strike Mike Wild": "Mike K",
+    "Pay-Streak Michael Vee": "Michael V",
+}
+LEGACY_OWNER_NAME_MAP = {
+    "Gravel Gus": "Sure-Shot Josh McGosh",
+    "Josh": "Sure-Shot Josh McGosh",
+    "Andrew": "Gold-Slew Andrew McGrew",
+    "Alondra": "Silver-Rock Alondra Knox",
+    "Mike K": "Big-Strike Mike Wild",
+    "Michael V": "Pay-Streak Michael Vee",
+}
+DEFAULT_INVENTORY_OWNER = "Sure-Shot Josh McGosh"
+
+
+def _normalize_owner_name(owner_name: str) -> str:
+    owner = str(owner_name or "").strip()
+    if owner in INVENTORY_BY_OWNER:
+        return owner
+    mapped = LEGACY_OWNER_NAME_MAP.get(owner, "")
+    if mapped in INVENTORY_BY_OWNER:
+        return mapped
+    return DEFAULT_INVENTORY_OWNER
 
 
 def _inventory_for_owner(owner_name: str) -> int:
-    owner = str(owner_name or "").strip()
+    owner = _normalize_owner_name(owner_name)
     return int(INVENTORY_BY_OWNER.get(owner, INVENTORY_BY_OWNER[DEFAULT_INVENTORY_OWNER]))
+
+
+def _tag_for_owner(owner_name: str) -> str:
+    owner = _normalize_owner_name(owner_name)
+    return str(OWNER_TAG_BY_OWNER.get(owner, OWNER_TAG_BY_OWNER[DEFAULT_INVENTORY_OWNER])).strip()
 
 
 def _normalize_url_for_open(value: str) -> str:
@@ -343,11 +380,12 @@ class ProductProspectorDesktopApp:
 
         self.vendor_path = StringVar(value="")
         self.mode_help_text = StringVar(value="")
-        self.sku_scope_help_text = StringVar(value="Enter SKUs that need to be updated or added.")
+        self.sku_scope_help_text = StringVar(value="")
         self.input_metrics_text = StringVar(value="Vendor SKUs: 0 | Shopify Catalog SKUs: 0")
         self.sku_text_status = StringVar(value="")
         self.product_id_text_status = StringVar(value="")
         self.source_status_text = StringVar(value="")
+        self.vendor_input_loaded_text = StringVar(value="")
         self.duplicate_check_text = StringVar(value="")
         self.setup_status_text = StringVar(value="Select a Run Mode to begin.")
         self.processing_status_text = StringVar(value="")
@@ -370,9 +408,9 @@ class ProductProspectorDesktopApp:
         self.run_mode = StringVar(value="")
         self.run_mode_locked = BooleanVar(value=False)
         self.run_mode_summary_text = StringVar(value="")
-        self.use_all_sheet_skus = BooleanVar(value=False)
         self.inventory_owner = StringVar(value=DEFAULT_INVENTORY_OWNER)
         self.inventory_owner_inventory_text = StringVar(value=f"Inventory default: {_inventory_for_owner(DEFAULT_INVENTORY_OWNER):,}")
+        self.shopify_cache_inline_text = StringVar(value="Shopify SKU cache: not ready")
 
         self.year_policy = StringVar(value="merge")
         self.carry_down_sku = BooleanVar(value=True)
@@ -499,6 +537,8 @@ class ProductProspectorDesktopApp:
 
         self.run_mode.trace_add("write", self._on_run_mode_changed)
         self.inventory_owner.trace_add("write", self._on_inventory_owner_changed)
+        self.duplicate_check_text.trace_add("write", self._on_setup_status_rows_changed)
+        self.setup_status_text.trace_add("write", self._on_setup_status_rows_changed)
         self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
         self._load_review_collection_options()
 
@@ -551,6 +591,9 @@ class ProductProspectorDesktopApp:
             command=self._redownload_shopify_sku_cache_clicked,
         )
         self.shopify_cache_redownload_button.pack(side=LEFT, padx=(8, 0))
+        self.reset_app_button = ttk.Button(root_frame, text="Reset", command=self._reset_application_state)
+        self.reset_app_button.place(relx=1.0, x=-15, y=15, anchor="ne")
+        self.reset_app_button.lift()
         self._draw_shopify_dot(state="disconnected")
         self._refresh_shopify_cache_action_buttons()
 
@@ -1016,6 +1059,9 @@ class ProductProspectorDesktopApp:
             return
 
     def _build_setup_tab(self) -> None:
+        update_check_style = ttk.Style(self.root)
+        update_check_style.configure("WideUpdate.TCheckbutton", padding=(8, 4))
+
         self.setup_canvas = Canvas(self.tab_setup, highlightthickness=0, bd=0)
         self.setup_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         self.setup_scrollbar = ttk.Scrollbar(self.tab_setup, orient=VERTICAL, command=self.setup_canvas.yview)
@@ -1036,37 +1082,42 @@ class ProductProspectorDesktopApp:
         self.mode_area = ttk.Frame(self.setup_inner)
         self.mode_area.pack(fill=X, pady=(0, 8))
 
-        self.inventory_owner_wrap = ttk.LabelFrame(self.mode_area, text="Choose your Prospector", padding=8)
+        self.inventory_owner_wrap = ttk.Frame(self.mode_area, padding=8)
         self.inventory_owner_wrap.pack(fill=X, pady=(0, 8))
         owner_row = ttk.Frame(self.inventory_owner_wrap)
         owner_row.pack(fill=X)
-        ttk.Label(owner_row, text="Who are you?", width=18).pack(side=LEFT)
+        ttk.Label(owner_row, text="Choose your Prospector:").pack(side=LEFT, padx=(0, 6))
         self.inventory_owner_combo = ttk.Combobox(
             owner_row,
             textvariable=self.inventory_owner,
             values=INVENTORY_OWNER_VALUES,
             state="readonly",
             width=18,
+            height=len(INVENTORY_OWNER_VALUES),
+            postcommand=self._prepare_prospector_dropdown_menu,
         )
         self.inventory_owner_combo.pack(side=LEFT)
-        ttk.Label(owner_row, textvariable=self.inventory_owner_inventory_text, foreground="#1f4e79").pack(side=LEFT, padx=(10, 0))
+        ttk.Label(owner_row, textvariable=self.inventory_owner_inventory_text, foreground="#1f4e79").pack(side=LEFT, padx=(15, 10))
+        ttk.Label(owner_row, textvariable=self.shopify_cache_inline_text, foreground="#1f4e79").pack(side=LEFT, padx=(16, 0))
 
-        self.mode_selector_wrap = ttk.LabelFrame(self.mode_area, text="Run Mode", padding=8)
+        self.mode_selector_wrap = ttk.LabelFrame(self.mode_area, text="Run Mode -", padding=8)
         self.mode_selector_wrap.pack(fill=X)
+        self.mode_options_wrap = ttk.Frame(self.mode_selector_wrap)
+        self.mode_options_wrap.pack(fill=X)
         ttk.Radiobutton(
-            self.mode_selector_wrap,
+            self.mode_options_wrap,
             text="Update Existing Products",
             variable=self.run_mode,
             value=RUN_MODE_UPDATE,
         ).pack(anchor=W, pady=2)
         ttk.Radiobutton(
-            self.mode_selector_wrap,
+            self.mode_options_wrap,
             text="Create New Products",
             variable=self.run_mode,
             value=RUN_MODE_CREATE,
         ).pack(anchor=W, pady=2)
 
-        self.mode_summary_wrap = ttk.Frame(self.mode_area)
+        self.mode_summary_wrap = ttk.Frame(self.mode_selector_wrap, padding=(0, 10, 0, 0))
         ttk.Label(self.mode_summary_wrap, textvariable=self.run_mode_summary_text, font=("Segoe UI", 13, "bold")).pack(
             side=LEFT
         )
@@ -1077,24 +1128,23 @@ class ProductProspectorDesktopApp:
         self.setup_workflow_wrap = ttk.Frame(self.setup_inner)
         self.setup_workflow_wrap.pack(fill=X)
 
-        input_box = ttk.LabelFrame(self.setup_workflow_wrap, text="SKUs In Scope", padding=8)
+        input_box = ttk.Frame(self.setup_workflow_wrap, padding=8)
         input_box.pack(fill=X, pady=(0, 8))
-        ttk.Label(input_box, textvariable=self.sku_scope_help_text).pack(anchor=W)
 
         self.text_input_wrap = ttk.Frame(input_box)
         self.text_input_wrap.pack(fill=X, pady=(6, 6))
         self.text_input_wrap.columnconfigure(0, weight=1)
         self.text_input_wrap.columnconfigure(1, weight=1)
 
-        sku_scope_frame = ttk.LabelFrame(self.text_input_wrap, text="SKU", padding=8)
-        sku_scope_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.sku_scope_frame = ttk.LabelFrame(self.text_input_wrap, text="SKU (For looking up Products)", padding=8)
+        self.sku_scope_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         ttk.Label(
-            sku_scope_frame,
+            self.sku_scope_frame,
             text="Paste SKUs using any delimiter: comma, space, |, or line break.",
         ).pack(anchor=W)
-        self.sku_text_widget = tk.Text(sku_scope_frame, height=6, wrap="word")
+        self.sku_text_widget = tk.Text(self.sku_scope_frame, height=6, wrap="word")
         self.sku_text_widget.pack(fill=X, pady=(6, 6))
-        paste_btn_row = ttk.Frame(sku_scope_frame)
+        paste_btn_row = ttk.Frame(self.sku_scope_frame)
         paste_btn_row.pack(fill=X)
         self.load_pasted_btn = ttk.Button(paste_btn_row, text="Load Pasted SKUs", command=self._load_pasted_skus)
         self.load_pasted_btn.pack(side=LEFT)
@@ -1102,19 +1152,19 @@ class ProductProspectorDesktopApp:
         self.clear_pasted_btn.pack(side=LEFT, padx=(8, 0))
         ttk.Label(paste_btn_row, textvariable=self.sku_text_status, foreground="#1f4e79").pack(side=LEFT, padx=(12, 0))
 
-        product_id_scope_frame = ttk.LabelFrame(
+        self.product_id_scope_frame = ttk.LabelFrame(
             self.text_input_wrap,
-            text="Product ID (For looking up products / variants)",
+            text="Product ID (For looking up Variants)",
             padding=8,
         )
-        product_id_scope_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.product_id_scope_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Label(
-            product_id_scope_frame,
+            self.product_id_scope_frame,
             text="Paste numeric Shopify Product IDs (or product URLs that contain IDs).",
         ).pack(anchor=W)
-        self.product_id_text_widget = tk.Text(product_id_scope_frame, height=6, wrap="word")
+        self.product_id_text_widget = tk.Text(self.product_id_scope_frame, height=6, wrap="word")
         self.product_id_text_widget.pack(fill=X, pady=(6, 6))
-        product_id_btn_row = ttk.Frame(product_id_scope_frame)
+        product_id_btn_row = ttk.Frame(self.product_id_scope_frame)
         product_id_btn_row.pack(fill=X)
         self.load_product_ids_btn = ttk.Button(
             product_id_btn_row,
@@ -1133,14 +1183,6 @@ class ProductProspectorDesktopApp:
             padx=(12, 0),
         )
 
-        self.use_all_sheet_check = ttk.Checkbutton(
-            input_box,
-            text="Use all SKUs from uploaded spreadsheet",
-            variable=self.use_all_sheet_skus,
-            command=self._on_use_all_sheet_toggle,
-        )
-        self.use_all_sheet_check.pack(anchor=W, pady=(0, 6))
-
         self.spreadsheet_input_wrap = ttk.Frame(input_box)
         self.spreadsheet_input_wrap.pack(fill=X)
         self.load_sheet_btn = ttk.Button(
@@ -1148,15 +1190,16 @@ class ProductProspectorDesktopApp:
             text="Load Vendor Price Sheet (CSV/XLSX)",
             command=self._load_vendor_file,
         )
-        self.load_sheet_btn.pack(side=LEFT)
+        self.load_sheet_btn.pack(side=LEFT, padx=(10, 0))
         ttk.Label(self.spreadsheet_input_wrap, textvariable=self.vendor_path).pack(side=LEFT, padx=(10, 0))
-        ttk.Label(
-            input_box,
-            text="If loaded, spreadsheet values are used for in-scope SKUs and scraper fills only missing fields.",
-            foreground="#1f4e79",
-        ).pack(anchor=W, pady=(6, 0))
 
         self.vendor_mapping_wrap = ttk.LabelFrame(self.setup_workflow_wrap, text="Vendor Mapping", padding=8)
+        ttk.Label(
+            self.vendor_mapping_wrap,
+            text="Unmapped fields are allowed and can be filled by scraping, defaults and rules later.",
+            foreground="#1f4e79",
+        ).pack(anchor=W, pady=(0, 6))
+        self.rules_status = ttk.Label(self.vendor_mapping_wrap, text="", foreground="#1f4e79")
         mapping_grid = ttk.Frame(self.vendor_mapping_wrap)
         mapping_grid.pack(fill=X)
         mapping_grid.columnconfigure(0, weight=1)
@@ -1182,47 +1225,51 @@ class ProductProspectorDesktopApp:
             column=1,
         )
 
-        vendor_btn_row = ttk.Frame(self.vendor_mapping_wrap)
-        vendor_btn_row.pack(anchor=W, pady=(8, 0))
-        self.auto_suggest_btn = ttk.Button(vendor_btn_row, text="Auto Suggest Vendor", command=self._auto_suggest_vendor)
-        self.auto_suggest_btn.pack(side=LEFT, padx=(0, 8))
-        self.stitch_btn = ttk.Button(vendor_btn_row, text="Stitch Vendor Rows", command=self._stitch_vendor_rows)
-        self.stitch_btn.pack(side=LEFT)
-        ttk.Label(
-            self.vendor_mapping_wrap,
-            text="Unmapped fields are allowed and can be filled by defaults/rules later.",
-            foreground="#1f4e79",
-        ).pack(anchor=W, pady=(6, 0))
-
         self.vendor_preview_wrap = ttk.LabelFrame(self.setup_workflow_wrap, text="Vendor Input Preview", padding=8)
         self.vendor_preview = self._create_tree(self.vendor_preview_wrap, height_rows=10, expand=False, fill_mode=BOTH)
+        self.vendor_input_loaded_wrap = ttk.Frame(self.setup_workflow_wrap)
+        ttk.Label(
+            self.vendor_input_loaded_wrap,
+            textvariable=self.vendor_input_loaded_text,
+            foreground="#1f4e79",
+        ).pack(anchor=W, padx=(10, 0))
 
         self.update_fields_wrap = ttk.LabelFrame(self.setup_workflow_wrap, text="Fields To Update (Update Mode)", padding=8)
-        update_grid = ttk.Frame(self.update_fields_wrap)
-        update_grid.pack(fill=X)
-        ttk.Checkbutton(update_grid, text="Title", variable=self.update_title).grid(row=0, column=0, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Price", variable=self.update_price).grid(row=0, column=1, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Cost", variable=self.update_cost).grid(row=0, column=2, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Description", variable=self.update_description).grid(row=1, column=0, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Images", variable=self.update_images).grid(row=1, column=1, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Category Fields", variable=self.update_category_fields).grid(row=1, column=2, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Vendor", variable=self.update_vendor).grid(row=2, column=0, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Weight", variable=self.update_weight).grid(row=2, column=1, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Barcode", variable=self.update_barcode).grid(row=2, column=2, sticky=W, padx=(0, 16))
-        ttk.Checkbutton(update_grid, text="Application", variable=self.update_application).grid(row=3, column=0, sticky=W, padx=(0, 16))
         ttk.Label(
             self.update_fields_wrap,
             text="Checked fields are the only fields that will be updated on matching Shopify products.",
             foreground="#1f4e79",
-        ).pack(anchor=W, pady=(6, 0))
+        ).pack(anchor=W, pady=(0, 6))
+        update_grid = ttk.Frame(self.update_fields_wrap)
+        update_grid.pack(fill=X)
+        for idx in range(3):
+            update_grid.columnconfigure(idx, weight=1)
 
-        # Footer area remains pinned below setup content; vendor preview/mapping
-        # and update-fields sections are always inserted above this wrapper.
-        self.setup_footer_wrap = ttk.Frame(self.setup_workflow_wrap)
-        self.setup_footer_wrap.pack(fill=X)
-        ttk.Label(self.setup_footer_wrap, textvariable=self.input_metrics_text, foreground="#1f4e79").pack(anchor=W)
-        ttk.Label(self.setup_footer_wrap, textvariable=self.source_status_text, foreground="#1f4e79").pack(anchor=W, pady=(2, 8))
-        self.duplicate_status_wrap = ttk.Frame(self.setup_footer_wrap)
+        def add_update_check(row: int, column: int, label: str, var: tk.BooleanVar) -> None:
+            ttk.Checkbutton(
+                update_grid,
+                text=label,
+                variable=var,
+                style="WideUpdate.TCheckbutton",
+                width=18,
+            ).grid(row=row, column=column, sticky=W, padx=(0, 20), pady=(3, 3))
+
+        add_update_check(0, 0, "Title", self.update_title)
+        add_update_check(0, 1, "Price", self.update_price)
+        add_update_check(0, 2, "Cost", self.update_cost)
+        add_update_check(1, 0, "Description", self.update_description)
+        add_update_check(1, 1, "Images", self.update_images)
+        add_update_check(1, 2, "Category Fields", self.update_category_fields)
+        add_update_check(2, 0, "Vendor", self.update_vendor)
+        add_update_check(2, 1, "Weight", self.update_weight)
+        add_update_check(2, 2, "Barcode", self.update_barcode)
+        add_update_check(3, 0, "Application", self.update_application)
+
+        self.setup_status_wrap = ttk.Frame(input_box)
+        # Add vertical separation under the sheet controls before blue status rows.
+        self.setup_status_wrap.pack(fill=X, pady=(23, 0))
+        ttk.Label(self.setup_status_wrap, textvariable=self.input_metrics_text, foreground="#1f4e79").pack(anchor=W)
+        self.duplicate_status_wrap = ttk.Frame(self.setup_status_wrap)
         self.duplicate_status_wrap.pack(fill=X, pady=(0, 2))
         ttk.Label(self.duplicate_status_wrap, textvariable=self.duplicate_check_text, foreground="#1f4e79").pack(anchor=W)
         self.duplicate_check_progress = ttk.Progressbar(
@@ -1232,14 +1279,15 @@ class ProductProspectorDesktopApp:
             maximum=100,
             value=0,
         )
-        self.rules_status = ttk.Label(self.setup_footer_wrap, text="", foreground="#1f4e79")
-        self.rules_status.pack(anchor=W)
-
-        self.setup_status = ttk.Label(self.setup_footer_wrap, textvariable=self.setup_status_text, foreground="#1f4e79")
+        self.setup_status = ttk.Label(self.setup_status_wrap, textvariable=self.setup_status_text, foreground="#1f4e79")
         self.setup_status.pack(anchor=W)
 
+        # Footer area remains pinned below setup content; vendor preview/mapping
+        # and update-fields sections are always inserted above this wrapper.
+        self.setup_footer_wrap = ttk.Frame(self.setup_workflow_wrap)
+        self.setup_footer_wrap.pack(fill=X)
         continue_row = ttk.Frame(self.setup_footer_wrap)
-        continue_row.pack(fill=X, pady=(6, 6))
+        continue_row.pack(fill=X, pady=(4, 6))
         self.setup_continue_row = continue_row
         self.setup_continue_btn = ttk.Button(
             continue_row,
@@ -1254,7 +1302,6 @@ class ProductProspectorDesktopApp:
         )
         self.setup_skip_review_btn.pack(side=LEFT, padx=(8, 0))
         self.setup_mode_widgets = [
-            self.use_all_sheet_check,
             self.load_sheet_btn,
             self.load_pasted_btn,
             self.clear_pasted_btn,
@@ -1271,8 +1318,6 @@ class ProductProspectorDesktopApp:
             self.vendor_barcode_combo,
             self.vendor_weight_combo,
             self.vendor_fitment_combo,
-            self.auto_suggest_btn,
-            self.stitch_btn,
             self.setup_continue_btn,
             self.setup_skip_review_btn,
         ]
@@ -1280,6 +1325,37 @@ class ProductProspectorDesktopApp:
         self._set_duplicate_check_busy(False)
         self._refresh_mode_lock_ui()
         self._attach_vendor_mapping_traces()
+        self._refresh_product_id_scope_visibility()
+        self._refresh_setup_status_rows()
+
+    def _prepare_prospector_dropdown_menu(self) -> None:
+        if not hasattr(self, "inventory_owner_combo"):
+            return
+        try:
+            combo = self.inventory_owner_combo
+            popdown = str(self.root.tk.call("ttk::combobox::PopdownWindow", str(combo)))
+            listbox_path = f"{popdown}.f.l"
+            if not hasattr(self, "_prospector_dropdown_font"):
+                base_name = str(combo.cget("font") or "TkTextFont")
+                try:
+                    base_font = tkfont.nametofont(base_name)
+                except Exception:
+                    base_font = tkfont.nametofont("TkTextFont")
+                size = int(base_font.cget("size"))
+                adjusted_size = size
+                if size > 0:
+                    adjusted_size = size + 1
+                elif size < 0:
+                    adjusted_size = size - 1
+                self._prospector_dropdown_font = tkfont.Font(
+                    self.root,
+                    family=base_font.cget("family"),
+                    size=adjusted_size,
+                    weight=base_font.cget("weight"),
+                )
+            self.root.tk.call(listbox_path, "configure", "-font", str(self._prospector_dropdown_font))
+        except Exception:
+            return
 
     def _set_setup_workflow_visible(self, visible: bool) -> None:
         if not hasattr(self, "setup_workflow_wrap"):
@@ -1289,6 +1365,28 @@ class ProductProspectorDesktopApp:
                 self.setup_workflow_wrap.pack(fill=X)
             return
         self.setup_workflow_wrap.pack_forget()
+
+    def _on_setup_status_rows_changed(self, *_args) -> None:
+        self._refresh_setup_status_rows()
+
+    def _refresh_setup_status_rows(self) -> None:
+        if not hasattr(self, "duplicate_status_wrap"):
+            return
+        duplicate_text = str(self.duplicate_check_text.get() or "").strip()
+        if duplicate_text:
+            if not self.duplicate_status_wrap.winfo_manager():
+                self.duplicate_status_wrap.pack(fill=X, pady=(0, 2))
+        elif self.duplicate_status_wrap.winfo_manager():
+            self.duplicate_status_wrap.pack_forget()
+
+        if not hasattr(self, "setup_status"):
+            return
+        setup_text = str(self.setup_status_text.get() or "").strip()
+        if setup_text:
+            if not self.setup_status.winfo_manager():
+                self.setup_status.pack(anchor=W)
+        elif self.setup_status.winfo_manager():
+            self.setup_status.pack_forget()
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
         try:
@@ -1578,13 +1676,88 @@ class ProductProspectorDesktopApp:
         self._update_tab_access()
         self._refresh_mode_lock_ui()
 
+    def _reset_application_state(self) -> None:
+        if self.processing_inflight or self.shopify_push_inflight:
+            messagebox.showwarning(APP_TITLE, "Wait for active processing or Shopify push to finish before resetting.")
+            return
+
+        self._unlock_run_mode()
+
+        self.vendor_df_raw = None
+        self.vendor_df_stitched = None
+        self.plan_df = None
+        self.vendor_source_is_sheet = False
+        self.vendor_path.set("")
+        self.vendor_input_loaded_text.set("")
+        self.source_status_text.set("")
+        self.sku_text_status.set("")
+        self.product_id_text_status.set("")
+        self.duplicate_check_text.set("")
+        self.rules_status.configure(text="")
+        self.setup_status_text.set("Application reset. Select a Run Mode to begin.")
+        self.processing_status_text.set("")
+        self.review_status_text.set("")
+
+        self.sku_text_widget.configure(state="normal")
+        self.sku_text_widget.delete("1.0", END)
+        self.product_id_text_widget.configure(state="normal")
+        self.product_id_text_widget.delete("1.0", END)
+
+        self.scrape_search_url.set("")
+        self.scrape_workers.set("3")
+        self.scrape_delay.set("0.35")
+        self.scrape_retries.set("2")
+        self.scrape_headless.set(True)
+        self.scrape_images.set(True)
+        self.scrape_force.set(False)
+
+        for _field_name, variable in self._vendor_mapping_var_pairs():
+            variable.set("")
+        self._bind_vendor_columns([])
+        _tree_show_dataframe(self.vendor_preview, pd.DataFrame())
+        _tree_show_dataframe(self.processing_preview, pd.DataFrame())
+
+        self.push_selected_skus = set()
+        self.review_table_row_index_map = {}
+        self.review_index = 0
+        self.review_refresh_pending = False
+        self.review_refresh_inflight = False
+        self._cancel_review_table_refresh()
+        self._hide_review_busy_overlay()
+        self.review_loaded_raw = {}
+        self.review_loaded_display = {}
+        self.review_loaded_truncated = {}
+        self.review_cost_options_loaded_for_sku = ""
+        self.review_cost_option_map = {}
+        self.review_cost_options = []
+        self.review_collection_selected = []
+        self.review_collections_query.set("")
+        for var in self.review_fields.values():
+            var.set("")
+        self.review_fields["inventory"].set(str(_inventory_for_owner(self.inventory_owner.get())))
+        self._clear_review_variant_fields()
+        self._set_review_collections_from_text("")
+        self._set_variant_form_visible(False)
+        self._refresh_review_tab()
+        self.review_status_text.set("")
+
+        self._duplicate_check_request_id += 1
+        self.create_existing_skus = set()
+        self.create_duplicate_scope = ()
+        self._set_duplicate_check_busy(False)
+        self._refresh_vendor_sheet_ui()
+        self._refresh_input_metrics()
+        self._refresh_sku_action_labels()
+        self._refresh_new_mode_check_controls()
+        self._refresh_push_button_state()
+        self._update_tab_access()
+        self.notebook.select(0)
+
     def _on_inventory_owner_changed(self, *_args) -> None:
-        selected = self.inventory_owner.get().strip()
-        if selected not in INVENTORY_BY_OWNER:
-            selected = DEFAULT_INVENTORY_OWNER
-            if self.inventory_owner.get() != selected:
-                self.inventory_owner.set(selected)
-                return
+        selected = _normalize_owner_name(self.inventory_owner.get())
+        if self.inventory_owner.get().strip() != selected:
+            self.inventory_owner.set(selected)
+            return
 
         inventory_value = _inventory_for_owner(selected)
         self.session.inventory_default = inventory_value
@@ -1596,16 +1769,16 @@ class ProductProspectorDesktopApp:
         mode_name = self.run_mode.get().strip()
         display_mode_map = {
             RUN_MODE_UPDATE: "Update Existing Products",
-            RUN_MODE_CREATE: "Create New Products",
+            RUN_MODE_CREATE: "Create New Product",
         }
         display_mode = display_mode_map.get(mode_name, "Not Selected")
-        self.run_mode_summary_text.set(f"Run Mode - {display_mode}")
+        self.run_mode_summary_text.set(display_mode)
         if self.run_mode_locked.get():
-            self.mode_selector_wrap.pack_forget()
+            self.mode_options_wrap.pack_forget()
             self.mode_summary_wrap.pack(fill=X)
             return
         self.mode_summary_wrap.pack_forget()
-        self.mode_selector_wrap.pack(fill=X)
+        self.mode_options_wrap.pack(fill=X)
 
     def _build_preview_tab(self) -> None:
         self.preview_canvas = Canvas(self.tab_preview, highlightthickness=0, bd=0)
@@ -3203,7 +3376,7 @@ class ProductProspectorDesktopApp:
         self.review_busy_text.set("Checking existing SKUs in Shopify...")
         self._show_review_busy_overlay("Checking existing SKUs in Shopify...")
         self._set_shopify_push_busy(True)
-        operator_tag = str(self.inventory_owner.get() or "").strip() or DEFAULT_INVENTORY_OWNER
+        operator_tag = _tag_for_owner(self.inventory_owner.get())
 
         worker = threading.Thread(
             target=self._run_shopify_push_worker,
@@ -3509,12 +3682,51 @@ class ProductProspectorDesktopApp:
         except Exception:
             return 0
 
+    def _refresh_shopify_cache_inline_text(self) -> None:
+        def apply() -> None:
+            if not hasattr(self, "shopify_cache_inline_text"):
+                return
+
+            if self.shopify_cache_warmup_inflight:
+                self.shopify_cache_inline_text.set("Shopify SKU cache: downloading...")
+                return
+
+            count = 0
+            try:
+                if self.shopify_df_raw is not None and not self.shopify_df_raw.empty:
+                    if "sku" in self.shopify_df_raw.columns:
+                        count = int(
+                            self.shopify_df_raw["sku"]
+                            .astype(str)
+                            .map(normalize_sku)
+                            .replace("", pd.NA)
+                            .dropna()
+                            .nunique()
+                        )
+                    else:
+                        count = int(len(self.shopify_df_raw))
+                else:
+                    count = self._cached_shopify_sku_count()
+            except Exception:
+                count = self._cached_shopify_sku_count()
+
+            if count > 0 or self.shopify_cache_ready:
+                self.shopify_cache_inline_text.set(f"Shopify SKU cache ready: {count:,} SKUs")
+            else:
+                self.shopify_cache_inline_text.set("Shopify SKU cache: not ready")
+
+        if threading.current_thread() is threading.main_thread():
+            apply()
+            return
+        self._run_on_ui_thread(apply)
+
     def _initialize_shopify_cache_state(self) -> None:
         cached_df = load_shopify_sku_cache()
         self.shopify_cache_ready = cached_df is not None and not cached_df.empty
         if self.shopify_cache_ready and (self.shopify_df_raw is None or self.shopify_df_raw.empty):
             self.shopify_df_raw = cached_df
         self._set_shopify_cache_api_busy(False)
+        self._refresh_shopify_cache_inline_text()
         self._refresh_shopify_cache_action_buttons()
         self._refresh_new_mode_check_controls()
 
@@ -3746,6 +3958,7 @@ class ProductProspectorDesktopApp:
                 if not self.shopify_cache_api_label.winfo_ismapped():
                     self.shopify_cache_api_label.pack(side=LEFT, padx=(6, 0))
                 self._start_shopify_cache_spinner()
+                self._refresh_shopify_cache_inline_text()
                 return
             self._stop_shopify_cache_spinner()
             if self.shopify_cache_api_spinner.winfo_ismapped():
@@ -3753,6 +3966,7 @@ class ProductProspectorDesktopApp:
             if self.shopify_cache_api_label.winfo_ismapped():
                 self.shopify_cache_api_label.pack_forget()
             self.shopify_cache_api_text.set("")
+            self._refresh_shopify_cache_inline_text()
 
         self._run_on_ui_thread(apply)
 
@@ -3894,6 +4108,7 @@ class ProductProspectorDesktopApp:
             if connected:
                 self.shopify_ever_connected = True
             self._refresh_shopify_cache_action_buttons()
+            self._refresh_shopify_cache_inline_text()
             if connected:
                 # Avoid re-downloading full catalog on every reconnect.
                 # If cache is already present, warmup uses cached rows and returns quickly.
@@ -4040,17 +4255,18 @@ class ProductProspectorDesktopApp:
             self.run_mode_locked.set(False)
             self._set_setup_workflow_visible(False)
             self.setup_status_text.set("Select a Run Mode to begin.")
-            self.sku_scope_help_text.set("Enter SKUs that need to be updated or added.")
+            self.sku_scope_help_text.set("")
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
             self.duplicate_check_text.set("")
             self._set_duplicate_check_busy(False)
             self._set_setup_mode_widgets_enabled(False)
-            self.update_fields_wrap.pack_forget()
             self.session.mode = ""
             self._refresh_mode_lock_ui()
             self._update_tab_access()
+            self._refresh_product_id_scope_visibility()
             self._refresh_sku_action_labels()
+            self._refresh_vendor_sheet_ui()
             return
 
         if self._mode_initialized and not self.run_mode_locked.get():
@@ -4059,9 +4275,7 @@ class ProductProspectorDesktopApp:
         self._set_setup_workflow_visible(True)
         if mode == RUN_MODE_UPDATE:
             self.session.mode = MODE_UPDATE
-            self.sku_scope_help_text.set(
-                "Enter SKUs and/or Product IDs that need to be updated. Use 'Skip to Review & Export' for fast direct edits."
-            )
+            self.sku_scope_help_text.set("")
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
             self.duplicate_check_text.set("")
@@ -4070,7 +4284,6 @@ class ProductProspectorDesktopApp:
                 "Update Existing Products: Finds matching SKUs and proposes field changes (fitment/title/etc). "
                 "SKUs not found are skipped."
             )
-            self.update_fields_wrap.pack(fill=X, pady=(0, 8), before=self.setup_footer_wrap)
             self.setup_continue_btn.configure(text="Save & Continue to Scraping")
             self.setup_skip_review_btn.configure(state="normal")
             self.load_product_ids_btn.configure(state="normal")
@@ -4078,22 +4291,21 @@ class ProductProspectorDesktopApp:
             self.product_id_text_widget.configure(state="normal")
         elif mode == RUN_MODE_CREATE:
             self.session.mode = MODE_NEW
-            self.sku_scope_help_text.set("Enter SKUs that need to be added as new products.")
+            self.sku_scope_help_text.set("")
             cached_count = 0
             try:
                 cached_count = int(len(load_shopify_sku_cache()))
             except Exception:
                 cached_count = 0
             if cached_count:
-                self.duplicate_check_text.set(f"Shopify SKU cache ready: {cached_count} SKU(s).")
+                self.duplicate_check_text.set("Load SKUs to run duplicate check.")
             else:
-                self.duplicate_check_text.set("Shopify SKU cache is downloading. SKU check buttons enable when ready.")
+                self.duplicate_check_text.set("Duplicate check is preparing. Try again shortly.")
             self._set_duplicate_check_busy(False)
             self.mode_help_text.set(
                 "Create New Products: Treats input as candidates for new product creation. "
                 "If Shopify export is loaded, already-existing SKUs can be excluded."
             )
-            self.update_fields_wrap.pack_forget()
             self.setup_continue_btn.configure(text="Save & Continue to Scraping")
             self.setup_skip_review_btn.configure(state="disabled")
             self.load_product_ids_btn.configure(state="disabled")
@@ -4102,8 +4314,10 @@ class ProductProspectorDesktopApp:
         else:
             self.session.mode = ""
             self.mode_help_text.set("Select a valid run mode.")
+        self._refresh_product_id_scope_visibility()
+        self._refresh_vendor_sheet_ui()
         self._set_setup_mode_widgets_enabled(True)
-        self.setup_status_text.set(f"Run Mode selected: {merge_mode_label(self.session.mode)}")
+        self.setup_status_text.set("")
         self._refresh_mode_lock_ui()
         self._refresh_sku_action_labels()
         self._refresh_new_mode_check_controls()
@@ -4136,6 +4350,20 @@ class ProductProspectorDesktopApp:
         self.setup_continue_btn.configure(state="normal")
         self._refresh_new_mode_check_controls()
 
+    def _refresh_product_id_scope_visibility(self) -> None:
+        if not hasattr(self, "text_input_wrap"):
+            return
+        show_product_id = self.session.mode == MODE_UPDATE
+        self.text_input_wrap.columnconfigure(0, weight=1)
+        if show_product_id:
+            self.text_input_wrap.columnconfigure(1, weight=1)
+            self.sku_scope_frame.grid_configure(padx=(0, 6))
+            self.product_id_scope_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            return
+        self.text_input_wrap.columnconfigure(1, weight=0)
+        self.sku_scope_frame.grid_configure(padx=(0, 0))
+        self.product_id_scope_frame.grid_remove()
+
     def _refresh_new_mode_check_controls(self) -> None:
         if not hasattr(self, "load_pasted_btn"):
             return
@@ -4143,37 +4371,29 @@ class ProductProspectorDesktopApp:
         base_state = "normal" if self.setup_widgets_enabled else "disabled"
         if base_state == "disabled":
             self.load_pasted_btn.configure(state="disabled")
-            self.use_all_sheet_check.configure(state="disabled")
             return
 
         if self.session.mode != MODE_NEW:
             self.load_pasted_btn.configure(state=base_state)
-            self.use_all_sheet_check.configure(state=base_state)
             return
 
         check_state = "normal" if self.shopify_cache_ready else "disabled"
         self.load_pasted_btn.configure(state=check_state)
-        self.use_all_sheet_check.configure(state=check_state)
 
     def _refresh_sku_action_labels(self) -> None:
         if self.session.mode == MODE_NEW:
             self.load_pasted_btn.configure(text="Load and Check SKUs")
             self.load_sheet_btn.configure(text="Load Price Sheet and Check SKUs")
-            self.use_all_sheet_check.configure(text="Use all SKUs from uploaded spreadsheet (and check Shopify)")
             self.load_product_ids_btn.configure(text="Load Product IDs")
             return
         self.load_pasted_btn.configure(text="Load Pasted SKUs")
         self.load_sheet_btn.configure(text="Load Vendor Price Sheet (CSV/XLSX)")
-        self.use_all_sheet_check.configure(text="Use all SKUs from uploaded spreadsheet")
         self.load_product_ids_btn.configure(text="Load Product IDs")
 
     def _set_duplicate_check_busy(self, busy: bool) -> None:
         if busy:
             self._duplicate_check_inflight = True
             self._duplicate_check_started_at = time.monotonic()
-            if not self.duplicate_check_progress.winfo_ismapped():
-                self.duplicate_check_progress.pack(anchor=W, fill=X, pady=(4, 0))
-            self.duplicate_check_progress.configure(mode="determinate", maximum=100, value=0)
             return
         self._duplicate_check_inflight = False
         self._duplicate_check_active_workers = 0
@@ -4188,8 +4408,6 @@ class ProductProspectorDesktopApp:
                 return
             safe_total = max(1, int(total))
             safe_current = max(0, min(int(current), safe_total))
-            if not self.duplicate_check_progress.winfo_ismapped():
-                self.duplicate_check_progress.pack(anchor=W, fill=X, pady=(4, 0))
             self.duplicate_check_progress.configure(mode="determinate", maximum=safe_total, value=safe_current)
             if text is not None:
                 self.duplicate_check_text.set(text)
@@ -4199,26 +4417,14 @@ class ProductProspectorDesktopApp:
             return
         self._run_on_ui_thread(apply)
 
-    def _on_use_all_sheet_toggle(self) -> None:
+    def _on_vendor_sku_mapping_changed(self) -> None:
         self._refresh_input_metrics()
         if self.session.mode != MODE_NEW:
             return
-        if not self.shopify_cache_ready:
-            self.duplicate_check_text.set("Shopify SKU cache is downloading. SKU check buttons enable when ready.")
-            return
-        scope_skus = self._create_scope_skus_for_duplicate_check()
-        if not scope_skus:
-            if self.use_all_sheet_skus.get():
-                self.duplicate_check_text.set("Load a spreadsheet and map SKU to run duplicate check.")
-            return
-        self._queue_create_duplicate_check(scope_skus)
-
-    def _on_vendor_sku_mapping_changed(self) -> None:
-        self._refresh_input_metrics()
-        if self.session.mode != MODE_NEW or not self.use_all_sheet_skus.get():
+        if self._pasted_scope_skus():
             return
         if not self.shopify_cache_ready:
-            self.duplicate_check_text.set("Shopify SKU cache is downloading. SKU check buttons enable when ready.")
+            self.duplicate_check_text.set("Duplicate check is preparing. Try again shortly.")
             return
         scope_skus = self._sheet_scope_skus()
         if not scope_skus:
@@ -4242,12 +4448,16 @@ class ProductProspectorDesktopApp:
             .tolist()
         )
 
+    def _pasted_scope_skus(self) -> list[str]:
+        return self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+
     def _create_scope_skus_for_duplicate_check(self) -> list[str]:
         if self.session.mode != MODE_NEW:
             return []
-        if self.use_all_sheet_skus.get():
-            return self._sheet_scope_skus()
-        return self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+        pasted_skus = self._pasted_scope_skus()
+        if pasted_skus:
+            return pasted_skus
+        return self._sheet_scope_skus()
 
     def _compact_sku_for_partial_match(self, value: str) -> str:
         return re.sub(r"[^A-Z0-9]", "", normalize_sku(value))
@@ -4396,7 +4606,7 @@ class ProductProspectorDesktopApp:
             self.duplicate_check_text.set(f"Checking Shopify for {len(normalized)} scoped SKU(s)...")
         else:
             self.duplicate_check_text.set(
-                f"Building local Shopify SKU cache (one-time read-only sync), then checking {len(normalized)} SKU(s)..."
+                f"Preparing duplicate check, then checking {len(normalized)} SKU(s)..."
             )
         self._set_duplicate_check_busy(True)
         self._duplicate_check_pending_scope = tuple(normalized)
@@ -4485,7 +4695,7 @@ class ProductProspectorDesktopApp:
             self.duplicate_check_text.set(f"Checking Shopify for {len(normalized)} scoped SKU(s)...")
         else:
             self.duplicate_check_text.set(
-                f"Building local Shopify SKU cache (one-time read-only sync), then checking {len(normalized)} SKU(s)..."
+                f"Preparing duplicate check, then checking {len(normalized)} SKU(s)..."
             )
         self._set_duplicate_check_busy(True)
         self._set_duplicate_check_progress(
@@ -4585,12 +4795,6 @@ class ProductProspectorDesktopApp:
         pasted_product_ids = self._parse_product_id_text(self.product_id_text_widget.get("1.0", END))
         has_sheet = self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty
         bypass_sheet_for_skip = bool(skip_to_review and self.session.mode == MODE_UPDATE)
-        use_all_sheet_skus = bool(self.use_all_sheet_skus.get())
-
-        if use_all_sheet_skus and not has_sheet:
-            if show_messages:
-                messagebox.showwarning(APP_TITLE, "Load a vendor spreadsheet before using all spreadsheet SKUs.")
-            return False
         self._enforce_unique_vendor_mappings()
 
         self.session.source_mapping.vendor = self.vendor_vendor_column.get().strip()
@@ -4645,18 +4849,15 @@ class ProductProspectorDesktopApp:
                     )
                 return False
 
-        if use_all_sheet_skus:
-            target_skus = sheet_scope_skus
-        else:
-            target_skus = pasted_skus
+        target_skus = pasted_skus if pasted_skus else sheet_scope_skus
 
         has_update_product_ids = self.session.mode == MODE_UPDATE and bool(pasted_product_ids)
         if not target_skus and not (skip_to_review and has_update_product_ids):
             if show_messages:
-                if has_sheet and not use_all_sheet_skus:
+                if has_sheet:
                     messagebox.showwarning(
                         APP_TITLE,
-                        "Paste SKUs or enable 'Use all SKUs from uploaded spreadsheet'.",
+                        "Paste SKUs or map the spreadsheet SKU column to include sheet SKUs in scope.",
                     )
                 else:
                     messagebox.showwarning(APP_TITLE, "Provide at least one valid SKU before continuing.")
@@ -4923,7 +5124,7 @@ class ProductProspectorDesktopApp:
         self.review_busy_text.set(f"Updating variant weights... 0/{len(updates)}")
         self._show_review_busy_overlay(f"Updating variant weights... 0/{len(updates)}")
         self.review_status_text.set(f"Pushing {len(updates)} variant weight updates to Shopify...")
-        operator_tag = str(self.inventory_owner.get() or "").strip() or DEFAULT_INVENTORY_OWNER
+        operator_tag = _tag_for_owner(self.inventory_owner.get())
 
         worker = threading.Thread(
             target=self._run_variant_weight_push_worker,
@@ -5301,9 +5502,16 @@ class ProductProspectorDesktopApp:
         has_vendor_sheet_rows = self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty
 
         self.vendor_preview_wrap.pack_forget()
+        self.vendor_input_loaded_wrap.pack_forget()
         self.vendor_mapping_wrap.pack_forget()
+        self.update_fields_wrap.pack_forget()
+
+        if self.session.mode == MODE_UPDATE:
+            self.update_fields_wrap.pack(fill=X, pady=(2, 8), before=self.setup_footer_wrap)
+
         if has_vendor_sheet_rows:
             self.vendor_mapping_wrap.pack(fill=X, pady=(0, 8), before=self.setup_footer_wrap)
+            self.vendor_input_loaded_wrap.pack(fill=X, pady=(0, 4), before=self.setup_footer_wrap)
             self.vendor_preview_wrap.pack(fill=X, pady=(0, 8), before=self.setup_footer_wrap)
 
     def _parse_sku_text(self, raw_text: str) -> list[str]:
@@ -5332,10 +5540,17 @@ class ProductProspectorDesktopApp:
     def _clear_pasted_skus(self) -> None:
         self.sku_text_widget.delete("1.0", END)
         self.sku_text_status.set("")
-        if self.session.mode == MODE_NEW and not self.use_all_sheet_skus.get():
+        if self.session.mode == MODE_NEW:
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
-            self.duplicate_check_text.set("Shopify duplicate check runs when SKU scope is loaded.")
+            scope_skus = self._create_scope_skus_for_duplicate_check()
+            if scope_skus:
+                if self.shopify_cache_ready:
+                    self._queue_create_duplicate_check(scope_skus)
+                else:
+                    self.duplicate_check_text.set("Duplicate check is preparing. Try again shortly.")
+            else:
+                self.duplicate_check_text.set("Shopify duplicate check runs when SKU scope is loaded.")
         self._refresh_input_metrics()
 
     def _clear_product_ids(self) -> None:
@@ -5353,15 +5568,13 @@ class ProductProspectorDesktopApp:
         _tree_show_dataframe(self.vendor_preview, _safe_head(normalized_df))
         self._bind_vendor_columns(list(normalized_df.columns))
         self._auto_suggest_vendor()
-        sample_columns = ", ".join(list(normalized_df.columns)[:8])
-        if len(normalized_df.columns) > 8:
-            sample_columns += ", ..."
-        self.source_status_text.set(
-            f"Vendor input loaded: {len(normalized_df)} rows, {len(normalized_df.columns)} columns. {sample_columns}"
+        self.vendor_input_loaded_text.set(
+            f"Vendor Input Loaded: {len(normalized_df):,} rows, {len(normalized_df.columns):,} columns"
         )
+        self.source_status_text.set("")
         self._refresh_input_metrics()
         self._refresh_vendor_sheet_ui()
-        if self.session.mode == MODE_NEW and self.use_all_sheet_skus.get():
+        if self.session.mode == MODE_NEW and not self._pasted_scope_skus():
             scope_skus = self._sheet_scope_skus()
             if scope_skus:
                 self._queue_create_duplicate_check(scope_skus)
@@ -5397,7 +5610,7 @@ class ProductProspectorDesktopApp:
         self.sku_text_status.set(f"Found {len(skus)} unique SKUs in text scope")
         self.source_status_text.set(f"SKU text scope ready: {len(skus)} SKUs.")
         self._refresh_input_metrics()
-        if self.session.mode == MODE_NEW and not self.use_all_sheet_skus.get():
+        if self.session.mode == MODE_NEW:
             self._queue_create_duplicate_check(skus)
 
     def _load_product_ids(self) -> None:
@@ -5483,15 +5696,16 @@ class ProductProspectorDesktopApp:
             else:
                 vendor_skus = int(len(self.vendor_df_raw))
 
-        scoped_skus = len(self._parse_sku_text(self.sku_text_widget.get("1.0", END)))
+        scoped_skus = len(self._pasted_scope_skus())
         scoped_product_ids = len(self._parse_product_id_text(self.product_id_text_widget.get("1.0", END)))
-        if self.use_all_sheet_skus.get() and vendor_skus:
-            scoped_skus = vendor_skus
+        if self.session.mode == MODE_NEW:
+            scoped_skus = len(self._create_scope_skus_for_duplicate_check())
 
         shopify_rows = int(len(self.shopify_df_raw)) if self.shopify_df_raw is not None else 0
         self.input_metrics_text.set(
             f"Vendor SKUs: {vendor_skus} | Scoped SKUs: {scoped_skus} | Scoped Product IDs: {scoped_product_ids} | Shopify Catalog SKUs: {shopify_rows}"
         )
+        self._refresh_shopify_cache_inline_text()
 
     def _vendor_mapping_var_pairs(self) -> list[tuple[str, StringVar]]:
         return [
@@ -6009,9 +6223,7 @@ class ProductProspectorDesktopApp:
         self.carry_down_sku.set(settings.carry_down_sku)
         self.propose_title_year_update.set(settings.propose_title_year_update)
         self.only_rows_with_year_changes.set(settings.only_rows_with_year_changes)
-        owner = str(getattr(settings, "inventory_owner", DEFAULT_INVENTORY_OWNER) or "").strip()
-        if owner not in INVENTORY_BY_OWNER:
-            owner = DEFAULT_INVENTORY_OWNER
+        owner = _normalize_owner_name(getattr(settings, "inventory_owner", DEFAULT_INVENTORY_OWNER))
         self.inventory_owner.set(owner)
         self._on_inventory_owner_changed()
 
@@ -6032,7 +6244,7 @@ class ProductProspectorDesktopApp:
             carry_down_sku=self.carry_down_sku.get(),
             propose_title_year_update=self.propose_title_year_update.get(),
             only_rows_with_year_changes=self.only_rows_with_year_changes.get(),
-            inventory_owner=self.inventory_owner.get().strip() or DEFAULT_INVENTORY_OWNER,
+            inventory_owner=_normalize_owner_name(self.inventory_owner.get()),
         )
         try:
             save_app_settings(settings)

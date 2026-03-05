@@ -9,6 +9,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 ICON_ICO="$PROJECT_ROOT/app/icon.ico"
 ICONSET_DIR="$APP_DEV_DIR/build/ProductProspector.iconset"
 ICON_ICNS="$APP_DEV_DIR/build/ProductProspector.icns"
+ROOT_APP="$PROJECT_ROOT/ProductProspector.app"
+COPY_TO_ROOT="${COPY_TO_ROOT:-1}"
+MAX_ROOT_BACKUPS="${MAX_ROOT_BACKUPS:-1}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Error: $PYTHON_BIN not found. Install Python 3.12+ or set PYTHON_BIN=<python_path>." >&2
@@ -88,3 +91,28 @@ popd >/dev/null
 
 echo "Build complete:"
 echo "  $APP_DEV_DIR/dist/ProductProspector.app"
+
+if [[ "$COPY_TO_ROOT" == "1" ]]; then
+  backup_ts="$(date +%Y%m%d-%H%M%S)"
+  if [[ -d "$ROOT_APP" ]]; then
+    mv "$ROOT_APP" "$PROJECT_ROOT/ProductProspector.app.backup-$backup_ts"
+  fi
+
+  cp -R "$APP_DEV_DIR/dist/ProductProspector.app" "$ROOT_APP"
+
+  if [[ "$MAX_ROOT_BACKUPS" =~ ^[0-9]+$ ]]; then
+    backup_index=0
+    while IFS= read -r old_backup; do
+      [[ -z "$old_backup" ]] && continue
+      backup_index=$((backup_index + 1))
+      if (( backup_index > MAX_ROOT_BACKUPS )); then
+        rm -rf "$old_backup"
+      fi
+    done < <(ls -dt "$PROJECT_ROOT"/ProductProspector.app.backup-* 2>/dev/null || true)
+  fi
+
+  echo "Copied to root:"
+  echo "  $ROOT_APP"
+  echo "Kept root backups:"
+  echo "  up to $MAX_ROOT_BACKUPS"
+fi
