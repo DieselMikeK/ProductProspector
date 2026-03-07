@@ -78,8 +78,11 @@ def _apply_vendor_sku_prefix(raw_sku: str, sku_prefix: str) -> str:
     if sku.startswith(f"{prefix}-") or sku == prefix or sku.startswith(prefix):
         return sku
     if "-" in sku:
-        # SKU already appears prefixed; avoid overriding user-provided patterns.
-        return sku
+        # Allow prefixing numeric-first SKUs like "57-923545" (Westin pattern),
+        # but avoid overriding already-prefixed alpha-leading SKUs (e.g. PPE-..., AFE-...).
+        first_token = sku.split("-", 1)[0]
+        if re.search(r"[A-Z]", first_token):
+            return sku
     return f"{prefix}-{sku}"
 
 
@@ -181,6 +184,20 @@ def _derive_application_from_title(title_text: str) -> str:
     fitment = _expand_short_year_ranges(fitment)
     fitment = re.sub(r"\s+", " ", fitment).strip()
     return fitment
+
+
+def _looks_like_fitment_text(value: str) -> bool:
+    source = _sanitize_text_for_parse(value)
+    if not source:
+        return False
+    has_year = bool(re.search(r"\b\d{2,4}(?:\.5)?\s*[-/]\s*\d{2,4}(?:\.5)?\b|\b(19|20)\d{2}\b", source))
+    has_vehicle = bool(
+        re.search(
+            r"(?i)\b(ford|ram|dodge|gmc|chevy|chevrolet|gm|jeep|nissan|toyota|cummins|duramax|powerstroke)\b",
+            source,
+        )
+    )
+    return has_year and has_vehicle
 
 
 def _detect_make_label(text: str) -> str:
@@ -1236,7 +1253,7 @@ def normalize_product(
         )
     if should("application") and mode != "update":
         derived_application = _derive_application_from_title(product.title)
-        if derived_application:
+        if derived_application and (not _clean_text(product.application) or not _looks_like_fitment_text(product.application)):
             product.application = derived_application
     if should("media_urls"):
         product.media_urls = _normalize_media_urls(product.media_urls)

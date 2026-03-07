@@ -1,5 +1,6 @@
 pattern,category,subtype,google_leaf,enabled,notes
 \b(?:cold\s+charge\s+air\s+pipe(?:\s+kit)?|hot\s+charge\s+air\s+pipe(?:\s+kit)?|(?:hot|cold)\s+side\s+(?:intercooler\s+)?charge\s+pipe(?:\s+kit)?|intercooler\s+charge\s+pipe(?:\s+kit)?|charge\s+air\s+pipe(?:\s+kit)?)\b,Intercoolers / Radiators / Condensers,Intercooler Pipes / Hoses,Motor Vehicle Engine Parts,1,Custom override for charge air/intercooler pipe products
+\b(?:grille\s+guard|grill\s+guard|winch\s+mount\s+grille\s+guard|grille\s+guard\s+tube)\b,Bumpers,,Motor Vehicle Frame & Body Parts,1,Custom override for grille guard and winch-mount guard products
 \b(?:back\s+exhaust)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,"Auto-trained global alias (support=100, precision=1.0000, vendors=7)"
 \b(?:exhaust\s+system)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,"Auto-trained global alias (support=97, precision=1.0000, vendors=6)"
 \b(?:fuel\s+lift\s+pump)\b,Fuel Related,Lift Pumps,Motor Vehicle Fuel Systems,1,"Auto-trained global alias (support=81, precision=1.0000, vendors=5)"

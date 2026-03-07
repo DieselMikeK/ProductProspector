@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import concurrent.futures
+import http.cookiejar
 import hashlib
+import gzip
 import json
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from io import BytesIO
 import urllib.error
@@ -24,6 +27,14 @@ _REQUEST_USER_AGENT = (
 )
 _REQUEST_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _REQUEST_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+_HTTP_SESSION_LOCK = threading.Lock()
+_HTTP_COOKIE_JARS_BY_HOST: dict[str, http.cookiejar.CookieJar] = {}
+_HTTP_OPENERS_BY_HOST: dict[str, urllib.request.OpenerDirector] = {}
+_HTTP_HOST_LOCKS_BY_HOST: dict[str, threading.Lock] = {}
+_HTTP_HOST_BACKOFF_LOCK = threading.Lock()
+_HTTP_HOST_NEXT_ALLOWED_AT: dict[str, float] = {}
+_HTTP_HOST_BACKOFF_SECONDS: dict[str, float] = {}
 
 
 def _clean_text(value: object) -> str:
@@ -137,7 +148,171 @@ def _fetch_html_with_curl(url: str, timeout: int = 30) -> tuple[str, str | None]
     return body_text, None
 
 
+def _host_key_from_url(url: str) -> str:
+    try:
+        return _clean_text(urllib.parse.urlparse(url).netloc).lower()
+    except Exception:
+        return ""
+
+
+def _sleep_for_host_backoff(url: str) -> None:
+    host = _host_key_from_url(url)
+    if not host:
+        return
+    while True:
+        now = time.monotonic()
+        with _HTTP_HOST_BACKOFF_LOCK:
+            next_allowed = float(_HTTP_HOST_NEXT_ALLOWED_AT.get(host, 0.0))
+        wait_seconds = next_allowed - now
+        if wait_seconds <= 0:
+            return
+        time.sleep(min(wait_seconds, 1.25))
+
+
+def _register_host_fetch_result(url: str, error_text: str | None) -> None:
+    host = _host_key_from_url(url)
+    if not host:
+        return
+    error = _clean_text(error_text).lower()
+    now = time.monotonic()
+    with _HTTP_HOST_BACKOFF_LOCK:
+        current_backoff = float(_HTTP_HOST_BACKOFF_SECONDS.get(host, 0.0))
+        if ("http 429" in error) or ("rate limit" in error) or ("too many requests" in error):
+            if current_backoff <= 0:
+                current_backoff = 0.75
+            else:
+                current_backoff = min(8.0, (current_backoff * 1.8) + 0.2)
+            _HTTP_HOST_BACKOFF_SECONDS[host] = current_backoff
+            _HTTP_HOST_NEXT_ALLOWED_AT[host] = max(
+                float(_HTTP_HOST_NEXT_ALLOWED_AT.get(host, 0.0)),
+                now + current_backoff,
+            )
+            return
+        if ("bot challenge" in error) or ("http 403" in error):
+            if current_backoff <= 0:
+                current_backoff = 0.9
+            else:
+                current_backoff = min(7.0, (current_backoff * 1.5) + 0.15)
+            _HTTP_HOST_BACKOFF_SECONDS[host] = current_backoff
+            _HTTP_HOST_NEXT_ALLOWED_AT[host] = max(
+                float(_HTTP_HOST_NEXT_ALLOWED_AT.get(host, 0.0)),
+                now + current_backoff,
+            )
+            return
+        if not error:
+            if current_backoff > 0:
+                reduced = max(0.0, current_backoff * 0.65)
+                _HTTP_HOST_BACKOFF_SECONDS[host] = reduced
+                if reduced <= 0.05:
+                    _HTTP_HOST_NEXT_ALLOWED_AT.pop(host, None)
+                else:
+                    _HTTP_HOST_NEXT_ALLOWED_AT[host] = now + min(0.35, reduced * 0.25)
+
+
+def _get_session_opener_for_host(url: str) -> urllib.request.OpenerDirector | None:
+    host = _host_key_from_url(url)
+    if not host:
+        return None
+    with _HTTP_SESSION_LOCK:
+        opener = _HTTP_OPENERS_BY_HOST.get(host)
+        if opener is not None:
+            return opener
+        jar = _HTTP_COOKIE_JARS_BY_HOST.get(host)
+        if jar is None:
+            jar = http.cookiejar.CookieJar()
+            _HTTP_COOKIE_JARS_BY_HOST[host] = jar
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        _HTTP_OPENERS_BY_HOST[host] = opener
+        return opener
+
+
+def _get_host_lock_for_url(url: str) -> threading.Lock:
+    host = _host_key_from_url(url) or "__default__"
+    with _HTTP_SESSION_LOCK:
+        lock = _HTTP_HOST_LOCKS_BY_HOST.get(host)
+        if lock is None:
+            lock = threading.Lock()
+            _HTTP_HOST_LOCKS_BY_HOST[host] = lock
+        return lock
+
+
+def _fetch_html_with_cookie_session(url: str, timeout: int = 30) -> tuple[str, str | None]:
+    opener = _get_session_opener_for_host(url)
+    if opener is None:
+        return "", "cookie session unavailable"
+    parsed = urllib.parse.urlparse(url)
+    host_root = ""
+    if parsed.scheme and parsed.netloc:
+        host_root = f"{parsed.scheme}://{parsed.netloc}/"
+
+    host_lock = _get_host_lock_for_url(url)
+    with host_lock:
+        for attempt in range(2):
+            request = urllib.request.Request(
+                url=url,
+                method="GET",
+                headers={
+                    "User-Agent": _REQUEST_USER_AGENT,
+                    "Accept": _REQUEST_ACCEPT,
+                    "Accept-Language": _REQUEST_ACCEPT_LANGUAGE,
+                    "Referer": host_root or url,
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    body = response.read()
+                    content_encoding = _clean_text(response.headers.get("Content-Encoding", "")).lower()
+            except urllib.error.HTTPError as exc:
+                response_text = ""
+                try:
+                    response_text = exc.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    response_text = ""
+                if exc.code == 429 and attempt == 0:
+                    time.sleep(0.35)
+                    continue
+                if exc.code in {403, 429} and _clean_text(response_text):
+                    # Keep cookies from challenge response and allow caller fallback.
+                    return "", f"HTTP {exc.code}"
+                return "", f"HTTP {exc.code}"
+            except Exception as exc:
+                return "", str(exc)
+
+            if content_encoding == "gzip" or body[:2] == b"\x1f\x8b":
+                try:
+                    body = gzip.decompress(body)
+                except Exception:
+                    pass
+            text = body.decode("utf-8", errors="ignore")
+            if _looks_like_bot_challenge(text) and attempt == 0:
+                time.sleep(0.35)
+                continue
+            if _looks_like_bot_challenge(text):
+                return "", "Bot challenge page detected"
+            return text, None
+
+    return "", "empty response body"
+
+
 def _fetch_html(url: str, timeout: int = 30) -> tuple[str, str | None]:
+    _sleep_for_host_backoff(url)
+
+    def _success(value: str) -> tuple[str, str | None]:
+        _register_host_fetch_result(url, None)
+        return value, None
+
+    def _failure(error_text: str) -> tuple[str, str | None]:
+        _register_host_fetch_result(url, error_text)
+        return "", error_text
+
+    # Prefer shared cookie-session fetches first; this reduces anti-bot false
+    # positives on many vendor sites compared to stateless requests.
+    session_text, session_error = _fetch_html_with_cookie_session(url, timeout=timeout)
+    if not session_error and session_text and not _looks_like_bot_challenge(session_text):
+        return _success(session_text)
+
     request = urllib.request.Request(
         url=url,
         method="GET",
@@ -157,20 +332,43 @@ def _fetch_html(url: str, timeout: int = 30) -> tuple[str, str | None]:
         except Exception:
             response_text = ""
         if exc.code in {403, 429} or _looks_like_bot_challenge(response_text):
+            session_text, session_error = _fetch_html_with_cookie_session(url, timeout=timeout)
+            if not session_error and session_text and not _looks_like_bot_challenge(session_text):
+                return _success(session_text)
             curl_text, curl_error = _fetch_html_with_curl(url, timeout=timeout)
             if not curl_error:
-                return curl_text, None
-        return "", f"HTTP {exc.code}"
+                return _success(curl_text)
+            if exc.code == 429:
+                # Final bounded cool-down retry for anti-bot burst windows.
+                time.sleep(0.95)
+                session_text, session_error = _fetch_html_with_cookie_session(url, timeout=timeout)
+                if not session_error and session_text and not _looks_like_bot_challenge(session_text):
+                    return _success(session_text)
+        return _failure(f"HTTP {exc.code}")
     except Exception as exc:
-        return "", str(exc)
+        return _failure(str(exc))
 
     text = body.decode("utf-8", errors="ignore")
     if _looks_like_bot_challenge(text):
+        session_text, session_error = _fetch_html_with_cookie_session(url, timeout=timeout)
+        if not session_error and session_text and not _looks_like_bot_challenge(session_text):
+            return _success(session_text)
         curl_text, curl_error = _fetch_html_with_curl(url, timeout=timeout)
         if not curl_error and not _looks_like_bot_challenge(curl_text):
-            return curl_text, None
-        return "", "Bot challenge page detected"
-    return text, None
+            return _success(curl_text)
+        time.sleep(0.75)
+        session_text, session_error = _fetch_html_with_cookie_session(url, timeout=timeout)
+        if not session_error and session_text and not _looks_like_bot_challenge(session_text):
+            return _success(session_text)
+        return _failure("Bot challenge page detected")
+    return _success(text)
+
+
+def _is_rate_limit_error(error_text: str) -> bool:
+    text = _clean_text(error_text).lower()
+    if not text:
+        return False
+    return ("http 429" in text) or ("too many requests" in text) or ("rate limit" in text)
 
 
 def _extract_first(pattern: str, text: str, flags: int = 0) -> str:
@@ -185,6 +383,30 @@ def _extract_first(pattern: str, text: str, flags: int = 0) -> str:
 def _extract_meta_content(html: str, name: str) -> str:
     pattern = rf'<meta[^>]+(?:name|property)\s*=\s*["\']{re.escape(name)}["\'][^>]+content\s*=\s*["\']([^"\']+)["\']'
     return _extract_first(pattern, html, flags=re.IGNORECASE)
+
+
+def _extract_canonical_page_url(html: str, page_url: str = "") -> str:
+    canonical = _extract_first(
+        r'<link[^>]+rel\s*=\s*["\']canonical["\'][^>]+href\s*=\s*["\']([^"\']+)["\']',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if not canonical:
+        canonical = _extract_first(
+            r'<link[^>]+href\s*=\s*["\']([^"\']+)["\'][^>]+rel\s*=\s*["\']canonical["\']',
+            html,
+            flags=re.IGNORECASE,
+        )
+    if not canonical:
+        canonical = _extract_meta_content(html, "og:url")
+    canonical = _clean_text(canonical)
+    if not canonical:
+        return ""
+    if canonical.startswith("//"):
+        canonical = f"https:{canonical}"
+    if page_url:
+        canonical = urllib.parse.urljoin(page_url, canonical)
+    return _clean_text(canonical)
 
 
 def _extract_json_scripts(html: str) -> list[str]:
@@ -401,6 +623,18 @@ def _image_quality_score(url: str) -> int:
 def _image_canonical_key(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     path = _strip_shopify_size_suffix(parsed.path)
+    # Normalize common ecommerce image transform tokens so width/quality variants
+    # of the same underlying asset collapse to one canonical key.
+    path = re.sub(r"(?i)(?:[_-](?:w|width)\d{2,5})", "", path)
+    path = re.sub(r"(?i)(?:[_-](?:h|height)\d{2,5})", "", path)
+    path = re.sub(r"(?i)(?:[_-]q\d{1,3})", "", path)
+    path = re.sub(r"(?i)(?:[_-]t\d{6,15})", "", path)
+    path = re.sub(r"(?i)(?:[_-]dpr\d(?:\.\d+)?)", "", path)
+    path = re.sub(r"(?i)(?:[_-]\d{2,4}x\d{2,4})(?=\.[a-z0-9]{2,6}$)", "", path)
+    path = re.sub(r"\.(?:jpe?g|png|webp|gif|bmp|avif)$", "", path, flags=re.IGNORECASE)
+    asset_match = re.search(r"([0-9]{2,}-[0-9]{2,}_[a-z]{1,6}\d{0,3})", path.lower())
+    if asset_match:
+        path = f"/_asset/{asset_match.group(1)}"
     keep_pairs: list[tuple[str, str]] = []
     for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
         lower = key.lower()
@@ -410,6 +644,21 @@ def _image_canonical_key(url: str) -> str:
     query = urllib.parse.urlencode(keep_pairs, doseq=True)
     canonical = parsed._replace(path=path, query=query, fragment="")
     return urllib.parse.urlunparse(canonical)
+
+
+def _media_url_matches_target_sku(url: str, sku: str) -> bool:
+    target = _compact_sku(sku).lower()
+    if not target:
+        return False
+    compact_url = re.sub(r"[^a-z0-9]+", "", _clean_text(url).lower())
+    if not compact_url:
+        return False
+    if target in compact_url:
+        return True
+    # Allow A/B suffix variants to match base-image filenames.
+    if len(target) > 5 and target[-1].isalpha() and target[:-1] in compact_url:
+        return True
+    return False
 
 
 def _normalize_media_values(values: list[str], page_url: str) -> list[str]:
@@ -596,14 +845,12 @@ def _shopify_match_score_for_sku(product: dict, sku: str) -> int:
         for variant in variants:
             if not isinstance(variant, dict):
                 continue
-            for key in ["sku", "barcode", "id"]:
+            for key in ["sku", "barcode", "mpn"]:
                 compact = _compact_sku(variant.get(key, ""))
                 if not compact:
                     continue
                 if compact == target:
                     best_score = max(best_score, 1000)
-                elif len(compact) >= 6 and len(target) >= 6 and (compact in target or target in compact):
-                    best_score = max(best_score, 700)
     if best_score:
         return best_score
 
@@ -1531,12 +1778,22 @@ def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: boo
     from_jsonld = _from_json_ld(html, page_url, sku)
     from_heuristic = _heuristic_extract(html, page_url, sku, scrape_images=scrape_images)
 
-    # Media should combine sources so JSON-LD single-image does not suppress full gallery extraction.
+    # Prefer product-scoped embedded media first. Heuristic media is broad and can
+    # include recommendation/upsell images on some vendor templates.
     embed_media = _split_multi_value(_clean_text(from_shopify_embed.get("media_urls", "")))
     json_media = _split_multi_value(_clean_text(from_jsonld.get("media_urls", "")))
     heuristic_media = _split_multi_value(_clean_text(from_heuristic.get("media_urls", "")))
-    if embed_media or json_media or heuristic_media:
-        combined_media = _normalize_media_values(embed_media + json_media + heuristic_media, page_url=page_url)
+
+    combined_media_candidates: list[str] = []
+    if embed_media:
+        combined_media_candidates = embed_media + json_media
+    elif json_media:
+        combined_media_candidates = json_media
+    else:
+        combined_media_candidates = heuristic_media
+
+    if combined_media_candidates:
+        combined_media = _normalize_media_values(combined_media_candidates, page_url=page_url)
         if combined_media:
             merged["media_urls"] = " | ".join(combined_media)
 
@@ -1618,8 +1875,9 @@ def _extract_shopify_product_image_candidates(
         ranked_products.append((score, product))
 
     ranked_products.sort(key=lambda entry: entry[0], reverse=True)
-    for _, product in ranked_products[:2]:
-        for value in _extract_shopify_media_from_product(product):
+    if ranked_products:
+        _, best_product = ranked_products[0]
+        for value in _extract_shopify_media_from_product(best_product):
             add(value)
 
     return candidates
@@ -1661,8 +1919,10 @@ def _extract_gallery_scope_blocks(html: str) -> list[str]:
     blocks: list[str] = []
     seen: set[str] = set()
     patterns = [
+        r'(?is)<section[^>]+class=["\'][^"\']*gallery[^"\']*["\'][^>]*>.*?</section>',
+        r'(?is)<div[^>]+class=["\'][^"\']*product-feature-image-wrapper[^"\']*["\'][^>]*>.*?</div>',
         r'(?is)<(?:div|section|ul|ol)[^>]+(?:id|class)=["\'][^"\']*(?:product[^"\']*(?:media|gallery|image|thumb|carousel|slider)|(?:media|gallery|image|thumb|carousel|slider)[^"\']*product|product__media|product-gallery|media-gallery)[^"\']*["\'][^>]*>.*?</(?:div|section|ul|ol)>',
-        r'(?is)<(?:div|section|ul|ol)[^>]+(?:id|class)=["\'][^"\']*(?:thumbnail|thumbnails)[^"\']*["\'][^>]*>.*?</(?:div|section|ul|ol)>',
+        r'(?is)<(?:div|section|ul|ol)[^>]+(?:id|class)=["\'][^"\']*(?:product[^"\']*(?:thumbnail|thumbnails)|(?:thumbnail|thumbnails)[^"\']*product|gallery__thumb|gallery-thumbnail)[^"\']*["\'][^>]*>.*?</(?:div|section|ul|ol)>',
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, html):
@@ -1756,6 +2016,24 @@ def _split_multi_value(raw: str) -> list[str]:
         return []
     parts = re.split(r"[|,;\n]+", text)
     return [item.strip() for item in parts if item and item.strip()]
+
+
+def _infer_vendor_from_title(title_text: str) -> str:
+    title = _clean_text(title_text)
+    if not title:
+        return ""
+    parts = [_clean_text(part) for part in title.split("|") if _clean_text(part)]
+    if not parts:
+        return ""
+    # Many vendor pages format as:
+    # "<Product Title> | #<SKU> | <Vendor Name>"
+    candidate = parts[-1]
+    if re.fullmatch(r"#?\s*[A-Z0-9][A-Z0-9._/-]{2,}", candidate, flags=re.IGNORECASE) and len(parts) >= 2:
+        candidate = parts[-2]
+    lowered = candidate.lower()
+    if lowered in {"search", "search results", "products", "product"}:
+        return ""
+    return candidate
 
 
 def _safe_folder_name(value: str) -> str:
@@ -1931,6 +2209,149 @@ def _download_images_for_sku(
     return output_files, str(folder), first_error
 
 
+def _html_fragment_to_lines(fragment: str) -> list[str]:
+    value = _clean_text(fragment)
+    if not value:
+        return []
+    value = re.sub(r"<script[\s\S]*?</script>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<style[\s\S]*?</style>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<noscript[\s\S]*?</noscript>", " ", value, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "\n", unescape(value))
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = _clean_text(raw)
+        if not line:
+            continue
+        if line.lower() in {"product details", "warranty", "reviews", "specifications"}:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _extract_tab_pane_sections(html: str) -> list[tuple[str, str, str]]:
+    sections: list[tuple[str, str, str]] = []
+    seen_ids: set[str] = set()
+
+    def _extract_pane_html(pane_id: str) -> str:
+        pane_patterns = [
+            rf'(?is)<div[^>]+id=["\']{re.escape(pane_id)}["\'][^>]*class=["\'][^"\']*tab-pane[^"\']*["\'][^>]*>(.*?)</div>\s*(?=<div[^>]+class=["\'][^"\']*tab-pane[^"\']*["\']|</section>|</article>|</main>)',
+            rf'(?is)<div[^>]+id=["\']{re.escape(pane_id)}["\'][^>]*role=["\']tabpanel["\'][^>]*>(.*?)</div>\s*(?=<div[^>]+role=["\']tabpanel["\']|</section>|</article>|</main>)',
+            rf'(?is)<div[^>]+id=["\']{re.escape(pane_id)}["\'][^>]*>(.*?)</div>\s*(?=<div[^>]+id=["\']|</section>|</article>|</main>)',
+        ]
+        for pane_pattern in pane_patterns:
+            pane_match = re.search(pane_pattern, html)
+            if pane_match:
+                return _clean_text(pane_match.group(1))
+        return ""
+
+    tab_matches = list(
+        re.finditer(
+            r'(?is)<a[^>]+(?:data-target|href)=["\']#([^"\']+)["\'][^>]*>(.*?)</a>',
+            html,
+        )
+    )
+    tab_matches.extend(
+        re.finditer(
+            r'(?is)<button[^>]+(?:data-target|href)=["\']#([^"\']+)["\'][^>]*>(.*?)</button>',
+            html,
+        )
+    )
+
+    for match in tab_matches:
+        pane_id = _clean_text(match.group(1))
+        if not pane_id or pane_id in seen_ids:
+            continue
+        seen_ids.add(pane_id)
+        label = _clean_text(re.sub(r"<[^>]+>", " ", unescape(match.group(2) or "")))
+        if not label:
+            continue
+        pane_html = _extract_pane_html(pane_id)
+        if not pane_html:
+            continue
+        sections.append((pane_id, label, pane_html))
+    return sections
+
+
+def _extract_description_from_tabs(html: str) -> str:
+    sections = _extract_tab_pane_sections(html)
+    if not sections:
+        return ""
+
+    preferred_labels = [
+        r"product\s*details?",
+        r"\bdescription\b",
+        r"\boverview\b",
+        r"about\s+this\s+product",
+        r"\bfeatures?\b",
+    ]
+    reject_labels = [r"\breviews?\b", r"\bwarranty\b", r"\bspecifications?\b"]
+
+    for _, label, pane_html in sections:
+        label_low = label.lower()
+        if any(re.search(pattern, label_low, flags=re.IGNORECASE) for pattern in reject_labels):
+            continue
+        if not any(re.search(pattern, label_low, flags=re.IGNORECASE) for pattern in preferred_labels):
+            continue
+        lines = _html_fragment_to_lines(pane_html)
+        if not lines:
+            continue
+        # Keep concise but complete enough for product detail content.
+        description = "\n".join(lines[:18]).strip()
+        if description:
+            return description
+    return ""
+
+
+def _extract_structured_fitment_lines(html: str) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(line: str) -> None:
+        text = _clean_text(line)
+        if not text:
+            return
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"\s*\.\.\.\s*see application guide.*$", "", text, flags=re.IGNORECASE)
+        if not text:
+            return
+        key = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        candidates.append(text)
+
+    # Common ecommerce fitment block on Westin and similar templates.
+    for match in re.finditer(
+        r'(?is)<div[^>]+class=["\'][^"\']*product-list-container[^"\']*["\'][^>]*>(.*?)</div>\s*</section>',
+        html,
+    ):
+        block = _clean_text(match.group(1))
+        if not block:
+            continue
+        for li_match in re.finditer(r"(?is)<li[^>]*>(.*?)</li>", block):
+            line = _clean_text(re.sub(r"<[^>]+>", " ", unescape(li_match.group(1) or "")))
+            if not line:
+                continue
+            if re.search(r"\b(19|20)\d{2}\b", line) and re.search(
+                r"(?i)(ford|ram|dodge|gmc|chevy|chevrolet|gm|jeep|nissan|toyota)",
+                line,
+            ):
+                add(line)
+
+    # Generic fitment-style tabs for vendors that keep applications in tabs.
+    for _, label, pane_html in _extract_tab_pane_sections(html):
+        if not re.search(r"(?i)(fit|what\s+it\s+fits|application|compatib|specification)", label):
+            continue
+        for line in _html_fragment_to_lines(pane_html):
+            if re.search(r"\b(19|20)\d{2}\b", line) and re.search(
+                r"(?i)(ford|ram|dodge|gmc|chevy|chevrolet|gm|jeep|nissan|toyota)",
+                line,
+            ):
+                add(line)
+
+    return candidates[:40]
+
+
 def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) -> dict[str, str]:
     context = _find_context_near_sku(html, sku)
     output: dict[str, str] = {}
@@ -1944,7 +2365,11 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
     )
     output["weight"] = _extract_first(r'(?i)(?:weight|wt)\D{0,20}([0-9]{1,3}(?:\.[0-9]{1,3})?)', context)
     output["barcode"] = _extract_first(r'(?i)(?:upc|gtin|barcode|ean)\D{0,20}([0-9]{8,14})', context)
-    output["vendor"] = _extract_meta_content(html, "og:site_name")
+    output["vendor"] = _extract_meta_content(html, "og:site_name") or _infer_vendor_from_title(output.get("title", ""))
+    if not _clean_text(output.get("description_html", "")):
+        tab_description = _extract_description_from_tabs(html)
+        if tab_description:
+            output["description_html"] = tab_description
 
     if scrape_images:
         shopify_media_values = _extract_shopify_product_image_candidates(html, page_url=page_url, sku=sku)
@@ -1953,9 +2378,15 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
         else:
             media_values = _collect_gallery_image_candidates(html)
             normalized_media = _normalize_media_values(media_values, page_url)
+            sku_scoped_media = [value for value in normalized_media if _media_url_matches_target_sku(value, sku)]
+            if sku_scoped_media:
+                normalized_media = sku_scoped_media
         output["media_urls"] = " | ".join(normalized_media[:30])
 
     application_lines: list[str] = []
+    structured_fitment_lines = _extract_structured_fitment_lines(html)
+    if structured_fitment_lines:
+        application_lines.extend(structured_fitment_lines)
     # Scope fitment heuristics near the matched SKU to avoid unrelated recommendation tiles.
     fitment_context = _find_context_near_sku(html, sku, span=12000)
     fitment_source = fitment_context if _clean_text(fitment_context) else html
@@ -1976,7 +2407,7 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
             text,
         ):
             application_lines.append(text)
-        if len(application_lines) >= 4:
+        if len(application_lines) >= 24:
             break
     title_text = _clean_text(output.get("title", ""))
     if title_text and re.search(r"\b(19|20)\d{2}\b", title_text) and re.search(
@@ -1999,6 +2430,46 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
     return output
 
 
+def _should_probe_search_candidates(
+    search_html: str,
+    target_url: str,
+    sku: str,
+    payload: dict[str, str],
+    direct_product_url: str,
+) -> bool:
+    if _clean_text(direct_product_url):
+        return False
+
+    target_path = urllib.parse.urlparse(target_url).path.lower()
+    title = _clean_text(payload.get("title", ""))
+    title_lower = title.lower()
+    if "/search" not in target_path and title and "search results" not in title_lower:
+        return False
+
+    evidence_text = " ".join(
+        [
+            title,
+            _clean_text(payload.get("description_html", "")),
+            _clean_text(payload.get("application", "")),
+            _clean_text(payload.get("barcode", "")),
+            _find_context_near_sku(search_html, sku, span=2800),
+        ]
+    )
+    has_sku_evidence = _contains_compact_sku(evidence_text, sku)
+    has_product_signals = sum(
+        [
+            1 if title and "search results" not in title_lower else 0,
+            1 if _clean_text(payload.get("price", "")) else 0,
+            1 if _clean_text(payload.get("description_html", "")) else 0,
+            1 if _clean_text(payload.get("application", "")) else 0,
+            1 if _clean_text(payload.get("media_urls", "")) else 0,
+        ]
+    )
+    if has_sku_evidence and has_product_signals >= 2:
+        return False
+    return True
+
+
 def _scrape_single_sku(
     sku: str,
     base_url: str,
@@ -2012,127 +2483,170 @@ def _scrape_single_sku(
         return sku, {}, "Missing vendor search URL"
 
     last_error: str | None = None
-    for attempt in range(max(retry_count + 1, 1)):
+    remaining_attempts = max(retry_count + 1, 1)
+    rate_limit_bonus_remaining = 1
+    rate_limit_hits = 0
+    while remaining_attempts > 0:
+        remaining_attempts -= 1
         if delay_seconds > 0:
             time.sleep(delay_seconds)
         search_html, error = _fetch_html(target_url)
         if error:
             last_error = f"{target_url} ({error})"
+            if _is_rate_limit_error(error) and rate_limit_bonus_remaining > 0:
+                rate_limit_hits += 1
+                rate_limit_bonus_remaining -= 1
+                remaining_attempts += 1
+                backoff_base = max(float(delay_seconds or 0.0), 0.45)
+                backoff = min(2.5, backoff_base * (1.5 + (rate_limit_hits * 0.5)))
+                jitter = ((sum(ord(ch) for ch in sku) + (rate_limit_hits * 13)) % 21) / 100.0
+                time.sleep(backoff + jitter)
             continue
 
         resolved_url = target_url
         resolved_html = search_html
         search_payload = _extract_page_payload(search_html, target_url, sku, scrape_images=scrape_images)
-        searchanise_candidates, searchanise_errors = _searchanise_candidates_from_search_page(
-            search_html=search_html,
-            page_url=target_url,
-            sku=sku,
-        )
-        convermax_candidates, convermax_errors = _convermax_candidates_from_search_page(
-            search_html=search_html,
-            page_url=target_url,
-            sku=sku,
-        )
+        direct_product_url = ""
+        canonical_from_search = _extract_canonical_page_url(search_html, page_url=target_url)
+        if canonical_from_search:
+            canonical_path = urllib.parse.urlparse(canonical_from_search).path.lower()
+            if canonical_path and canonical_path != "/" and "/search" not in canonical_path:
+                direct_evidence_text = " ".join(
+                    [
+                        _clean_text(search_payload.get("title", "")),
+                        _clean_text(search_payload.get("description_html", "")),
+                        _clean_text(canonical_from_search),
+                        _find_context_near_sku(search_html, sku, span=2000),
+                    ]
+                )
+                if _contains_compact_sku(direct_evidence_text, sku) or bool(_clean_text(search_payload.get("title", ""))):
+                    direct_product_url = canonical_from_search
+                    resolved_url = direct_product_url
+
+        searchanise_candidates: list[tuple[str, int, dict[str, str]]] = []
+        convermax_candidates: list[tuple[str, int, dict[str, str]]] = []
+        searchanise_errors: list[str] = []
+        convermax_errors: list[str] = []
         candidate_seed_payloads: dict[str, dict[str, str]] = {}
-        candidates = _extract_product_page_candidates(search_html, page_url=target_url, sku=sku)
-        provider_candidates = list(searchanise_candidates[:20]) + list(convermax_candidates[:20])
-        if provider_candidates:
-            merged_scores: dict[str, int] = {href: score for href, score in candidates}
-            for candidate_url, candidate_score, seed_payload in provider_candidates:
-                existing_score = merged_scores.get(candidate_url, -9999)
-                if candidate_score > existing_score:
-                    merged_scores[candidate_url] = candidate_score
-                if seed_payload:
-                    candidate_seed_payloads[candidate_url] = seed_payload
-            candidates = sorted(merged_scores.items(), key=lambda item: (-item[1], len(item[0])))
+        candidates: list[tuple[str, int]] = []
+        probe_candidates = _should_probe_search_candidates(
+            search_html=search_html,
+            target_url=target_url,
+            sku=sku,
+            payload=search_payload,
+            direct_product_url=direct_product_url,
+        )
+        if probe_candidates and not direct_product_url:
+            searchanise_candidates, searchanise_errors = _searchanise_candidates_from_search_page(
+                search_html=search_html,
+                page_url=target_url,
+                sku=sku,
+            )
+            convermax_candidates, convermax_errors = _convermax_candidates_from_search_page(
+                search_html=search_html,
+                page_url=target_url,
+                sku=sku,
+            )
+            candidates = _extract_product_page_candidates(search_html, page_url=target_url, sku=sku)
+            provider_candidates = list(searchanise_candidates[:20]) + list(convermax_candidates[:20])
+            if provider_candidates:
+                merged_scores: dict[str, int] = {href: score for href, score in candidates}
+                for candidate_url, candidate_score, seed_payload in provider_candidates:
+                    existing_score = merged_scores.get(candidate_url, -9999)
+                    if candidate_score > existing_score:
+                        merged_scores[candidate_url] = candidate_score
+                    if seed_payload:
+                        candidate_seed_payloads[candidate_url] = seed_payload
+                candidates = sorted(merged_scores.items(), key=lambda item: (-item[1], len(item[0])))
 
         product_fetch_errors: list[str] = []
         best_candidate_url = ""
         best_candidate_html = ""
         best_candidate_payload: dict[str, str] = {}
         best_candidate_rank = -1
-        for candidate_url, candidate_score in candidates[:10]:
-            if candidate_url == target_url:
-                continue
-            seed_payload = candidate_seed_payloads.get(candidate_url, {})
-            product_html, product_error = _fetch_html(candidate_url)
-            if product_error:
-                if seed_payload and candidate_score >= 260:
-                    candidate_payload = _merge_seed_payload({}, seed_payload, page_url=candidate_url)
-                    payload_match_text = " ".join(
-                        [
-                            candidate_url,
-                            _clean_text(candidate_payload.get("title", "")),
-                            _clean_text(candidate_payload.get("description_html", "")),
-                            _clean_text(candidate_payload.get("application", "")),
-                            _clean_text(candidate_payload.get("barcode", "")),
-                        ]
-                    )
-                    matches_sku = _contains_compact_sku(payload_match_text, sku)
-                    payload_score = 0
-                    if _clean_text(candidate_payload.get("title", "")):
-                        payload_score += 2
-                    if _clean_text(candidate_payload.get("description_html", "")):
-                        payload_score += 1
-                    if _clean_text(candidate_payload.get("application", "")):
-                        payload_score += 2
-                    if _clean_text(candidate_payload.get("media_urls", "")):
-                        payload_score += 2
-                    if _clean_text(candidate_payload.get("price", "")):
-                        payload_score += 1
-                    if matches_sku:
-                        payload_score += 4
-                    rank = (payload_score * 20) + candidate_score
-                    if rank > best_candidate_rank:
-                        best_candidate_rank = rank
-                        best_candidate_url = candidate_url
-                        best_candidate_html = ""
-                        best_candidate_payload = candidate_payload
-                else:
-                    product_fetch_errors.append(f"{candidate_url} ({product_error})")
-                continue
-            candidate_payload = _extract_page_payload(product_html, candidate_url, sku, scrape_images=False)
-            candidate_payload = _merge_seed_payload(candidate_payload, seed_payload, page_url=candidate_url)
-            payload_match_text = " ".join(
-                [
-                    candidate_url,
-                    _clean_text(candidate_payload.get("title", "")),
-                    _clean_text(candidate_payload.get("description_html", "")),
-                    _clean_text(candidate_payload.get("application", "")),
-                    _clean_text(candidate_payload.get("barcode", "")),
-                ]
-            )
-            matches_sku = _contains_compact_sku(payload_match_text, sku)
-            payload_score = 0
-            if _clean_text(candidate_payload.get("title", "")):
-                payload_score += 2
-            if _clean_text(candidate_payload.get("description_html", "")):
-                payload_score += 1
-            if _clean_text(candidate_payload.get("application", "")):
-                payload_score += 2
-            if _clean_text(candidate_payload.get("media_urls", "")):
-                payload_score += 2
-            if _clean_text(candidate_payload.get("price", "")):
-                payload_score += 1
-            candidate_title = _clean_text(candidate_payload.get("title", "")).lower()
-            if "search results" in candidate_title:
-                payload_score -= 4
-            if matches_sku:
-                payload_score += 4
+        if probe_candidates and not direct_product_url:
+            for candidate_url, candidate_score in candidates[:10]:
+                if candidate_url == target_url:
+                    continue
+                seed_payload = candidate_seed_payloads.get(candidate_url, {})
+                product_html, product_error = _fetch_html(candidate_url)
+                if product_error:
+                    if seed_payload and candidate_score >= 260:
+                        candidate_payload = _merge_seed_payload({}, seed_payload, page_url=candidate_url)
+                        payload_match_text = " ".join(
+                            [
+                                candidate_url,
+                                _clean_text(candidate_payload.get("title", "")),
+                                _clean_text(candidate_payload.get("description_html", "")),
+                                _clean_text(candidate_payload.get("application", "")),
+                                _clean_text(candidate_payload.get("barcode", "")),
+                            ]
+                        )
+                        matches_sku = _contains_compact_sku(payload_match_text, sku)
+                        payload_score = 0
+                        if _clean_text(candidate_payload.get("title", "")):
+                            payload_score += 2
+                        if _clean_text(candidate_payload.get("description_html", "")):
+                            payload_score += 1
+                        if _clean_text(candidate_payload.get("application", "")):
+                            payload_score += 2
+                        if _clean_text(candidate_payload.get("media_urls", "")):
+                            payload_score += 2
+                        if _clean_text(candidate_payload.get("price", "")):
+                            payload_score += 1
+                        if matches_sku:
+                            payload_score += 4
+                        rank = (payload_score * 20) + candidate_score
+                        if rank > best_candidate_rank:
+                            best_candidate_rank = rank
+                            best_candidate_url = candidate_url
+                            best_candidate_html = ""
+                            best_candidate_payload = candidate_payload
+                    else:
+                        product_fetch_errors.append(f"{candidate_url} ({product_error})")
+                    continue
+                candidate_payload = _extract_page_payload(product_html, candidate_url, sku, scrape_images=False)
+                candidate_payload = _merge_seed_payload(candidate_payload, seed_payload, page_url=candidate_url)
+                payload_match_text = " ".join(
+                    [
+                        candidate_url,
+                        _clean_text(candidate_payload.get("title", "")),
+                        _clean_text(candidate_payload.get("description_html", "")),
+                        _clean_text(candidate_payload.get("application", "")),
+                        _clean_text(candidate_payload.get("barcode", "")),
+                    ]
+                )
+                matches_sku = _contains_compact_sku(payload_match_text, sku)
+                payload_score = 0
+                if _clean_text(candidate_payload.get("title", "")):
+                    payload_score += 2
+                if _clean_text(candidate_payload.get("description_html", "")):
+                    payload_score += 1
+                if _clean_text(candidate_payload.get("application", "")):
+                    payload_score += 2
+                if _clean_text(candidate_payload.get("media_urls", "")):
+                    payload_score += 2
+                if _clean_text(candidate_payload.get("price", "")):
+                    payload_score += 1
+                candidate_title = _clean_text(candidate_payload.get("title", "")).lower()
+                if "search results" in candidate_title:
+                    payload_score -= 4
+                if matches_sku:
+                    payload_score += 4
 
-            # Only accept candidate pages with SKU evidence, unless URL score is very strong.
-            if not matches_sku and candidate_score < 160:
-                continue
+                # Only accept candidate pages with SKU evidence, unless URL score is very strong.
+                if not matches_sku and candidate_score < 160:
+                    continue
 
-            rank = (payload_score * 20) + candidate_score
-            if rank > best_candidate_rank:
-                best_candidate_rank = rank
-                best_candidate_url = candidate_url
-                best_candidate_html = product_html
-                best_candidate_payload = candidate_payload
+                rank = (payload_score * 20) + candidate_score
+                if rank > best_candidate_rank:
+                    best_candidate_rank = rank
+                    best_candidate_url = candidate_url
+                    best_candidate_html = product_html
+                    best_candidate_payload = candidate_payload
 
-            if matches_sku and payload_score >= 4:
-                break
+                if matches_sku and payload_score >= 4:
+                    break
 
         if best_candidate_url:
             resolved_url = best_candidate_url
@@ -2181,9 +2695,64 @@ def _scrape_single_sku(
         if provider_errors and resolved_url == target_url:
             merged["search_provider_error"] = " | ".join(provider_errors[:3])
 
+        canonical_product_url = ""
+        canonical_product_path = ""
+        if resolved_html:
+            canonical_url = _extract_canonical_page_url(resolved_html, page_url=resolved_url)
+            if canonical_url:
+                canonical_path = urllib.parse.urlparse(canonical_url).path.lower()
+                if canonical_path and canonical_path != "/" and "/search" not in canonical_path:
+                    evidence_text = " ".join(
+                        [
+                            _clean_text(merged.get("title", "")),
+                            _clean_text(merged.get("description_html", "")),
+                            _clean_text(merged.get("application", "")),
+                            _clean_text(canonical_url),
+                            _find_context_near_sku(resolved_html, sku, span=2000),
+                        ]
+                    )
+                    if _contains_compact_sku(evidence_text, sku) or bool(_clean_text(merged.get("title", ""))):
+                        canonical_product_url = canonical_url
+                        canonical_product_path = canonical_path
+
+        if canonical_product_url and resolved_url == target_url:
+            canonical_html, canonical_error = _fetch_html(canonical_product_url)
+            if not canonical_error and canonical_html:
+                canonical_payload = _extract_page_payload(
+                    canonical_html,
+                    canonical_product_url,
+                    sku,
+                    scrape_images=scrape_images,
+                )
+                for key in [
+                    "title",
+                    "description_html",
+                    "media_urls",
+                    "type",
+                    "price",
+                    "cost",
+                    "barcode",
+                    "weight",
+                    "application",
+                    "vendor",
+                    "core_charge_product_code",
+                ]:
+                    canonical_value = _clean_text(canonical_payload.get(key, ""))
+                    if canonical_value:
+                        merged[key] = canonical_value
+                resolved_html = canonical_html
+            merged["search_url"] = target_url
+            merged["product_url"] = canonical_product_url
+            merged["source_url"] = canonical_product_url
+            resolved_url = canonical_product_url
+
         resolved_path = urllib.parse.urlparse(resolved_url).path.lower()
         title_lower = _clean_text(merged.get("title", "")).lower()
-        if resolved_url == target_url and ("/search" in resolved_path or "search results" in title_lower):
+        if (
+            resolved_url == target_url
+            and ("/search" in resolved_path or "search results" in title_lower)
+            and not canonical_product_path
+        ):
             detail = _clean_text(merged.get("product_link_error", ""))
             if detail:
                 last_error = f"No SKU-specific product result found from search page. {detail}"
@@ -2223,10 +2792,39 @@ def scrape_vendor_records(
     if not vendor_search_url or not sku_values:
         return {}, {}, []
 
+    def _is_suffix_variant_sku(value: str) -> bool:
+        text = normalize_sku(value)
+        return bool(re.search(r"\d[A-Z]$", text))
+
+    # Process base SKUs before suffixed variants (e.g., ABC123 before ABC123A)
+    # to maximize useful hits when vendors enforce aggressive rate limits.
+    ordered_skus = sorted(sku_values, key=lambda item: (1 if _is_suffix_variant_sku(item) else 0, item))
+
     results: dict[str, dict[str, str]] = {}
     sku_errors: dict[str, str] = {}
     general_errors: list[str] = []
     max_workers = max(1, workers)
+    if len(sku_values) >= 8 and max_workers > 2:
+        max_workers = 2
+    effective_delay = float(delay_seconds or 0.0)
+
+    # Preflight the vendor endpoint once; if immediately throttled/challenged,
+    # switch to safer pacing for this batch instead of burning all SKUs.
+    preflight_url = _normalize_url(vendor_search_url, ordered_skus[0]) if ordered_skus else ""
+    if preflight_url:
+        preflight_error = ""
+        for attempt in range(2):
+            _, preflight_error = _fetch_html(preflight_url)
+            if not preflight_error:
+                break
+            if not _is_rate_limit_error(preflight_error) and "bot challenge" not in preflight_error.lower():
+                break
+            time.sleep(0.85 + (attempt * 0.65))
+        if preflight_error and (_is_rate_limit_error(preflight_error) or "bot challenge" in preflight_error.lower()):
+            max_workers = 1
+            effective_delay = max(effective_delay, 0.95)
+            general_errors.append("Vendor throttling detected; using safe scrape mode for this run.")
+
     output_root: Path | None = None
     if image_output_root is not None:
         try:
@@ -2242,11 +2840,11 @@ def scrape_vendor_records(
                 sku=sku,
                 base_url=vendor_search_url,
                 retry_count=retry_count,
-                delay_seconds=delay_seconds,
+                delay_seconds=effective_delay,
                 scrape_images=scrape_images,
                 image_output_root=output_root,
             )
-            for sku in sku_values
+            for sku in ordered_skus
         ]
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -2258,5 +2856,51 @@ def scrape_vendor_records(
                 results[sku] = payload
             if error:
                 sku_errors[sku] = error
+
+    rate_limited_skus = [
+        sku for sku, error_text in list(sku_errors.items()) if _is_rate_limit_error(error_text)
+    ]
+    if rate_limited_skus:
+        heavy_rate_limit = len(rate_limited_skus) >= 5
+        retry_delay = max(effective_delay, 0.95 if heavy_rate_limit else 0.65)
+        # Keep fallback bounded and fast: do one clean retry pass per SKU.
+        retry_count_adaptive = 0
+        if heavy_rate_limit:
+            # Give aggressive anti-bot systems a brief cool-down window before
+            # retrying sequentially.
+            time.sleep(1.35)
+        fallback_start = time.monotonic()
+        max_fallback_seconds = min(45.0, max(15.0, float(len(rate_limited_skus)) * 2.5))
+        recovered = 0
+        still_rate_limited = 0
+        for sku in rate_limited_skus:
+            if (time.monotonic() - fallback_start) >= max_fallback_seconds:
+                general_errors.append(
+                    f"Stopped rate-limit recovery early after {max_fallback_seconds:.0f}s to keep runtime bounded."
+                )
+                break
+            _, payload, error = _scrape_single_sku(
+                sku=sku,
+                base_url=vendor_search_url,
+                retry_count=retry_count_adaptive,
+                delay_seconds=retry_delay,
+                scrape_images=scrape_images,
+                image_output_root=output_root,
+            )
+            if payload:
+                results[sku] = payload
+                sku_errors.pop(sku, None)
+                recovered += 1
+                continue
+            if error:
+                sku_errors[sku] = error
+                if _is_rate_limit_error(error):
+                    still_rate_limited += 1
+        if recovered > 0:
+            general_errors.append(f"Recovered {recovered} SKU(s) after temporary rate limits.")
+        if still_rate_limited > 0:
+            general_errors.append(
+                f"{still_rate_limited} SKU(s) remain rate-limited. Try workers=1 and delay>=1.0 for this vendor."
+            )
 
     return results, sku_errors, general_errors

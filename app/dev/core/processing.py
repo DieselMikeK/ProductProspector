@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import pandas as pd
+import re
 
 from product_prospector.core.years import apply_year_policy, format_years_compact, parse_years_from_many, replace_years_in_text
 
@@ -33,7 +34,22 @@ class PlanningConfig:
 def normalize_sku(value: str | None) -> str:
     if value is None:
         return ""
-    cleaned = str(value).strip().upper()
+    cleaned = str(value)
+    # Normalize common invisible characters and non-ASCII dash variants so
+    # pasted scope SKUs match sheet values reliably.
+    cleaned = cleaned.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    cleaned = (
+        cleaned.replace("\u2010", "-")
+        .replace("\u2011", "-")
+        .replace("\u2012", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
+    )
+    cleaned = cleaned.strip().strip("\"'`").strip().upper()
+    # Excel/paste sometimes turns numeric-looking SKUs into "<value>.0".
+    if re.fullmatch(r"\d+\.0+", cleaned):
+        cleaned = cleaned.split(".", 1)[0]
     return " ".join(cleaned.split())
 
 
@@ -202,4 +218,3 @@ def build_action_plan(
         plan = plan[(plan["years_changed"] == "yes") | (plan["row_action"] == "create")].copy()
 
     return plan.reset_index(drop=True)
-

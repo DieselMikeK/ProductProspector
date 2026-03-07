@@ -159,6 +159,28 @@ def _parse_year_float(value: str) -> float | None:
     return float(base) + (0.5 if has_half else 0.0)
 
 
+def _normalize_year_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value) * 2.0) / 2.0
+
+
+def _is_half_year(value: float | None) -> bool:
+    normalized = _normalize_year_value(value)
+    if normalized is None:
+        return False
+    return abs(normalized - int(normalized)) > 0.001
+
+
+def _format_year_value(value: float | None) -> str:
+    normalized = _normalize_year_value(value)
+    if normalized is None:
+        return ""
+    if not _is_half_year(normalized):
+        return str(int(normalized))
+    return f"{normalized:.1f}"
+
+
 def _request_graphql(config: ShopifyConfig, access_token: str, query: str, variables: dict) -> tuple[dict | None, str | None]:
     query_text = _clean_text(query).lower()
     if re.search(r"\bmutation\b", query_text):
@@ -353,8 +375,11 @@ def _extract_fitment_fields(display_name: str, field_map: dict[str, str]) -> tup
         or display_name
     )
 
-    year_match = re.search(r"\b(19|20)\d{2}\b", year_text)
-    year = year_match.group(0) if year_match else ""
+    year_value = _parse_year_float(year_text) or _parse_year_float(display_name)
+    year = _format_year_value(year_value)
+    if not year:
+        year_match = re.search(r"\b(19|20)\d{2}\b", year_text)
+        year = year_match.group(0) if year_match else ""
     make = _normalize_make_key(make_text)
     liter = _normalize_engine_liter(liter_text)
     family = _normalize_family_key(family_text)
@@ -546,6 +571,7 @@ def _load_fitment_vehicle_records_cached(path_text: str, mtime_ns: int, size_byt
     liter_col = ""
     family_col = ""
     code_col = ""
+    fields_json_col = ""
 
     for index, normalized in enumerate(normalized_columns):
         col = columns[index]
@@ -563,6 +589,8 @@ def _load_fitment_vehicle_records_cached(path_text: str, mtime_ns: int, size_byt
             family_col = col
         if not code_col and normalized in {"engine_code", "code", "generation"}:
             code_col = col
+        if not fields_json_col and normalized in {"fields_json", "fields", "metaobject_fields", "field_json"}:
+            fields_json_col = col
 
     if not gid_col:
         return tuple()
@@ -581,12 +609,29 @@ def _load_fitment_vehicle_records_cached(path_text: str, mtime_ns: int, size_byt
         family_text = _clean_text(row.get(family_col, "")) if family_col else display_name
         code_text = _clean_text(row.get(code_col, "")) if code_col else display_name
 
-        year_match = re.search(r"\b(19|20)\d{2}\b", year_text)
-        year = int(year_match.group(0)) if year_match else None
+        field_year_text = ""
+        if fields_json_col:
+            raw_fields = _clean_text(row.get(fields_json_col, ""))
+            if raw_fields:
+                try:
+                    parsed_fields = json.loads(raw_fields)
+                    if isinstance(parsed_fields, dict):
+                        field_year_text = _clean_text(parsed_fields.get("year", ""))
+                except Exception:
+                    field_year_text = ""
+
+        year_value = (
+            _parse_year_float(field_year_text)
+            or _parse_year_float(year_text)
+            or _parse_year_float(display_name)
+        )
+        year_value = _normalize_year_value(year_value)
+        year = int(year_value) if year_value is not None else None
         record = {
             "gid": gid,
             "display_name": display_name,
             "year": year,
+            "year_value": year_value,
             "make_key": _normalize_make_key(make_text),
             "family_key": _normalize_family_key(family_text),
             "liter": _normalize_engine_liter(liter_text),
@@ -705,19 +750,30 @@ def _extract_year_spans(text: str) -> list[tuple[float, float]]:
     return spans
 
 
-def _expand_years(spans: list[tuple[float, float]]) -> list[int]:
-    years: list[int] = []
-    seen: set[int] = set()
+def _expand_year_points(spans: list[tuple[float, float]], half_year_candidates: set[float] | None = None) -> list[float]:
+    years: list[float] = []
+    seen: set[float] = set()
+    normalized_half_candidates = {_normalize_year_value(value) for value in (half_year_candidates or set())}
+    normalized_half_candidates.discard(None)
     for start, end in spans:
         first = int(start)
         last = int(end)
         if first > last:
             first, last = last, first
         for year in range(first, last + 1):
-            if year in seen:
-                continue
-            seen.add(year)
-            years.append(year)
+            full_year = float(year)
+            if start <= full_year <= end and full_year not in seen:
+                seen.add(full_year)
+                years.append(full_year)
+
+            half_year = float(year) + 0.5
+            if (
+                half_year in normalized_half_candidates
+                and start <= half_year <= end
+                and half_year not in seen
+            ):
+                seen.add(half_year)
+                years.append(half_year)
     return years
 
 
@@ -752,7 +808,7 @@ def _target_make_keys(make_key: str) -> list[str]:
 
 
 def _select_fitment_engine_rule_for_year(
-    year: int,
+    year_value: float,
     make_key: str,
     family_hint: str,
     liter_hint: str,
@@ -763,7 +819,7 @@ def _select_fitment_engine_rule_for_year(
     for rule in rules:
         start = float(rule.get("start", 0))
         end = float(rule.get("end", 0))
-        if float(year) < start or float(year) > end:
+        if float(year_value) < start or float(year_value) > end:
             continue
 
         rule_make = _clean_text(rule.get("make_key", ""))
@@ -792,12 +848,18 @@ def _select_fitment_engine_rule_for_year(
     return dict(best_rule) if best_rule is not None else None
 
 
-def _record_candidates_for_year_make(records: list[dict], year: int, make_key: str) -> list[dict]:
+def _record_candidates_for_year_make(records: list[dict], year_value: float, make_key: str) -> list[dict]:
     out: list[dict] = []
     for record in records:
-        record_year = record.get("year")
+        record_year = record.get("year_value")
+        if record_year is None:
+            fallback_year = record.get("year")
+            if fallback_year is not None:
+                record_year = float(fallback_year)
         record_make = _clean_text(record.get("make_key", ""))
-        if record_year != year:
+        if record_year is None:
+            continue
+        if abs(float(record_year) - float(year_value)) > 0.001:
             continue
         if record_make != make_key:
             continue
@@ -807,13 +869,13 @@ def _record_candidates_for_year_make(records: list[dict], year: int, make_key: s
 
 def _pick_fitment_vehicle_gid(
     records: list[dict],
-    year: int,
+    year_value: float,
     make_key: str,
     family_key: str,
     liter: str,
     engine_code: str,
 ) -> str:
-    candidates = _record_candidates_for_year_make(records=records, year=year, make_key=make_key)
+    candidates = _record_candidates_for_year_make(records=records, year_value=year_value, make_key=make_key)
     if not candidates:
         return ""
 
@@ -860,8 +922,7 @@ def resolve_fitment_vehicle_metaobject_gids(
 
     context = " ".join([_clean_text(application_text), _clean_text(title_text), _clean_text(description_text)]).strip()
     spans = _extract_year_spans(_clean_text(application_text) or context)
-    years = _expand_years(spans)
-    if not years:
+    if not spans:
         return [], ["Could not detect fitment year range from application text."]
 
     make_key = _detect_primary_make_key(_clean_text(application_text) or context)
@@ -882,14 +943,32 @@ def resolve_fitment_vehicle_metaobject_gids(
     if not target_makes:
         return [], [f"Unsupported fitment make '{make_key}' for fitment vehicle resolution."]
 
+    half_year_candidates: set[float] = set()
+    if make_key in {"gm", "ram"}:
+        for record in records:
+            record_make = _clean_text(record.get("make_key", ""))
+            if record_make not in target_makes:
+                continue
+            record_year_value = _normalize_year_value(record.get("year_value"))
+            if record_year_value is None:
+                fallback_year = record.get("year")
+                if fallback_year is not None:
+                    record_year_value = _normalize_year_value(float(fallback_year))
+            if _is_half_year(record_year_value):
+                half_year_candidates.add(float(record_year_value))
+
+    years = _expand_year_points(spans=spans, half_year_candidates=half_year_candidates)
+    if not years:
+        return [], ["Could not detect fitment year range from application text."]
+
     engine_rules = _load_fitment_engine_rules(required_root=required_root)
     warnings: list[str] = []
     gids: list[str] = []
     seen_gids: set[str] = set()
 
-    for year in years:
+    for year_value in years:
         selected_rule = _select_fitment_engine_rule_for_year(
-            year=year,
+            year_value=year_value,
             make_key=make_key,
             family_hint=family_hint,
             liter_hint=liter_hint,
@@ -901,14 +980,14 @@ def resolve_fitment_vehicle_metaobject_gids(
         for target_make in target_makes:
             gid = _pick_fitment_vehicle_gid(
                 records=records,
-                year=year,
+                year_value=year_value,
                 make_key=target_make,
                 family_key=family,
                 liter=liter,
                 engine_code=engine_code,
             )
             if not gid:
-                detail = f"{year} {target_make}"
+                detail = f"{_format_year_value(year_value) or str(year_value)} {target_make}"
                 if liter:
                     detail += f" {liter}"
                 if family:

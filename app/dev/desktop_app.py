@@ -14,6 +14,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.parse
 import webbrowser
 from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
 
@@ -63,6 +64,11 @@ from product_prospector.core.shopify_variant_updates import (
     fetch_variant_snapshots_by_skus,
     push_variant_weights_bulk,
 )
+from product_prospector.core.blog_tagging import (
+    is_valid_product_tag,
+    load_tag_catalog,
+    suggest_tags_for_product,
+)
 from product_prospector.core.type_mapping_engine import TypeCategoryMapper
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
@@ -82,6 +88,9 @@ APP_GEOMETRY = "1440x920"
 APP_WINDOW_MARGIN_PX = 64
 APP_MIN_WINDOW_WIDTH = 1080
 APP_MIN_WINDOW_HEIGHT = 680
+PROSPECTOR_COMBO_MIN_WIDTH_PX = 200
+PROSPECTOR_COMBO_PAD_X_PX = 7
+PROSPECTOR_COMBO_PAD_Y_PX = 3
 HEADER_LOGO_VERTICAL_CROP_TOP_PX = 80
 HEADER_LOGO_VERTICAL_CROP_BOTTOM_PX = 40
 HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 25
@@ -138,6 +147,15 @@ def _inventory_for_owner(owner_name: str) -> int:
 def _tag_for_owner(owner_name: str) -> str:
     owner = _normalize_owner_name(owner_name)
     return str(OWNER_TAG_BY_OWNER.get(owner, OWNER_TAG_BY_OWNER[DEFAULT_INVENTORY_OWNER])).strip()
+
+
+def _owner_tag_keys() -> set[str]:
+    keys: set[str] = set()
+    for value in OWNER_TAG_BY_OWNER.values():
+        token = str(value or "").strip().lower()
+        if token:
+            keys.add(token)
+    return keys
 
 
 def _normalize_url_for_open(value: str) -> str:
@@ -479,6 +497,7 @@ class ProductProspectorDesktopApp:
             "brand": StringVar(value=""),
             "application": StringVar(value=""),
             "collections": StringVar(value=""),
+            "tags": StringVar(value=""),
             "core_charge_product_code": StringVar(value=""),
         }
         self.review_variant_fields: dict[str, StringVar] = {
@@ -502,6 +521,14 @@ class ProductProspectorDesktopApp:
         self.review_collections_suggestions_frame: ttk.Frame | None = None
         self.review_collections_suggestions: tk.Listbox | None = None
         self.review_collections_suggestion_values: list[str] = []
+        self.review_tag_options: list[str] = []
+        self.review_tag_option_by_key: dict[str, str] = {}
+        self.review_tag_selected: list[str] = []
+        self.review_tags_query = StringVar(value="")
+        self.review_tags_entry: tk.Text | None = None
+        self.review_tags_suggestions_frame: ttk.Frame | None = None
+        self.review_tags_suggestions: tk.Listbox | None = None
+        self.review_tags_suggestion_values: list[str] = []
         self.review_index_text = StringVar(value="Product 0 / 0")
         self.review_cost_rule_text = StringVar(value="")
         self.review_cost_options: list[DiscountMatch] = []
@@ -534,6 +561,8 @@ class ProductProspectorDesktopApp:
         self._ui_task_pump_job: str | None = None
         self._mousewheel_bindings_ready = False
         self._review_collections_suggestion_hide_job: str | None = None
+        self._review_tags_suggestion_hide_job: str | None = None
+        self._review_tags_editor_internal = False
 
         self.run_mode.trace_add("write", self._on_run_mode_changed)
         self.inventory_owner.trace_add("write", self._on_inventory_owner_changed)
@@ -541,6 +570,7 @@ class ProductProspectorDesktopApp:
         self.setup_status_text.trace_add("write", self._on_setup_status_rows_changed)
         self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
         self._load_review_collection_options()
+        self._load_review_tag_options()
 
         self._create_layout()
         self._initialize_shopify_cache_state()
@@ -1061,6 +1091,11 @@ class ProductProspectorDesktopApp:
     def _build_setup_tab(self) -> None:
         update_check_style = ttk.Style(self.root)
         update_check_style.configure("WideUpdate.TCheckbutton", padding=(8, 4))
+        update_check_style.configure(
+            "Prospector.TCombobox",
+            fieldpadding=(PROSPECTOR_COMBO_PAD_X_PX, PROSPECTOR_COMBO_PAD_Y_PX),
+            padding=(PROSPECTOR_COMBO_PAD_X_PX, PROSPECTOR_COMBO_PAD_Y_PX),
+        )
 
         self.setup_canvas = Canvas(self.tab_setup, highlightthickness=0, bd=0)
         self.setup_canvas.pack(side=LEFT, fill=BOTH, expand=True)
@@ -1092,11 +1127,13 @@ class ProductProspectorDesktopApp:
             textvariable=self.inventory_owner,
             values=INVENTORY_OWNER_VALUES,
             state="readonly",
-            width=18,
+            width=24,
             height=len(INVENTORY_OWNER_VALUES),
+            style="Prospector.TCombobox",
             postcommand=self._prepare_prospector_dropdown_menu,
         )
         self.inventory_owner_combo.pack(side=LEFT)
+        self._ensure_prospector_combo_min_width()
         ttk.Label(owner_row, textvariable=self.inventory_owner_inventory_text, foreground="#1f4e79").pack(side=LEFT, padx=(15, 10))
         ttk.Label(owner_row, textvariable=self.shopify_cache_inline_text, foreground="#1f4e79").pack(side=LEFT, padx=(16, 0))
 
@@ -1333,6 +1370,7 @@ class ProductProspectorDesktopApp:
             return
         try:
             combo = self.inventory_owner_combo
+            self._ensure_prospector_combo_min_width()
             popdown = str(self.root.tk.call("ttk::combobox::PopdownWindow", str(combo)))
             listbox_path = f"{popdown}.f.l"
             if not hasattr(self, "_prospector_dropdown_font"):
@@ -1354,8 +1392,36 @@ class ProductProspectorDesktopApp:
                     weight=base_font.cget("weight"),
                 )
             self.root.tk.call(listbox_path, "configure", "-font", str(self._prospector_dropdown_font))
+            width_chars = int(getattr(self, "_prospector_combo_width_chars", combo.cget("width") or 24))
+            list_width = max(width_chars, max((len(item) for item in INVENTORY_OWNER_VALUES), default=width_chars) + 2)
+            self.root.tk.call(listbox_path, "configure", "-width", int(list_width))
         except Exception:
             return
+
+    def _ensure_prospector_combo_min_width(self) -> None:
+        if not hasattr(self, "inventory_owner_combo"):
+            return
+        combo = self.inventory_owner_combo
+        try:
+            combo_font_name = str(combo.cget("font") or "TkTextFont")
+            combo_font = tkfont.nametofont(combo_font_name)
+        except Exception:
+            combo_font = tkfont.nametofont("TkTextFont")
+
+        zero_width = max(1, int(combo_font.measure("0")))
+        min_chars = max(1, int((PROSPECTOR_COMBO_MIN_WIDTH_PX + zero_width - 1) // zero_width))
+
+        # Keep enough width for longest prospector label plus internal horizontal padding.
+        longest_label_px = max((combo_font.measure(str(item)) for item in INVENTORY_OWNER_VALUES), default=0)
+        longest_with_padding_px = (
+            int(longest_label_px)
+            + (PROSPECTOR_COMBO_PAD_X_PX * 2)
+            + 28
+        )
+        label_chars = max(1, int((longest_with_padding_px + zero_width - 1) // zero_width))
+        width_chars = max(int(combo.cget("width") or 0), min_chars, label_chars)
+        self._prospector_combo_width_chars = width_chars
+        combo.configure(width=width_chars)
 
     def _set_setup_workflow_visible(self, visible: bool) -> None:
         if not hasattr(self, "setup_workflow_wrap"):
@@ -1732,11 +1798,14 @@ class ProductProspectorDesktopApp:
         self.review_cost_options = []
         self.review_collection_selected = []
         self.review_collections_query.set("")
+        self.review_tag_selected = []
+        self.review_tags_query.set("")
         for var in self.review_fields.values():
             var.set("")
         self.review_fields["inventory"].set(str(_inventory_for_owner(self.inventory_owner.get())))
         self._clear_review_variant_fields()
         self._set_review_collections_from_text("")
+        self._set_review_tags_from_values([])
         self._set_variant_form_visible(False)
         self._refresh_review_tab()
         self.review_status_text.set("")
@@ -1867,8 +1936,10 @@ class ProductProspectorDesktopApp:
         form_wrap.pack(fill=X, pady=(0, 8))
         form_grid = ttk.Frame(form_wrap)
         form_grid.pack(fill=X)
-        form_grid.columnconfigure(1, weight=1)
-        form_grid.columnconfigure(3, weight=1)
+        form_grid.columnconfigure(0, weight=0, minsize=145)
+        form_grid.columnconfigure(1, weight=1, uniform="review_form_input")
+        form_grid.columnconfigure(2, weight=0, minsize=145)
+        form_grid.columnconfigure(3, weight=1, uniform="review_form_input")
 
         self._review_entry_row(form_grid, "Title", "title", 0, 0)
         self._review_entry_row(form_grid, "Description", "description_html", 1, 0)
@@ -1879,6 +1950,7 @@ class ProductProspectorDesktopApp:
         self._review_entry_row(form_grid, "SKU", "sku", 6, 0)
         self._review_entry_row(form_grid, "Barcode", "barcode", 7, 0)
         self._review_entry_row(form_grid, "Weight", "weight", 8, 0)
+        self._review_tags_row(form_grid, 9, 0)
 
         self._review_entry_row(form_grid, "Vendor", "vendor", 0, 2)
         self._review_entry_row(form_grid, "Type", "type", 1, 2)
@@ -1994,6 +2066,7 @@ class ProductProspectorDesktopApp:
             "scrape_status",
             "scrape_fields_found",
             "scrape_error",
+            "scrape_mismatch_error",
             "media_folder",
         ]
         trailing_present = [column for column in trailing if column in df.columns]
@@ -2109,6 +2182,33 @@ class ProductProspectorDesktopApp:
         titles.sort(key=lambda item: item.lower())
         self.review_collection_options = titles
         self.review_collection_option_by_key = title_by_key
+
+    @staticmethod
+    def _tag_key(value: str) -> str:
+        return str(value or "").strip().lower()
+
+    def _hidden_owner_tag_keys(self) -> set[str]:
+        return _owner_tag_keys()
+
+    def _load_review_tag_options(self) -> None:
+        options = load_tag_catalog(required_root=self.required_root)
+        values: list[str] = []
+        by_key: dict[str, str] = {}
+        hidden = self._hidden_owner_tag_keys()
+        for option in options:
+            tag = str(option or "").strip()
+            key = self._tag_key(tag)
+            if not tag or not key or key in by_key:
+                continue
+            if key in hidden:
+                continue
+            if not is_valid_product_tag(tag):
+                continue
+            by_key[key] = tag
+            values.append(tag)
+        values.sort(key=lambda item: item.lower())
+        self.review_tag_options = values
+        self.review_tag_option_by_key = by_key
 
     def _filter_collections_to_local_supported(self, collections_text: str) -> str:
         # Keep only known local collection titles and exclude deprecated entries.
@@ -2429,6 +2529,389 @@ class ProductProspectorDesktopApp:
                     pass
         return "break"
 
+    def _review_tags_row(self, parent, row: int, col_offset: int) -> None:
+        ttk.Label(parent, text="Tags", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
+        frame.columnconfigure(0, weight=1)
+
+        entry = tk.Text(
+            frame,
+            width=1,
+            height=2,
+            wrap="word",
+            undo=True,
+            bd=0,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#CBD5E1",
+            highlightcolor="#86EFAC",
+            padx=7,
+            pady=5,
+        )
+        entry.grid(row=0, column=0, sticky="ew")
+        entry.bind("<KeyRelease>", self._on_review_tags_entry_keyrelease, add="+")
+        entry.bind("<Return>", self._on_review_tags_entry_return, add="+")
+        entry.bind("<Down>", self._on_review_tags_entry_down, add="+")
+        entry.bind("<Escape>", self._on_review_tags_entry_escape, add="+")
+        entry.bind("<FocusOut>", self._on_review_tags_entry_focus_out, add="+")
+        self.review_tags_entry = entry
+
+        suggestions_frame = ttk.Frame(frame)
+        suggestions_frame.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        suggestions_frame.columnconfigure(0, weight=1)
+        suggestions = tk.Listbox(suggestions_frame, height=6, activestyle="none", exportselection=False)
+        suggestions.grid(row=0, column=0, sticky="ew")
+        suggestions_scroll = ttk.Scrollbar(suggestions_frame, orient=VERTICAL, command=suggestions.yview)
+        suggestions_scroll.grid(row=0, column=1, sticky="ns")
+        suggestions.configure(yscrollcommand=suggestions_scroll.set)
+        suggestions.bind("<ButtonRelease-1>", self._on_review_tags_suggestion_activate, add="+")
+        suggestions.bind("<Double-1>", self._on_review_tags_suggestion_activate, add="+")
+        suggestions.bind("<Return>", self._on_review_tags_suggestion_activate, add="+")
+        suggestions.bind("<Escape>", self._on_review_tags_entry_escape, add="+")
+        suggestions.bind("<FocusOut>", self._on_review_tags_entry_focus_out, add="+")
+        suggestions_frame.grid_remove()
+        self.review_tags_suggestions_frame = suggestions_frame
+        self.review_tags_suggestions = suggestions
+        self.review_tags_suggestion_values = []
+        self._render_review_tags_editor(query="", trailing_comma=False)
+
+    def _selected_tag_keys(self) -> set[str]:
+        return {self._tag_key(item) for item in self.review_tag_selected if self._tag_key(item)}
+
+    def _sync_review_tags_field(self) -> None:
+        self.review_fields["tags"].set(", ".join(self.review_tag_selected))
+
+    def _review_tags_editor_text(self) -> str:
+        editor = self.review_tags_entry
+        if editor is None:
+            return ""
+        try:
+            return str(editor.get("1.0", "end-1c") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse_review_tags_editor_input(text: str) -> tuple[list[str], str, bool]:
+        source = str(text or "")
+        trailing_comma = bool(re.search(r",\s*$", source))
+        parts = source.split(",")
+
+        if trailing_comma:
+            committed_parts = parts
+            query_part = ""
+        elif len(parts) > 1:
+            committed_parts = parts[:-1]
+            query_part = parts[-1]
+        else:
+            committed_parts = []
+            query_part = parts[0] if parts else ""
+
+        committed = [str(item or "").strip() for item in committed_parts if str(item or "").strip()]
+        query = str(query_part or "").strip()
+        return committed, query, trailing_comma
+
+    def _normalize_review_tag_values(
+        self,
+        values: list[str],
+        *,
+        existing_selected_keys: set[str] | None = None,
+        strict_catalog: bool,
+    ) -> list[str]:
+        selected: list[str] = []
+        seen: set[str] = set()
+        hidden = self._hidden_owner_tag_keys()
+        known_keys = set(self.review_tag_option_by_key.keys())
+        existing_keys = {self._tag_key(item) for item in (existing_selected_keys or set()) if self._tag_key(item)}
+        for raw in values:
+            value = str(raw or "").strip()
+            key = self._tag_key(value)
+            if not value or not key or key in seen:
+                continue
+            if key in hidden:
+                continue
+            if not is_valid_product_tag(value):
+                continue
+
+            canonical = self.review_tag_option_by_key.get(key, "")
+            if not canonical:
+                # Allow preserving already-existing tags currently selected on a loaded product,
+                # but block creating brand-new tags from manual typing.
+                if key in existing_keys or not strict_catalog:
+                    canonical = value
+                else:
+                    continue
+            elif key not in known_keys:
+                known_keys.add(key)
+            seen.add(key)
+            selected.append(canonical)
+        return selected
+
+    def _render_review_tags_editor(self, query: str = "", trailing_comma: bool = False) -> None:
+        editor = self.review_tags_entry
+        if editor is None:
+            return
+        query_text = str(query or "").strip()
+        base_text = ", ".join(self.review_tag_selected)
+        if query_text:
+            text = f"{base_text}, {query_text}" if base_text else query_text
+        elif trailing_comma and base_text:
+            text = f"{base_text}, "
+        else:
+            text = base_text
+
+        self._review_tags_editor_internal = True
+        try:
+            editor.delete("1.0", END)
+            if text:
+                editor.insert("1.0", text)
+            editor.tag_configure("selected_tag", background="#DCFCE7", foreground="#166534")
+            editor.tag_remove("selected_tag", "1.0", END)
+            seek_from = 0
+            for tag in self.review_tag_selected:
+                if not tag:
+                    continue
+                start = text.find(tag, seek_from)
+                if start < 0:
+                    continue
+                end = start + len(tag)
+                editor.tag_add("selected_tag", f"1.0+{start}c", f"1.0+{end}c")
+                seek_from = end
+            editor.mark_set("insert", "end-1c")
+            editor.see("insert")
+        finally:
+            self._review_tags_editor_internal = False
+
+    def _sync_review_tags_from_editor(
+        self,
+        *,
+        commit_query: bool,
+        strict_catalog: bool,
+    ) -> bool:
+        raw_text = self._review_tags_editor_text()
+        committed_values, query, trailing_comma = self._parse_review_tags_editor_input(raw_text)
+        tokens = list(committed_values)
+        if commit_query and query:
+            tokens.append(query)
+            query = ""
+            trailing_comma = False
+
+        normalized = self._normalize_review_tag_values(
+            tokens,
+            existing_selected_keys=self._selected_tag_keys(),
+            strict_catalog=strict_catalog,
+        )
+        changed = normalized != self.review_tag_selected
+        self.review_tag_selected = normalized
+        self._sync_review_tags_field()
+        self.review_tags_query.set(query)
+        self._render_review_tags_editor(query=query, trailing_comma=trailing_comma and not bool(query))
+        return changed
+
+    def _set_review_tags_from_values(self, values: list[str]) -> None:
+        self.review_tag_selected = self._normalize_review_tag_values(
+            values,
+            strict_catalog=False,
+        )
+        self._sync_review_tags_field()
+        self._render_review_tags_editor(query="", trailing_comma=False)
+        self._hide_review_tags_suggestions()
+        self.review_tags_query.set("")
+
+    def _set_review_tags_from_text(self, text: str) -> None:
+        values = [item.strip() for item in re.split(r"[,\n|]+", str(text or "")) if item.strip()]
+        self._set_review_tags_from_values(values)
+
+    def _remove_review_tag_token(self, tag: str) -> None:
+        key = self._tag_key(tag)
+        if not key:
+            return
+        self.review_tag_selected = [item for item in self.review_tag_selected if self._tag_key(item) != key]
+        self._sync_review_tags_field()
+        self._render_review_tags_editor(query="", trailing_comma=False)
+        self._refresh_review_tags_suggestions()
+
+    def _add_review_tag_token(self, tag: str, persist_new: bool = True) -> bool:
+        value = str(tag or "").strip()
+        key = self._tag_key(value)
+        if not value or not key:
+            return False
+        if key in self._hidden_owner_tag_keys():
+            return False
+        if not is_valid_product_tag(value):
+            return False
+
+        canonical = self.review_tag_option_by_key.get(key, "")
+        if not canonical:
+            return False
+
+        if key in self._selected_tag_keys():
+            self.review_tags_query.set("")
+            self._hide_review_tags_suggestions()
+            return True
+
+        self.review_tag_selected.append(canonical)
+        self._sync_review_tags_field()
+        self._render_review_tags_editor(query="", trailing_comma=True)
+        self.review_tags_query.set("")
+        self._hide_review_tags_suggestions()
+        return True
+
+    def _refresh_review_tag_chips(self) -> None:
+        self._render_review_tags_editor(query=self.review_tags_query.get(), trailing_comma=False)
+
+    def _review_tag_matches(self, query: str) -> list[str]:
+        self._load_review_tag_options()
+        text = str(query or "").strip().lower()
+        if not text:
+            return []
+        selected_keys = self._selected_tag_keys()
+        starts: list[str] = []
+        contains: list[str] = []
+        for option in self.review_tag_options:
+            key = self._tag_key(option)
+            if key in selected_keys:
+                continue
+            option_low = option.lower()
+            if option_low.startswith(text):
+                starts.append(option)
+            elif text in option_low:
+                contains.append(option)
+        return [*starts, *contains]
+
+    def _show_review_tags_suggestions(self, values: list[str]) -> None:
+        frame = self.review_tags_suggestions_frame
+        listbox = self.review_tags_suggestions
+        if frame is None or listbox is None:
+            return
+        listbox.delete(0, END)
+        for value in values:
+            listbox.insert(END, value)
+        self.review_tags_suggestion_values = list(values)
+        if values:
+            frame.grid()
+            try:
+                listbox.selection_clear(0, END)
+                listbox.selection_set(0)
+                listbox.activate(0)
+            except Exception:
+                pass
+        else:
+            frame.grid_remove()
+
+    def _hide_review_tags_suggestions(self) -> None:
+        if self._review_tags_suggestion_hide_job is not None:
+            try:
+                self.root.after_cancel(self._review_tags_suggestion_hide_job)
+            except Exception:
+                pass
+            self._review_tags_suggestion_hide_job = None
+        if self.review_tags_suggestions_frame is not None:
+            self.review_tags_suggestions_frame.grid_remove()
+        self.review_tags_suggestion_values = []
+
+    def _refresh_review_tags_suggestions(self) -> None:
+        self._load_review_tag_options()
+        _committed, query, _trailing = self._parse_review_tags_editor_input(self._review_tags_editor_text())
+        self.review_tags_query.set(query)
+        query = query.strip().strip(",")
+        if not query:
+            self._hide_review_tags_suggestions()
+            return
+        matches = self._review_tag_matches(query)[:40]
+        self._show_review_tags_suggestions(matches)
+
+    def _commit_review_tags_query(self) -> bool:
+        changed = self._sync_review_tags_from_editor(commit_query=True, strict_catalog=True)
+        self.review_tags_query.set("")
+        self._hide_review_tags_suggestions()
+        return changed
+
+    def _on_review_tags_entry_keyrelease(self, event=None):
+        if self._review_tags_editor_internal:
+            return
+        key = str(getattr(event, "keysym", "") or "")
+        if key in {"Return", "Up", "Down", "Escape", "Tab"}:
+            return
+        self._sync_review_tags_from_editor(commit_query=False, strict_catalog=True)
+        char = str(getattr(event, "char", "") or "")
+        if char == ",":
+            self._hide_review_tags_suggestions()
+            return
+        self._refresh_review_tags_suggestions()
+
+    def _on_review_tags_entry_return(self, _event=None):
+        listbox = self.review_tags_suggestions
+        frame = self.review_tags_suggestions_frame
+        if listbox is not None and frame is not None and bool(frame.winfo_ismapped()):
+            selection = listbox.curselection()
+            if selection:
+                index = int(selection[0])
+                if 0 <= index < len(self.review_tags_suggestion_values):
+                    self._add_review_tag_token(self.review_tags_suggestion_values[index])
+                    return "break"
+        self._commit_review_tags_query()
+        return "break"
+
+    def _on_review_tags_entry_down(self, _event=None):
+        listbox = self.review_tags_suggestions
+        frame = self.review_tags_suggestions_frame
+        if listbox is None or frame is None:
+            return
+        if not bool(frame.winfo_ismapped()):
+            self._refresh_review_tags_suggestions()
+        if bool(frame.winfo_ismapped()):
+            try:
+                listbox.focus_set()
+                if not listbox.curselection() and self.review_tags_suggestion_values:
+                    listbox.selection_set(0)
+                    listbox.activate(0)
+            except Exception:
+                pass
+            return "break"
+        return None
+
+    def _on_review_tags_entry_escape(self, _event=None):
+        self._hide_review_tags_suggestions()
+        return "break"
+
+    def _on_review_tags_entry_focus_out(self, _event=None):
+        self._commit_review_tags_query()
+        if self._review_tags_suggestion_hide_job is not None:
+            try:
+                self.root.after_cancel(self._review_tags_suggestion_hide_job)
+            except Exception:
+                pass
+        self._review_tags_suggestion_hide_job = self.root.after(120, self._hide_review_tags_suggestions)
+
+    def _on_review_tags_suggestion_activate(self, _event=None):
+        listbox = self.review_tags_suggestions
+        if listbox is None:
+            return "break"
+        selection = listbox.curselection()
+        if not selection:
+            return "break"
+        index = int(selection[0])
+        if 0 <= index < len(self.review_tags_suggestion_values):
+            selected = self.review_tags_suggestion_values[index]
+            committed_values, _query, _trailing = self._parse_review_tags_editor_input(self._review_tags_editor_text())
+            committed_values.append(selected)
+            self.review_tag_selected = self._normalize_review_tag_values(
+                committed_values,
+                existing_selected_keys=self._selected_tag_keys(),
+                strict_catalog=True,
+            )
+            self._sync_review_tags_field()
+            self.review_tags_query.set("")
+            self._render_review_tags_editor(query="", trailing_comma=True)
+            self._hide_review_tags_suggestions()
+            if self.review_tags_entry is not None:
+                try:
+                    self.review_tags_entry.focus_set()
+                except Exception:
+                    pass
+        return "break"
+
     def _review_cost_row(self, parent, row: int, col_offset: int) -> None:
         ttk.Label(parent, text="Cost", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
         frame = ttk.Frame(parent)
@@ -2681,7 +3164,12 @@ class ProductProspectorDesktopApp:
                 return self.review_loaded_raw.get(field_name, "").strip()
         return current
 
-    def _start_processing_clicked(self, auto_open_review: bool = False) -> bool:
+    def _start_processing_clicked(
+        self,
+        auto_open_review: bool = False,
+        allow_missing_without_scrape: bool = False,
+        skip_scrape: bool = False,
+    ) -> bool:
         if self.processing_inflight:
             return False
         if not self.session.setup_complete:
@@ -2712,7 +3200,11 @@ class ProductProspectorDesktopApp:
             messagebox.showwarning(APP_TITLE, "No valid SKUs found in the current scope.")
             return False
 
-        if self.session.missing_fields and not self.session.scrape_settings.vendor_search_url:
+        if (
+            self.session.missing_fields
+            and not self.session.scrape_settings.vendor_search_url
+            and not allow_missing_without_scrape
+        ):
             messagebox.showwarning(
                 APP_TITLE,
                 "Missing fields require scraping. Set Vendor Search URL in Processing or complete mappings in Setup.",
@@ -2736,7 +3228,11 @@ class ProductProspectorDesktopApp:
 
         worker = threading.Thread(
             target=self._run_processing_worker,
-            kwargs={"request_id": request_id, "target_skus": list(target_skus)},
+            kwargs={
+                "request_id": request_id,
+                "target_skus": list(target_skus),
+                "skip_scrape": bool(skip_scrape),
+            },
             daemon=True,
         )
         worker.start()
@@ -2816,7 +3312,7 @@ class ProductProspectorDesktopApp:
         except Exception:
             return True
 
-    def _run_processing_worker(self, request_id: int, target_skus: list[str]) -> None:
+    def _run_processing_worker(self, request_id: int, target_skus: list[str], skip_scrape: bool = False) -> None:
         result_payload: dict[str, object] = {}
         try:
             existing_index: dict[str, dict[str, str]] = {}
@@ -2832,11 +3328,13 @@ class ProductProspectorDesktopApp:
             scrape_general_errors: list[str] = []
             can_scrape = bool(self.session.scrape_settings.vendor_search_url and target_skus)
             image_scrape_needed = bool(self.session.scrape_settings.scrape_images) and self._scope_missing_media_for_scrape(target_skus)
-            should_scrape = can_scrape and (
-                self.session.scrape_settings.force_scrape
-                or bool(self.session.missing_fields)
-                or image_scrape_needed
-            )
+            should_scrape = False
+            if not skip_scrape:
+                should_scrape = can_scrape and (
+                    self.session.scrape_settings.force_scrape
+                    or bool(self.session.missing_fields)
+                    or image_scrape_needed
+                )
             if should_scrape:
                 scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
                     vendor_search_url=self.session.scrape_settings.vendor_search_url,
@@ -2866,6 +3364,8 @@ class ProductProspectorDesktopApp:
 
             normalized_products = []
             default_inventory = int(self.session.inventory_default or 3000000)
+            tag_catalog = list(self.review_tag_options)
+            hidden_owner_tags = self._hidden_owner_tag_keys()
             for product in products:
                 normalized = normalize_product(
                     product=product,
@@ -2893,6 +3393,43 @@ class ProductProspectorDesktopApp:
                     if auto_collections:
                         normalized.collections = auto_collections
                 normalized.finalize_defaults()
+                if self.session.mode == MODE_NEW:
+                    base_tags: list[str] = []
+                    seen_tags: set[str] = set()
+                    for raw_tag in list(getattr(normalized, "tags", []) or []):
+                        tag_value = str(raw_tag or "").strip()
+                        tag_key = self._tag_key(tag_value)
+                        if (
+                            not tag_value
+                            or not is_valid_product_tag(tag_value)
+                            or tag_key in seen_tags
+                            or tag_key in hidden_owner_tags
+                        ):
+                            continue
+                        seen_tags.add(tag_key)
+                        base_tags.append(tag_value)
+
+                    suggested_tags = suggest_tags_for_product(
+                        title=str(getattr(normalized, "title", "") or ""),
+                        description_html=str(getattr(normalized, "description_html", "") or ""),
+                        application=str(getattr(normalized, "application", "") or ""),
+                        vendor=str(getattr(normalized, "vendor", "") or ""),
+                        product_type=str(getattr(normalized, "type", "") or ""),
+                        tags_list=tag_catalog,
+                        max_tags=2,
+                    )
+                    for tag_value in suggested_tags:
+                        tag_key = self._tag_key(tag_value)
+                        if (
+                            not tag_value
+                            or not is_valid_product_tag(tag_value)
+                            or tag_key in seen_tags
+                            or tag_key in hidden_owner_tags
+                        ):
+                            continue
+                        seen_tags.add(tag_key)
+                        base_tags.append(tag_value)
+                    normalized.tags = base_tags
                 normalized_products.append(normalized)
 
             self._apply_scrape_diagnostics(
@@ -3074,6 +3611,106 @@ class ProductProspectorDesktopApp:
                     return candidate_error
             return ""
 
+        def normalize_money_text(value: object) -> str:
+            parsed = self._parse_float_value(value)
+            if parsed is None:
+                return ""
+            return f"{parsed:.2f}"
+
+        def normalize_barcode_text(value: object) -> str:
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            return re.sub(r"[^0-9]", "", text)
+
+        def normalize_weight_text(value: object) -> str:
+            parsed = self._parse_float_value(value)
+            if parsed is None:
+                return ""
+            return f"{parsed:.3f}".rstrip("0").rstrip(".")
+
+        def extract_scraped_sku_candidates(payload: dict[str, str]) -> list[str]:
+            raw_candidates: list[str] = []
+            title_text = str((payload or {}).get("title", "") or "")
+            for match in re.finditer(r"#\s*([A-Z0-9][A-Z0-9._/-]{2,})", title_text, flags=re.IGNORECASE):
+                raw_candidates.append(match.group(1))
+
+            for key in ["product_url", "source_url", "search_url"]:
+                value = str((payload or {}).get(key, "") or "")
+                if not value:
+                    continue
+                decoded = urllib.parse.unquote(value)
+                for match in re.finditer(r"/product-detail/([A-Za-z0-9._-]{3,})", decoded, flags=re.IGNORECASE):
+                    raw_candidates.append(match.group(1))
+                for match in re.finditer(r"[?&](?:find|sku|part|mpn)=([^&#]+)", decoded, flags=re.IGNORECASE):
+                    raw_candidates.append(match.group(1))
+
+            output: list[str] = []
+            seen: set[str] = set()
+            for candidate in raw_candidates:
+                token = normalize_sku(candidate)
+                if not token or token in seen:
+                    continue
+                seen.add(token)
+                output.append(token)
+            return output
+
+        def has_spreadsheet_value(product_obj, field_name: str) -> bool:
+            source = str(getattr(product_obj, "field_sources", {}).get(field_name, "") or "").strip().lower()
+            return source == "spreadsheet"
+
+        def collect_numeric_mismatches(product_obj, payload: dict[str, str]) -> list[str]:
+            mismatches: list[str] = []
+
+            mapped_sku = normalize_sku(getattr(product_obj, "sku", ""))
+            scraped_skus = extract_scraped_sku_candidates(payload)
+            if mapped_sku and scraped_skus:
+                mapped_compact = self._compact_sku_for_partial_match(mapped_sku)
+                matches_any = False
+                for scraped_sku in scraped_skus:
+                    scraped_compact = self._compact_sku_for_partial_match(scraped_sku)
+                    if not scraped_compact:
+                        continue
+                    if (
+                        mapped_compact == scraped_compact
+                        or mapped_compact.endswith(scraped_compact)
+                        or scraped_compact.endswith(mapped_compact)
+                    ):
+                        matches_any = True
+                        break
+                if not matches_any:
+                    mismatches.append(f"SKU (mapped {mapped_sku} vs scraped {scraped_skus[0]})")
+
+            if has_spreadsheet_value(product_obj, "barcode"):
+                mapped_barcode = normalize_barcode_text(getattr(product_obj, "barcode", ""))
+                scraped_barcode = normalize_barcode_text((payload or {}).get("barcode", ""))
+                if mapped_barcode and scraped_barcode and mapped_barcode != scraped_barcode:
+                    mismatches.append(f"Barcode (mapped {mapped_barcode} vs scraped {scraped_barcode})")
+
+            if has_spreadsheet_value(product_obj, "price"):
+                mapped_price = normalize_money_text(getattr(product_obj, "price", ""))
+                scraped_price = normalize_money_text((payload or {}).get("price", ""))
+                if mapped_price and scraped_price and mapped_price != scraped_price:
+                    mismatches.append(f"Price (mapped {mapped_price} vs scraped {scraped_price})")
+
+            if has_spreadsheet_value(product_obj, "cost") or has_spreadsheet_value(product_obj, "dealer_cost"):
+                mapped_cost = normalize_money_text(getattr(product_obj, "cost", "")) or normalize_money_text(
+                    getattr(product_obj, "dealer_cost", "")
+                )
+                scraped_cost = normalize_money_text((payload or {}).get("cost", "")) or normalize_money_text(
+                    (payload or {}).get("dealer_cost", "")
+                )
+                if mapped_cost and scraped_cost and mapped_cost != scraped_cost:
+                    mismatches.append(f"Cost (mapped {mapped_cost} vs scraped {scraped_cost})")
+
+            if has_spreadsheet_value(product_obj, "weight"):
+                mapped_weight = normalize_weight_text(getattr(product_obj, "weight", ""))
+                scraped_weight = normalize_weight_text((payload or {}).get("weight", ""))
+                if mapped_weight and scraped_weight and mapped_weight != scraped_weight:
+                    mismatches.append(f"Weight (mapped {mapped_weight} vs scraped {scraped_weight})")
+
+            return mismatches
+
         product_by_sku = {normalize_sku(product.sku): product for product in products if normalize_sku(product.sku)}
         scoped_skus = [normalize_sku(sku) for sku in target_skus if normalize_sku(sku)]
         found_fields_order = [
@@ -3102,6 +3739,7 @@ class ProductProspectorDesktopApp:
                 product.scrape_status = "not run"
                 product.scrape_fields_found = ""
                 product.scrape_error = ""
+                product.scrape_mismatch_error = ""
                 continue
 
             payload = lookup_payload(sku)
@@ -3118,10 +3756,13 @@ class ProductProspectorDesktopApp:
                 if provider_value.endswith("_fuzzy"):
                     fuzzy_warning = "Fuzzy SKU match from search provider. Verify product selection."
                 product.scrape_error = image_error or parse_error or fuzzy_warning
+                mismatches = collect_numeric_mismatches(product, payload)
+                product.scrape_mismatch_error = "; ".join(mismatches)
             else:
                 product.scrape_status = "fail X"
                 product.scrape_fields_found = ""
                 product.scrape_error = lookup_error(sku) or "No scrape data found"
+                product.scrape_mismatch_error = ""
 
             media_folder = str(payload.get("media_folder", "")).strip()
             if media_folder:
@@ -3142,6 +3783,7 @@ class ProductProspectorDesktopApp:
             self._clear_review_variant_fields()
             self._set_variant_form_visible(False)
             self._set_review_collections_from_text("")
+            self._set_review_tags_from_values([])
             self.review_cost_rule_text.set("")
             self.review_cost_options = []
             self.review_cost_option_map = {}
@@ -3181,6 +3823,7 @@ class ProductProspectorDesktopApp:
             self.review_loaded_truncated[field_name] = truncated
             var.set(display)
         self._set_review_collections_from_text(self.review_loaded_raw.get("collections", ""))
+        self._set_review_tags_from_values(list(getattr(product, "tags", []) or []))
         self.review_cost_option_map = {}
         self.review_cost_options = []
         self.review_cost_options_loaded_for_sku = ""
@@ -3248,6 +3891,11 @@ class ProductProspectorDesktopApp:
         product.brand = self._read_review_field("brand")
         product.application = self._read_review_field("application")
         product.collections = self._read_review_field("collections")
+        product.tags = [
+            item
+            for item in list(self.review_tag_selected)
+            if is_valid_product_tag(item) and self._tag_key(item) not in self._hidden_owner_tag_keys()
+        ]
         product.core_charge_product_code = self._read_review_field("core_charge_product_code")
         if str(getattr(product, "record_type", "") or "").strip().lower() == "variant":
             product.sku = self.review_variant_fields["variant_sku"].get().strip().upper()
@@ -4285,7 +4933,6 @@ class ProductProspectorDesktopApp:
                 "SKUs not found are skipped."
             )
             self.setup_continue_btn.configure(text="Save & Continue to Scraping")
-            self.setup_skip_review_btn.configure(state="normal")
             self.load_product_ids_btn.configure(state="normal")
             self.clear_product_ids_btn.configure(state="normal")
             self.product_id_text_widget.configure(state="normal")
@@ -4307,7 +4954,6 @@ class ProductProspectorDesktopApp:
                 "If Shopify export is loaded, already-existing SKUs can be excluded."
             )
             self.setup_continue_btn.configure(text="Save & Continue to Scraping")
-            self.setup_skip_review_btn.configure(state="disabled")
             self.load_product_ids_btn.configure(state="disabled")
             self.clear_product_ids_btn.configure(state="disabled")
             self.product_id_text_widget.configure(state="disabled")
@@ -4319,6 +4965,7 @@ class ProductProspectorDesktopApp:
         self._set_setup_mode_widgets_enabled(True)
         self.setup_status_text.set("")
         self._refresh_mode_lock_ui()
+        self._refresh_skip_review_button_state()
         self._refresh_sku_action_labels()
         self._refresh_new_mode_check_controls()
         self._refresh_input_metrics()
@@ -4339,9 +4986,7 @@ class ProductProspectorDesktopApp:
             self.load_product_ids_btn.configure(state=product_id_state)
         if hasattr(self, "clear_product_ids_btn"):
             self.clear_product_ids_btn.configure(state=product_id_state)
-        if hasattr(self, "setup_skip_review_btn"):
-            skip_state = state if enabled and self.session.mode == MODE_UPDATE else "disabled"
-            self.setup_skip_review_btn.configure(state=skip_state)
+        self._refresh_skip_review_button_state()
         if not enabled:
             self._set_duplicate_check_busy(False)
             self.setup_continue_btn.configure(state="disabled")
@@ -4380,6 +5025,21 @@ class ProductProspectorDesktopApp:
         check_state = "normal" if self.shopify_cache_ready else "disabled"
         self.load_pasted_btn.configure(state=check_state)
 
+    def _refresh_skip_review_button_state(self) -> None:
+        if not hasattr(self, "setup_skip_review_btn"):
+            return
+        if not bool(getattr(self, "setup_widgets_enabled", False)):
+            self.setup_skip_review_btn.configure(state="disabled")
+            return
+        if self.session.mode == MODE_UPDATE:
+            self.setup_skip_review_btn.configure(state="normal")
+            return
+        if self.session.mode == MODE_NEW:
+            has_sheet = bool(self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty)
+            self.setup_skip_review_btn.configure(state="normal" if has_sheet else "disabled")
+            return
+        self.setup_skip_review_btn.configure(state="disabled")
+
     def _refresh_sku_action_labels(self) -> None:
         if self.session.mode == MODE_NEW:
             self.load_pasted_btn.configure(text="Load and Check SKUs")
@@ -4387,7 +5047,7 @@ class ProductProspectorDesktopApp:
             self.load_product_ids_btn.configure(text="Load Product IDs")
             return
         self.load_pasted_btn.configure(text="Load Pasted SKUs")
-        self.load_sheet_btn.configure(text="Load Vendor Price Sheet (CSV/XLSX)")
+        self.load_sheet_btn.configure(text="Load Vendor Price Sheet (CSV/XLS/XLSX/XLSB)")
         self.load_product_ids_btn.configure(text="Load Product IDs")
 
     def _set_duplicate_check_busy(self, busy: bool) -> None:
@@ -4418,6 +5078,7 @@ class ProductProspectorDesktopApp:
         self._run_on_ui_thread(apply)
 
     def _on_vendor_sku_mapping_changed(self) -> None:
+        self._refresh_vendor_preview_for_scope()
         self._refresh_input_metrics()
         if self.session.mode != MODE_NEW:
             return
@@ -4450,6 +5111,58 @@ class ProductProspectorDesktopApp:
 
     def _pasted_scope_skus(self) -> list[str]:
         return self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+
+    def _build_vendor_preview_for_scope(
+        self, rows: int = 30
+    ) -> tuple[pd.DataFrame, int, int, bool, str]:
+        if self.vendor_df_raw is None or self.vendor_df_raw.empty:
+            return pd.DataFrame(), 0, 0, False, ""
+
+        requested_skus = self._pasted_scope_skus()
+        requested_count = len(requested_skus)
+        if not requested_skus or not self.vendor_source_is_sheet:
+            return _safe_head(self.vendor_df_raw, rows=rows), 0, requested_count, False, ""
+
+        sku_column = self.vendor_sku_column.get().strip()
+        if not sku_column or sku_column not in self.vendor_df_raw.columns:
+            return _safe_head(self.vendor_df_raw, rows=rows), 0, requested_count, False, sku_column
+
+        target_set = set(requested_skus)
+        order_map = {sku: idx for idx, sku in enumerate(requested_skus)}
+        scoped = self.vendor_df_raw.copy()
+        scoped["_norm_sku"] = scoped[sku_column].astype(str).map(normalize_sku)
+        scoped = scoped[scoped["_norm_sku"].isin(target_set)].copy()
+        matched_rows = int(len(scoped))
+        if matched_rows <= 0:
+            return _safe_head(self.vendor_df_raw, rows=rows), 0, requested_count, True, sku_column
+
+        scoped["_scope_rank"] = scoped["_norm_sku"].map(order_map).fillna(len(order_map))
+        scoped["_source_order"] = range(len(scoped.index))
+        scoped.sort_values(by=["_scope_rank", "_source_order"], kind="stable", inplace=True)
+        scoped.drop(columns=["_norm_sku", "_scope_rank", "_source_order"], inplace=True, errors="ignore")
+        return _safe_head(scoped, rows=rows), matched_rows, requested_count, True, sku_column
+
+    def _refresh_vendor_preview_for_scope(self) -> None:
+        if not hasattr(self, "vendor_preview"):
+            return
+        preview_df, matched_rows, requested_count, used_scope, sku_column = self._build_vendor_preview_for_scope(rows=30)
+        _tree_show_dataframe(self.vendor_preview, preview_df)
+
+        if self.vendor_df_raw is None or self.vendor_df_raw.empty:
+            self.vendor_input_loaded_text.set("")
+            return
+
+        base_text = f"Vendor Input Loaded: {len(self.vendor_df_raw):,} rows, {len(self.vendor_df_raw.columns):,} columns"
+        if used_scope:
+            if matched_rows > 0:
+                base_text += (
+                    f" | Previewing scoped matches: {min(30, matched_rows):,} of {matched_rows:,} row(s) "
+                    f"for {requested_count:,} pasted SKU(s)"
+                )
+            else:
+                mapped = sku_column or "(unmapped)"
+                base_text += f" | No scoped SKU matches on mapped column '{mapped}'. Showing sheet head."
+        self.vendor_input_loaded_text.set(base_text)
 
     def _create_scope_skus_for_duplicate_check(self) -> list[str]:
         if self.session.mode != MODE_NEW:
@@ -5002,10 +5715,33 @@ class ProductProspectorDesktopApp:
     def _skip_to_review_from_setup(self) -> None:
         if self.processing_inflight or self.shopify_push_inflight:
             return
-        if self.session.mode != MODE_UPDATE:
-            messagebox.showwarning(APP_TITLE, "Skip to Review is available only in Update Existing Products mode.")
+        if self.session.mode not in {MODE_UPDATE, MODE_NEW}:
+            messagebox.showwarning(APP_TITLE, "Select a run mode before skipping to review.")
             return
         if not self._capture_setup_to_session(show_messages=True, skip_to_review=True):
+            return
+
+        if self.session.mode == MODE_NEW:
+            has_sheet = bool(self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty)
+            if not has_sheet:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Create mode skip-to-review requires a loaded spreadsheet.",
+                )
+                return
+            target_skus = collect_session_skus(self.session)
+            if not target_skus:
+                messagebox.showwarning(APP_TITLE, "No valid SKUs found in the loaded spreadsheet scope.")
+                return
+            self.setup_status_text.set("Skipping scraper. Building review from spreadsheet mappings only...")
+            self.processing_status_text.set("Building review data without scraping...")
+            started = self._start_processing_clicked(
+                auto_open_review=True,
+                allow_missing_without_scrape=True,
+                skip_scrape=True,
+            )
+            if not started:
+                self.setup_status_text.set("Could not skip to review. Check setup inputs and retry.")
             return
 
         target_skus = collect_session_skus(self.session)
@@ -5513,6 +6249,7 @@ class ProductProspectorDesktopApp:
             self.vendor_mapping_wrap.pack(fill=X, pady=(0, 8), before=self.setup_footer_wrap)
             self.vendor_input_loaded_wrap.pack(fill=X, pady=(0, 4), before=self.setup_footer_wrap)
             self.vendor_preview_wrap.pack(fill=X, pady=(0, 8), before=self.setup_footer_wrap)
+        self._refresh_skip_review_button_state()
 
     def _parse_sku_text(self, raw_text: str) -> list[str]:
         tokens = re.split(r"[\s,;|]+", raw_text or "")
@@ -5540,6 +6277,7 @@ class ProductProspectorDesktopApp:
     def _clear_pasted_skus(self) -> None:
         self.sku_text_widget.delete("1.0", END)
         self.sku_text_status.set("")
+        self._refresh_vendor_preview_for_scope()
         if self.session.mode == MODE_NEW:
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
@@ -5565,15 +6303,13 @@ class ProductProspectorDesktopApp:
         self.plan_df = None
         self.vendor_source_is_sheet = source_is_sheet
         self.vendor_path.set(path_text)
-        _tree_show_dataframe(self.vendor_preview, _safe_head(normalized_df))
         self._bind_vendor_columns(list(normalized_df.columns))
         self._auto_suggest_vendor()
-        self.vendor_input_loaded_text.set(
-            f"Vendor Input Loaded: {len(normalized_df):,} rows, {len(normalized_df.columns):,} columns"
-        )
+        self._refresh_vendor_preview_for_scope()
         self.source_status_text.set("")
         self._refresh_input_metrics()
         self._refresh_vendor_sheet_ui()
+        self._refresh_skip_review_button_state()
         if self.session.mode == MODE_NEW and not self._pasted_scope_skus():
             scope_skus = self._sheet_scope_skus()
             if scope_skus:
@@ -5582,7 +6318,7 @@ class ProductProspectorDesktopApp:
     def _load_vendor_file(self) -> None:
         path = filedialog.askopenfilename(
             title="Select Vendor File",
-            filetypes=[("Spreadsheet", "*.csv *.xlsx *.xls"), ("All Files", "*.*")],
+            filetypes=[("Spreadsheet", "*.csv *.xlsx *.xls *.xlsb"), ("All Files", "*.*")],
         )
         if not path:
             return
@@ -5609,6 +6345,7 @@ class ProductProspectorDesktopApp:
 
         self.sku_text_status.set(f"Found {len(skus)} unique SKUs in text scope")
         self.source_status_text.set(f"SKU text scope ready: {len(skus)} SKUs.")
+        self._refresh_vendor_preview_for_scope()
         self._refresh_input_metrics()
         if self.session.mode == MODE_NEW:
             self._queue_create_duplicate_check(skus)

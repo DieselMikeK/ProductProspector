@@ -1,6 +1,7 @@
 # === Shopify credentials - NEVER commit these ===
 app/config/shopify.json
 app/config/shopify_token.json
+app2/
 
 # === Python cache ===
 __pycache__/

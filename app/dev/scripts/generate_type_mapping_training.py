@@ -352,7 +352,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate robust type-mapping training candidates from local catalog export.")
     parser.add_argument(
         "--input",
-        default="app/config/product_taxonomy_master.csv",
+        default="app/required/mappings/product_taxonomy_master.csv",
         help="Path to product taxonomy master CSV.",
     )
     parser.add_argument(

@@ -512,6 +512,116 @@ def _set_if_present(product: Product, field_name: str, raw_value: object, source
     product.set_field(field_name, text, source)
 
 
+def _split_application_parts(raw: str) -> list[str]:
+    text = _clean_text(raw)
+    if not text:
+        return []
+    return [item.strip() for item in re.split(r"[|\n\r]+", text) if item and item.strip()]
+
+
+def _merge_application_values(primary: str, secondary: str) -> str:
+    primary_text = _clean_text(primary)
+    secondary_text = _clean_text(secondary)
+    if not primary_text:
+        return secondary_text
+    if not secondary_text:
+        return primary_text
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in [primary_text, secondary_text]:
+        for part in _split_application_parts(value):
+            key = re.sub(r"[^a-z0-9]+", " ", part.lower()).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(part)
+    return " | ".join(merged)
+
+
+def _split_description_chunks(raw: str) -> list[str]:
+    text = _clean_text(raw)
+    if not text:
+        return []
+    chunks = re.split(r"(?is)</p>|<br\s*/?>|[\r\n]+", text)
+    output: list[str] = []
+    for chunk in chunks:
+        value = _clean_text(chunk)
+        if value:
+            output.append(value)
+    return output
+
+
+def _merge_description_values(primary: str, secondary: str) -> str:
+    primary_text = _clean_text(primary)
+    secondary_text = _clean_text(secondary)
+    if not primary_text:
+        return secondary_text
+    if not secondary_text:
+        return primary_text
+
+    primary_key = re.sub(r"\s+", " ", primary_text).strip().lower()
+    secondary_key = re.sub(r"\s+", " ", secondary_text).strip().lower()
+    if primary_key == secondary_key:
+        return primary_text
+    if primary_key and primary_key in secondary_key:
+        return secondary_text
+    if secondary_key and secondary_key in primary_key:
+        return primary_text
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for chunk in _split_description_chunks(primary_text) + _split_description_chunks(secondary_text):
+        key = re.sub(r"<[^>]+>", " ", chunk)
+        key = re.sub(r"[^a-z0-9]+", " ", key.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(chunk)
+    return "\n".join(merged) if merged else primary_text
+
+
+def _title_quality_score(value: str) -> float:
+    text = _clean_text(value)
+    if not text:
+        return -999.0
+    low = text.lower()
+    score = min(2.0, len(text) / 60.0)
+    if re.search(r"\b\d{2,4}(?:\.5)?\s*[-/]\s*\d{2,4}(?:\.5)?\b", text):
+        score += 2.0
+    if re.search(r"(?i)\b(ford|ram|dodge|chevy|chevrolet|gmc|gm|jeep|nissan|cummins|duramax|powerstroke)\b", text):
+        score += 1.5
+    if "search results" in low:
+        score -= 5.0
+    if re.search(r"(?i)\|#?[a-z0-9._/-]+\|", text):
+        score -= 0.5
+    return score
+
+
+def _merge_title_values(primary: str, secondary: str) -> str:
+    primary_text = _clean_text(primary)
+    secondary_text = _clean_text(secondary)
+    if not primary_text:
+        return secondary_text
+    if not secondary_text:
+        return primary_text
+
+    primary_key = re.sub(r"\s+", " ", primary_text).strip().lower()
+    secondary_key = re.sub(r"\s+", " ", secondary_text).strip().lower()
+    if primary_key == secondary_key:
+        return primary_text
+    if primary_key and primary_key in secondary_key:
+        return secondary_text
+    if secondary_key and secondary_key in primary_key:
+        return primary_text
+
+    primary_score = _title_quality_score(primary_text)
+    secondary_score = _title_quality_score(secondary_text)
+    if secondary_score > primary_score + 0.15:
+        return secondary_text
+    return primary_text
+
+
 def build_products_from_session(
     session: AppSession,
     existing_shopify_index: dict[str, dict[str, str]] | None = None,
@@ -635,6 +745,40 @@ def build_products_from_session(
                     "core_charge_product_code",
                     "product_url",
                 ]:
+                    if field_name == "title":
+                        merged_title = _merge_title_values(
+                            _clean_text(getattr(product, "title", "")),
+                            _clean_text(scraped_values.get("title", "")),
+                        )
+                        if merged_title:
+                            source = "scraper" if not _clean_text(getattr(product, "title", "")) else "spreadsheet+scraper"
+                            product.set_field("title", merged_title, source)
+                        continue
+
+                    if field_name == "description_html":
+                        merged_description = _merge_description_values(
+                            _clean_text(getattr(product, "description_html", "")),
+                            _clean_text(scraped_values.get("description_html", "")),
+                        )
+                        if merged_description:
+                            source = (
+                                "scraper"
+                                if not _clean_text(getattr(product, "description_html", ""))
+                                else "spreadsheet+scraper"
+                            )
+                            product.set_field("description_html", merged_description, source)
+                        continue
+
+                    if field_name == "application":
+                        merged_application = _merge_application_values(
+                            _clean_text(getattr(product, "application", "")),
+                            _clean_text(scraped_values.get("application", "")),
+                        )
+                        if merged_application:
+                            source = "scraper" if not _clean_text(getattr(product, "application", "")) else "spreadsheet+scraper"
+                            product.set_field("application", merged_application, source)
+                        continue
+
                     existing_value = _clean_text(getattr(product, field_name, ""))
                     if existing_value:
                         continue

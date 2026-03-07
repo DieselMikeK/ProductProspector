@@ -7,6 +7,13 @@ import pandas as pd
 
 from product_prospector.core.mapping import FIELD_ALIASES, normalize_header
 
+try:
+    import pyxlsb  # noqa: F401
+
+    _HAS_PYXLSB = True
+except Exception:
+    _HAS_PYXLSB = False
+
 
 _MAX_HEADER_SCAN_ROWS = 35
 _EXTRA_HEADER_ALIASES = [
@@ -258,16 +265,51 @@ def _pick_best_excel_sheet(all_sheets: dict[object, pd.DataFrame]) -> pd.DataFra
     return fallback if fallback is not None else pd.DataFrame()
 
 
+def _read_excel_sheets_from_bytes(raw: bytes, suffix: str) -> dict[object, pd.DataFrame]:
+    kwargs = {
+        "sheet_name": None,
+        "header": None,
+        "dtype": str,
+        "keep_default_na": False,
+    }
+    if suffix == ".xlsb":
+        if not _HAS_PYXLSB:
+            raise ValueError("Reading .xlsb requires 'pyxlsb'. Install with: pip install pyxlsb")
+        try:
+            return pd.read_excel(io.BytesIO(raw), engine="pyxlsb", **kwargs)
+        except ImportError as exc:
+            raise ValueError("Reading .xlsb requires 'pyxlsb'. Install with: pip install pyxlsb") from exc
+    return pd.read_excel(io.BytesIO(raw), **kwargs)
+
+
+def _read_excel_sheets_from_path(file_path: Path, suffix: str) -> dict[object, pd.DataFrame]:
+    kwargs = {
+        "sheet_name": None,
+        "header": None,
+        "dtype": str,
+        "keep_default_na": False,
+    }
+    if suffix == ".xlsb":
+        if not _HAS_PYXLSB:
+            raise ValueError("Reading .xlsb requires 'pyxlsb'. Install with: pip install pyxlsb")
+        try:
+            return pd.read_excel(file_path, engine="pyxlsb", **kwargs)
+        except ImportError as exc:
+            raise ValueError("Reading .xlsb requires 'pyxlsb'. Install with: pip install pyxlsb") from exc
+    return pd.read_excel(file_path, **kwargs)
+
+
 def read_table_from_upload(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     raw = uploaded_file.getvalue()
 
     if name.endswith(".csv"):
         return _normalize_raw_table(_read_csv_raw_from_bytes(raw))
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        all_sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=None, dtype=str, keep_default_na=False)
+    if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsb"):
+        suffix = ".xlsb" if name.endswith(".xlsb") else (".xlsx" if name.endswith(".xlsx") else ".xls")
+        all_sheets = _read_excel_sheets_from_bytes(raw, suffix=suffix)
         return _pick_best_excel_sheet(all_sheets)
-    raise ValueError("Unsupported file type. Upload CSV or XLSX.")
+    raise ValueError("Unsupported file type. Upload .csv, .xlsx, .xls, or .xlsb.")
 
 
 def read_table_from_path(path: str) -> pd.DataFrame:
@@ -276,12 +318,12 @@ def read_table_from_path(path: str) -> pd.DataFrame:
 
     if suffix == ".csv":
         return _normalize_raw_table(_read_csv_raw_from_path(file_path))
-    if suffix in {".xlsx", ".xls"}:
-        all_sheets = pd.read_excel(file_path, sheet_name=None, header=None, dtype=str, keep_default_na=False)
+    if suffix in {".xlsx", ".xls", ".xlsb"}:
+        all_sheets = _read_excel_sheets_from_path(file_path, suffix=suffix)
         if not all_sheets:
             return pd.DataFrame()
         return _pick_best_excel_sheet(all_sheets)
-    raise ValueError("Unsupported file type. Use .csv or .xlsx.")
+    raise ValueError("Unsupported file type. Use .csv, .xlsx, .xls, or .xlsb.")
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
