@@ -216,3 +216,17 @@ def resolve_vendor_profile(vendor_like: str, required_root: Path | None) -> Vend
     if acronym and acronym in by_acronym:
         return by_acronym[acronym]
     return None
+
+
+def load_vendor_profiles(required_root: Path | None) -> list[VendorProfile]:
+    by_key, _ = _load_profile_lookup(required_root)
+    if not by_key:
+        return []
+
+    unique: dict[str, VendorProfile] = {}
+    for profile in by_key.values():
+        canonical = _clean_text(profile.canonical_vendor)
+        if not canonical:
+            continue
+        unique.setdefault(canonical.lower(), profile)
+    return sorted(unique.values(), key=lambda item: _normalize_key(item.canonical_vendor))

@@ -9,6 +9,15 @@ import pandas as pd
 from product_prospector.core.config_store import ShopifyConfig
 
 
+def _clean_optional_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"none", "nan", "null"}:
+        return ""
+    return text
+
+
 _CATALOG_QUERY = """
 query Catalog($cursor: String, $search: String, $sortKey: ProductSortKeys, $reverse: Boolean) {
   products(first: 100, after: $cursor, query: $search, sortKey: $sortKey, reverse: $reverse) {
@@ -69,7 +78,7 @@ query VariantsBySku($cursor: String, $search: String!) {
 
 
 def _extract_numeric_id(value: object) -> str:
-    text = str(value or "").strip()
+    text = _clean_optional_text(value)
     if not text:
         return ""
     if text.isdigit():
@@ -162,17 +171,17 @@ def fetch_shopify_catalog_dataframe(
         page_rows: list[dict[str, str]] = []
         for edge in edges:
             node = (edge or {}).get("node") or {}
-            title = str(node.get("title", "")).strip()
-            description = str(node.get("description", "")).strip()
-            product_type = str(node.get("productType", "")).strip()
-            vendor = str(node.get("vendor", "")).strip()
+            title = _clean_optional_text(node.get("title", ""))
+            description = _clean_optional_text(node.get("description", ""))
+            product_type = _clean_optional_text(node.get("productType", ""))
+            vendor = _clean_optional_text(node.get("vendor", ""))
             metafield = node.get("metafield") or {}
-            fitment = str((metafield or {}).get("value", "")).strip()
+            fitment = _clean_optional_text((metafield or {}).get("value", ""))
 
             variant_edges = ((node.get("variants") or {}).get("edges")) or []
             for variant_edge in variant_edges:
                 variant = (variant_edge or {}).get("node") or {}
-                sku = str(variant.get("sku", "")).strip()
+                sku = _clean_optional_text(variant.get("sku", ""))
                 if not sku:
                     continue
                 row = {
@@ -183,7 +192,7 @@ def fetch_shopify_catalog_dataframe(
                     "fitment": fitment,
                     "product_type": product_type,
                     "vendor": vendor,
-                    "barcode": str(variant.get("barcode", "")).strip(),
+                    "barcode": _clean_optional_text(variant.get("barcode", "")),
                 }
                 page_rows.append(row)
 
@@ -275,16 +284,16 @@ def fetch_shopify_catalog_for_skus(
             edges = variants.get("edges") or []
             for edge in edges:
                 node = (edge or {}).get("node") or {}
-                sku = str(node.get("sku", "")).strip()
+                sku = _clean_optional_text(node.get("sku", ""))
                 if not sku:
                     continue
                 product = node.get("product") or {}
-                title = str(product.get("title", "")).strip()
-                description = str(product.get("description", "")).strip()
-                product_type = str(product.get("productType", "")).strip()
-                vendor = str(product.get("vendor", "")).strip()
+                title = _clean_optional_text(product.get("title", ""))
+                description = _clean_optional_text(product.get("description", ""))
+                product_type = _clean_optional_text(product.get("productType", ""))
+                vendor = _clean_optional_text(product.get("vendor", ""))
                 metafield = product.get("metafield") or {}
-                fitment = str((metafield or {}).get("value", "")).strip()
+                fitment = _clean_optional_text((metafield or {}).get("value", ""))
                 rows.append(
                     {
                         "sku": sku,
@@ -294,7 +303,7 @@ def fetch_shopify_catalog_for_skus(
                         "fitment": fitment,
                         "product_type": product_type,
                         "vendor": vendor,
-                        "barcode": str(node.get("barcode", "")).strip(),
+                        "barcode": _clean_optional_text(node.get("barcode", "")),
                     }
                 )
 

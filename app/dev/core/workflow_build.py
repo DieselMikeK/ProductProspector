@@ -26,7 +26,10 @@ from product_prospector.core.vendor_normalization import normalize_vendor_name a
 def _clean_text(value: object) -> str:
     if value is None:
         return ""
-    return str(value).strip()
+    text = str(value).strip()
+    if text.lower() in {"none", "nan", "null"}:
+        return ""
+    return text
 
 
 def _split_multi_value(raw: str) -> list[str]:
@@ -35,6 +38,27 @@ def _split_multi_value(raw: str) -> list[str]:
         return []
     parts = re.split(r"[|,;\n]+", text)
     return [item.strip() for item in parts if item and item.strip()]
+
+
+def _effective_update_fields(session: AppSession) -> set[str]:
+    selected = {str(value or "").strip() for value in (session.update_fields or []) if str(value or "").strip()}
+    if selected:
+        return selected
+    return {
+        "title",
+        "price",
+        "cost",
+        "description_html",
+        "media_urls",
+        "vendor",
+        "weight",
+        "barcode",
+        "application",
+        "type",
+        "google_product_type",
+        "category_code",
+        "product_subtype",
+    }
 
 
 def _row_value(row: pd.Series, column_name: str) -> str:
@@ -282,6 +306,7 @@ class BuildStats:
     rows_built: int = 0
     rows_skipped_missing_sku: int = 0
     rows_skipped_no_shopify_match: int = 0
+    rows_built_without_shopify_match: int = 0
     rows_flagged_gas: int = 0
 
 
@@ -366,7 +391,7 @@ def _can_infer_cost_for_sku_rows(
 def detect_missing_required_fields(session: AppSession, required_root: Path | None = None) -> list[str]:
     required: list[str] = []
     if session.mode == MODE_UPDATE:
-        selected = set(session.update_fields or [])
+        selected = _effective_update_fields(session)
         if "title" in selected:
             required.append("title")
         if "price" in selected:
@@ -647,12 +672,17 @@ def build_products_from_session(
             continue
 
         existing = existing_index.get(sku, {})
-        if session.mode == MODE_UPDATE and not existing:
+        update_without_shopify_match = session.mode == MODE_UPDATE and not existing
+
+        if update_without_shopify_match:
             stats.rows_skipped_no_shopify_match += 1
             continue
 
         product = Product()
         product.set_field("sku", sku, "input")
+        search_term = _clean_text((session.search_terms_by_sku or {}).get(sku, ""))
+        if search_term:
+            _set_if_present(product, "mpn", search_term, "input")
 
         if existing:
             _set_if_present(product, "title", existing.get("title", ""), "shopify")
@@ -704,7 +734,7 @@ def build_products_from_session(
             for field_name, value in spreadsheet_values.items():
                 _set_if_present(product, field_name, value, "spreadsheet")
         elif session.mode == MODE_UPDATE:
-            selected = set(session.update_fields or [])
+            selected = _effective_update_fields(session)
             if "price" in selected:
                 selected.update({"map_price", "msrp_price", "jobber_price"})
             if "cost" in selected:
@@ -715,7 +745,7 @@ def build_products_from_session(
                 if field_name not in selected:
                     continue
                 _set_if_present(product, field_name, value, "spreadsheet")
-            product.field_sources["update_scope"] = ",".join(sorted(selected))
+            product.field_sources["update_scope"] = ",".join(sorted(selected)) if session.update_fields else "all"
 
         scraped_values = dict(scraped_index.get(sku, {}) or {})
         scraped_product_url = (
@@ -784,11 +814,13 @@ def build_products_from_session(
                         continue
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
             elif session.mode == MODE_UPDATE:
-                selected = set(session.update_fields or [])
+                selected = _effective_update_fields(session)
                 if "price" in selected:
                     selected.update({"map_price", "msrp_price", "jobber_price"})
                 if "cost" in selected:
                     selected.add("dealer_cost")
+                if scraped_product_url:
+                    _set_if_present(product, "product_url", scraped_product_url, "scraper")
                 for field_name in selected:
                     existing_value = _clean_text(getattr(product, field_name, ""))
                     if existing_value:

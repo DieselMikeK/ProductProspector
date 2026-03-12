@@ -1,0 +1,194 @@
+[
+  {
+    "summary": {
+      "vendor": "AccuAir Suspension",
+      "display_name": "AccuAir Suspension",
+      "official_website_url": "https://accuair.com/",
+      "search_url_template": "https://accuair.com/search?q={sku}&options%5Bprefix%5D=last",
+      "tested_skus": "AA-3837 | AA-3836 | AA-3838 | AA-3708",
+      "tested_sku_count": "4",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "AA-3837 | AA-3836 | AA-3838 | AA-3708",
+      "first_product_url": "",
+      "dominant_error": "Bot challenge page",
+      "warning_count": "4",
+      "first_warning": "Bot challenge page",
+      "runtime_seconds": "2.64"
+    },
+    "general_errors": [
+      "Bot challenge page",
+      "Bot challenge page",
+      "Bot challenge page",
+      "Bot challenge page"
+    ],
+    "sku_results": [
+      {
+        "sku": "AA-3837",
+        "normalized_sku": "AA-3837",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://accuair.com/search?q=AA-3837&options%5Bprefix%5D=last",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AA-3836",
+        "normalized_sku": "AA-3836",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://accuair.com/search?q=AA-3836&options%5Bprefix%5D=last",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AA-3838",
+        "normalized_sku": "AA-3838",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://accuair.com/search?q=AA-3838&options%5Bprefix%5D=last",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AA-3708",
+        "normalized_sku": "AA-3708",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://accuair.com/search?q=AA-3708&options%5Bprefix%5D=last",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      }
+    ]
+  },
+  {
+    "summary": {
+      "vendor": "AEV | American Expedition Vehicles",
+      "display_name": "AEV | American Expedition Vehicles",
+      "official_website_url": "https://aev-conversions.com/",
+      "search_url_template": "https://aev-conversions.com/search?q={sku}",
+      "tested_skus": "AEV-N0340000AB | AEV-N0340001AB | AEV-10404020AA | AEV-40408001AB",
+      "tested_sku_count": "4",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "AEV-N0340000AB | AEV-N0340001AB | AEV-10404020AA | AEV-40408001AB",
+      "first_product_url": "",
+      "dominant_error": "Bot challenge page",
+      "warning_count": "4",
+      "first_warning": "Bot challenge page",
+      "runtime_seconds": "2.05"
+    },
+    "general_errors": [
+      "Bot challenge page",
+      "Bot challenge page",
+      "Bot challenge page",
+      "Bot challenge page"
+    ],
+    "sku_results": [
+      {
+        "sku": "AEV-N0340000AB",
+        "normalized_sku": "AEV-N0340000AB",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://aev-conversions.com/search?q=AEV-N0340000AB",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AEV-N0340001AB",
+        "normalized_sku": "AEV-N0340001AB",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://aev-conversions.com/search?q=AEV-N0340001AB",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AEV-10404020AA",
+        "normalized_sku": "AEV-10404020AA",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://aev-conversions.com/search?q=AEV-10404020AA",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AEV-40408001AB",
+        "normalized_sku": "AEV-40408001AB",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://aev-conversions.com/search?q=AEV-40408001AB",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      }
+    ]
+  },
+  {
+    "summary": {
+      "vendor": "AFE",
+      "display_name": "AFE",
+      "official_website_url": "https://afepower.com/",
+      "search_url_template": "https://afepower.com/catalogsearch/result/?q={sku}",
+      "tested_skus": "46-71370B | AFE-46-20039 | AFE-20-91059 | AFE-30-10102",
+      "tested_sku_count": "4",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "46-71370B | AFE-46-20039 | AFE-20-91059 | AFE-30-10102",
+      "first_product_url": "",
+      "dominant_error": "Bot challenge page",
+      "warning_count": "4",
+      "first_warning": "Bot challenge page",
+      "runtime_seconds": "13.39"
+    },
+    "general_errors": [
+      "Bot challenge page",
+      "Bot challenge page",
+      "Bot challenge page",
+      "Bot challenge page"
+    ],
+    "sku_results": [
+      {
+        "sku": "46-71370B",
+        "normalized_sku": "46-71370B",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://afepower.com/catalogsearch/result/?q=46-71370B",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AFE-46-20039",
+        "normalized_sku": "AFE-46-20039",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://afepower.com/catalogsearch/result/?q=AFE-46-20039",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AFE-20-91059",
+        "normalized_sku": "AFE-20-91059",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://afepower.com/catalogsearch/result/?q=AFE-20-91059",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      },
+      {
+        "sku": "AFE-30-10102",
+        "normalized_sku": "AFE-30-10102",
+        "status": "fail",
+        "result_kind": "blocked",
+        "product_url": "https://afepower.com/catalogsearch/result/?q=AFE-30-10102",
+        "fields_found": "",
+        "error": "Bot challenge page"
+      }
+    ]
+  }
+]

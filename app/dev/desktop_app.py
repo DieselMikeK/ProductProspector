@@ -70,7 +70,7 @@ from product_prospector.core.blog_tagging import (
     suggest_tags_for_product,
 )
 from product_prospector.core.type_mapping_engine import TypeCategoryMapper
-from product_prospector.core.vendor_profiles import resolve_vendor_profile
+from product_prospector.core.vendor_profiles import load_vendor_profiles, resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
 from product_prospector.core.workflow_build import (
     build_products_from_session,
@@ -263,6 +263,21 @@ def _safe_head(df: pd.DataFrame | None, rows: int = 30) -> pd.DataFrame:
     return df.head(rows).fillna("")
 
 
+def _normalize_prefix_token(value: str) -> str:
+    token = str(value or "").strip().upper()
+    return re.sub(r"[^A-Z0-9]+", "", token)
+
+
+def _apply_lookup_vendor_prefix(raw_value: str, sku_prefix: str) -> str:
+    normalized_value = normalize_sku(raw_value)
+    prefix = _normalize_prefix_token(sku_prefix)
+    if not normalized_value or not prefix:
+        return normalized_value
+    if normalized_value == prefix or normalized_value.startswith(f"{prefix}-") or normalized_value.startswith(prefix):
+        return normalized_value
+    return f"{prefix}-{normalized_value}"
+
+
 def _combobox_set_values(widget: ttk.Combobox, values: list[str]) -> None:
     widget["values"] = values
     current = widget.get()
@@ -401,6 +416,7 @@ class ProductProspectorDesktopApp:
         self.sku_scope_help_text = StringVar(value="")
         self.input_metrics_text = StringVar(value="Vendor SKUs: 0 | Shopify Catalog SKUs: 0")
         self.sku_text_status = StringVar(value="")
+        self.mpn_text_status = StringVar(value="")
         self.product_id_text_status = StringVar(value="")
         self.source_status_text = StringVar(value="")
         self.vendor_input_loaded_text = StringVar(value="")
@@ -426,6 +442,7 @@ class ProductProspectorDesktopApp:
         self.run_mode = StringVar(value="")
         self.run_mode_locked = BooleanVar(value=False)
         self.run_mode_summary_text = StringVar(value="")
+        self.update_lookup_vendor = StringVar(value="")
         self.inventory_owner = StringVar(value=DEFAULT_INVENTORY_OWNER)
         self.inventory_owner_inventory_text = StringVar(value=f"Inventory default: {_inventory_for_owner(DEFAULT_INVENTORY_OWNER):,}")
         self.shopify_cache_inline_text = StringVar(value="Shopify SKU cache: not ready")
@@ -468,6 +485,7 @@ class ProductProspectorDesktopApp:
 
         self.scrape_search_url = StringVar(value="")
         self.scrape_workers = StringVar(value="3")
+        self.scrape_worker_options = tuple(str(value) for value in range(1, 11))
         self.scrape_delay = StringVar(value="0.35")
         self.scrape_retries = StringVar(value="2")
         self.scrape_headless = BooleanVar(value=True)
@@ -541,10 +559,19 @@ class ProductProspectorDesktopApp:
         self.review_loaded_raw: dict[str, str] = {}
         self.review_loaded_display: dict[str, str] = {}
         self.review_loaded_truncated: dict[str, bool] = {}
+        self.review_field_widgets: dict[str, tuple[tk.Widget, tk.Widget]] = {}
+        self.review_field_layouts: dict[str, tuple[int, int]] = {}
         self.review_cost_options_loaded_for_sku: str = ""
         self.review_busy_spinner_job: str | None = None
         self.review_busy_spinner_angle = 0
         self.review_busy_active = False
+        self.vendor_profile_choices = [
+            profile.canonical_vendor
+            for profile in load_vendor_profiles(self.required_root)
+            if str(profile.canonical_vendor or "").strip()
+        ]
+        self.update_lookup_skus: tuple[str, ...] = ()
+        self.update_lookup_search_terms_by_sku: dict[str, str] = {}
         self.create_existing_skus: set[str] = set()
         self.create_duplicate_scope: tuple[str, ...] = ()
         self._duplicate_check_request_id = 0
@@ -1172,12 +1199,13 @@ class ProductProspectorDesktopApp:
         self.text_input_wrap.pack(fill=X, pady=(6, 6))
         self.text_input_wrap.columnconfigure(0, weight=1)
         self.text_input_wrap.columnconfigure(1, weight=1)
+        self.text_input_wrap.columnconfigure(2, weight=1)
 
         self.sku_scope_frame = ttk.LabelFrame(self.text_input_wrap, text="SKU (For looking up Products)", padding=8)
         self.sku_scope_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         ttk.Label(
             self.sku_scope_frame,
-            text="Paste SKUs using any delimiter: comma, space, |, or line break.",
+            text="Paste DPP SKUs using any delimiter: comma, space, |, or line break.",
         ).pack(anchor=W)
         self.sku_text_widget = tk.Text(self.sku_scope_frame, height=6, wrap="word")
         self.sku_text_widget.pack(fill=X, pady=(6, 6))
@@ -1189,12 +1217,40 @@ class ProductProspectorDesktopApp:
         self.clear_pasted_btn.pack(side=LEFT, padx=(8, 0))
         ttk.Label(paste_btn_row, textvariable=self.sku_text_status, foreground="#1f4e79").pack(side=LEFT, padx=(12, 0))
 
+        self.mpn_scope_frame = ttk.LabelFrame(
+            self.text_input_wrap,
+            text="MPN / Vendor Part Number (Update Mode)",
+            padding=8,
+        )
+        self.mpn_scope_frame.grid(row=0, column=1, sticky="nsew", padx=6)
+        ttk.Label(
+            self.mpn_scope_frame,
+            text="Choose vendor, then paste MPNs to resolve cache matches while keeping raw MPNs for vendor search.",
+        ).pack(anchor=W)
+        self.update_lookup_vendor_combo = ttk.Combobox(
+            self.mpn_scope_frame,
+            textvariable=self.update_lookup_vendor,
+            values=self.vendor_profile_choices,
+            state="readonly",
+            width=34,
+        )
+        self.update_lookup_vendor_combo.pack(fill=X, pady=(6, 6))
+        self.mpn_text_widget = tk.Text(self.mpn_scope_frame, height=4, wrap="word")
+        self.mpn_text_widget.pack(fill=X, pady=(0, 6))
+        mpn_btn_row = ttk.Frame(self.mpn_scope_frame)
+        mpn_btn_row.pack(fill=X)
+        self.load_mpn_btn = ttk.Button(mpn_btn_row, text="Load and Check MPNs", command=self._load_pasted_mpns)
+        self.load_mpn_btn.pack(side=LEFT)
+        self.clear_mpn_btn = ttk.Button(mpn_btn_row, text="Clear", command=self._clear_pasted_mpns)
+        self.clear_mpn_btn.pack(side=LEFT, padx=(8, 0))
+        ttk.Label(mpn_btn_row, textvariable=self.mpn_text_status, foreground="#1f4e79").pack(side=LEFT, padx=(12, 0))
+
         self.product_id_scope_frame = ttk.LabelFrame(
             self.text_input_wrap,
             text="Product ID (For looking up Variants)",
             padding=8,
         )
-        self.product_id_scope_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.product_id_scope_frame.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
         ttk.Label(
             self.product_id_scope_frame,
             text="Paste numeric Shopify Product IDs (or product URLs that contain IDs).",
@@ -1342,6 +1398,9 @@ class ProductProspectorDesktopApp:
             self.load_sheet_btn,
             self.load_pasted_btn,
             self.clear_pasted_btn,
+            self.update_lookup_vendor_combo,
+            self.load_mpn_btn,
+            self.clear_mpn_btn,
             self.load_product_ids_btn,
             self.clear_product_ids_btn,
             self.vendor_vendor_combo,
@@ -1553,6 +1612,9 @@ class ProductProspectorDesktopApp:
                     "price": str(product.price or ""),
                     "cost": str(product.cost or ""),
                     "vendor": str(product.vendor or ""),
+                    "mpn": str(getattr(product, "mpn", "") or ""),
+                    "barcode": str(product.barcode or ""),
+                    "weight": str(product.weight or ""),
                     "type": str(product.type or ""),
                     "google_product_type": str(product.google_product_type or ""),
                     "category_code": str(product.category_code or ""),
@@ -1563,6 +1625,7 @@ class ProductProspectorDesktopApp:
                 }
             )
         df = pd.DataFrame(rows)
+        df = self._apply_update_scope_to_dataframe(df)
         _tree_show_dataframe(self.review_table, df, max_rows=80, max_cell_chars=3000)
         self.review_table_row_index_map = {}
         if not df.empty:
@@ -1737,6 +1800,8 @@ class ProductProspectorDesktopApp:
         self.review_loaded_display = {}
         self.review_loaded_truncated = {}
         self.review_cost_options_loaded_for_sku = ""
+        self.update_lookup_skus = ()
+        self.update_lookup_search_terms_by_sku = {}
         if hasattr(self, "to_review_btn"):
             self.to_review_btn.configure(state="disabled")
         self._update_tab_access()
@@ -1757,6 +1822,7 @@ class ProductProspectorDesktopApp:
         self.vendor_input_loaded_text.set("")
         self.source_status_text.set("")
         self.sku_text_status.set("")
+        self.mpn_text_status.set("")
         self.product_id_text_status.set("")
         self.duplicate_check_text.set("")
         self.rules_status.configure(text="")
@@ -1766,6 +1832,10 @@ class ProductProspectorDesktopApp:
 
         self.sku_text_widget.configure(state="normal")
         self.sku_text_widget.delete("1.0", END)
+        if hasattr(self, "mpn_text_widget"):
+            self.mpn_text_widget.configure(state="normal")
+            self.mpn_text_widget.delete("1.0", END)
+        self.update_lookup_vendor.set("")
         self.product_id_text_widget.configure(state="normal")
         self.product_id_text_widget.delete("1.0", END)
 
@@ -1872,19 +1942,19 @@ class ProductProspectorDesktopApp:
 
         ttk.Label(settings_wrap, text="Vendor Search URL", width=24).grid(row=0, column=0, sticky=W, padx=(0, 8), pady=3)
         ttk.Entry(settings_wrap, textvariable=self.scrape_search_url).grid(row=0, column=1, sticky="ew", pady=3)
-        ttk.Label(settings_wrap, text="Chrome Workers", width=24).grid(row=1, column=0, sticky=W, padx=(0, 8), pady=3)
-        ttk.Entry(settings_wrap, textvariable=self.scrape_workers, width=12).grid(row=1, column=1, sticky=W, pady=3)
+        ttk.Label(settings_wrap, text="Workers", width=24).grid(row=1, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Combobox(
+            settings_wrap,
+            textvariable=self.scrape_workers,
+            state="readonly",
+            values=self.scrape_worker_options,
+            width=10,
+        ).grid(row=1, column=1, sticky=W, pady=3)
         ttk.Label(settings_wrap, text="Delay Between Requests", width=24).grid(row=2, column=0, sticky=W, padx=(0, 8), pady=3)
         ttk.Entry(settings_wrap, textvariable=self.scrape_delay, width=12).grid(row=2, column=1, sticky=W, pady=3)
         ttk.Label(settings_wrap, text="Retry Count", width=24).grid(row=3, column=0, sticky=W, padx=(0, 8), pady=3)
         ttk.Entry(settings_wrap, textvariable=self.scrape_retries, width=12).grid(row=3, column=1, sticky=W, pady=3)
         settings_wrap.columnconfigure(1, weight=1)
-
-        toggles = ttk.Frame(settings_wrap)
-        toggles.grid(row=4, column=0, columnspan=2, sticky=W, pady=(6, 0))
-        ttk.Checkbutton(toggles, text="Headless Mode", variable=self.scrape_headless).pack(side=LEFT, padx=(0, 12))
-        ttk.Checkbutton(toggles, text="Scrape Images", variable=self.scrape_images).pack(side=LEFT, padx=(0, 12))
-        ttk.Checkbutton(toggles, text="Force Scrape", variable=self.scrape_force).pack(side=LEFT, padx=(0, 12))
 
         action_row = ttk.Frame(self.preview_inner)
         action_row.pack(fill=X, pady=(0, 8))
@@ -2071,7 +2141,8 @@ class ProductProspectorDesktopApp:
         ]
         trailing_present = [column for column in trailing if column in df.columns]
         leading = [column for column in df.columns if column not in trailing_present]
-        return df.loc[:, [*leading, *trailing_present]]
+        ordered = df.loc[:, [*leading, *trailing_present]]
+        return self._apply_update_scope_to_dataframe(ordered)
 
     def _combo_row(self, parent, label: str, variable: StringVar, row: int, column: int = 0) -> ttk.Combobox:
         frame = ttk.Frame(parent)
@@ -2104,14 +2175,18 @@ class ProductProspectorDesktopApp:
         return tree
 
     def _review_entry_row(self, parent, label: str, field_name: str, row: int, col_offset: int) -> None:
-        ttk.Label(parent, text=label, width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
-        ttk.Entry(parent, textvariable=self.review_fields[field_name]).grid(
+        label_widget = ttk.Label(parent, text=label, width=18)
+        label_widget.grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        entry_widget = ttk.Entry(parent, textvariable=self.review_fields[field_name])
+        entry_widget.grid(
             row=row,
             column=col_offset + 1,
             sticky="ew",
             padx=(0, 12),
             pady=2,
         )
+        self.review_field_widgets[field_name] = (label_widget, entry_widget)
+        self.review_field_layouts[field_name] = (row, col_offset)
 
     def _review_variant_entry_row(self, parent, label: str, field_name: str, row: int, col_offset: int) -> None:
         ttk.Label(parent, text=label, width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
@@ -2245,7 +2320,8 @@ class ProductProspectorDesktopApp:
         return ", ".join(ordered)
 
     def _review_collections_row(self, parent, row: int, col_offset: int) -> None:
-        ttk.Label(parent, text="Collections", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        label_widget = ttk.Label(parent, text="Collections", width=18)
+        label_widget.grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
         frame.columnconfigure(0, weight=1)
@@ -2281,6 +2357,8 @@ class ProductProspectorDesktopApp:
         self.review_collections_suggestions = suggestions
         self.review_collections_suggestion_values = []
         self._refresh_review_collection_chips()
+        self.review_field_widgets["collections"] = (label_widget, frame)
+        self.review_field_layouts["collections"] = (row, col_offset)
 
     def _selected_collection_keys(self) -> set[str]:
         return {self._collection_title_key(item) for item in self.review_collection_selected if self._collection_title_key(item)}
@@ -2530,7 +2608,8 @@ class ProductProspectorDesktopApp:
         return "break"
 
     def _review_tags_row(self, parent, row: int, col_offset: int) -> None:
-        ttk.Label(parent, text="Tags", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        label_widget = ttk.Label(parent, text="Tags", width=18)
+        label_widget.grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
         frame.columnconfigure(0, weight=1)
@@ -2575,6 +2654,8 @@ class ProductProspectorDesktopApp:
         self.review_tags_suggestions = suggestions
         self.review_tags_suggestion_values = []
         self._render_review_tags_editor(query="", trailing_comma=False)
+        self.review_field_widgets["tags"] = (label_widget, frame)
+        self.review_field_layouts["tags"] = (row, col_offset)
 
     def _selected_tag_keys(self) -> set[str]:
         return {self._tag_key(item) for item in self.review_tag_selected if self._tag_key(item)}
@@ -2913,7 +2994,8 @@ class ProductProspectorDesktopApp:
         return "break"
 
     def _review_cost_row(self, parent, row: int, col_offset: int) -> None:
-        ttk.Label(parent, text="Cost", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
+        label_widget = ttk.Label(parent, text="Cost", width=18)
+        label_widget.grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
         frame.columnconfigure(1, weight=1)
@@ -2936,6 +3018,8 @@ class ProductProspectorDesktopApp:
         )
         self.review_cost_apply_all_btn.grid(row=0, column=2, sticky=W, padx=(6, 0))
         self.review_cost_apply_all_btn.configure(state="disabled")
+        self.review_field_widgets["cost"] = (label_widget, frame)
+        self.review_field_layouts["cost"] = (row, col_offset)
 
     def _parse_float_value(self, value: object) -> float | None:
         text = str(value or "").strip()
@@ -3177,7 +3261,7 @@ class ProductProspectorDesktopApp:
             return False
 
         try:
-            workers = max(int(float(self.scrape_workers.get().strip() or "1")), 1)
+            workers = min(max(int(float(self.scrape_workers.get().strip() or "1")), 1), 10)
             delay = max(float(self.scrape_delay.get().strip() or "0"), 0.0)
             retries = max(int(float(self.scrape_retries.get().strip() or "0")), 0)
         except Exception:
@@ -3188,11 +3272,14 @@ class ProductProspectorDesktopApp:
         self.session.scrape_settings.chrome_workers = workers
         self.session.scrape_settings.delay_seconds = delay
         self.session.scrape_settings.retry_count = retries
-        self.session.scrape_settings.headless = bool(self.scrape_headless.get())
-        # Images are always scrape-driven in this workflow.
-        self.scrape_images.set(True)
-        self.session.scrape_settings.scrape_images = True
-        self.session.scrape_settings.force_scrape = bool(self.scrape_force.get())
+        requested_scrape_fields = self._requested_scrape_fields()
+        scrape_images_requested = "media_urls" in requested_scrape_fields
+        self.scrape_headless.set(True)
+        self.session.scrape_settings.headless = True
+        self.scrape_images.set(scrape_images_requested)
+        self.session.scrape_settings.scrape_images = scrape_images_requested
+        self.scrape_force.set(False)
+        self.session.scrape_settings.force_scrape = False
         self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
 
         target_skus = collect_session_skus(self.session)
@@ -3327,14 +3414,10 @@ class ProductProspectorDesktopApp:
             scrape_sku_errors: dict[str, str] = {}
             scrape_general_errors: list[str] = []
             can_scrape = bool(self.session.scrape_settings.vendor_search_url and target_skus)
-            image_scrape_needed = bool(self.session.scrape_settings.scrape_images) and self._scope_missing_media_for_scrape(target_skus)
+            requested_scrape_fields = self._requested_scrape_fields()
             should_scrape = False
             if not skip_scrape:
-                should_scrape = can_scrape and (
-                    self.session.scrape_settings.force_scrape
-                    or bool(self.session.missing_fields)
-                    or image_scrape_needed
-                )
+                should_scrape = can_scrape and bool(requested_scrape_fields)
             if should_scrape:
                 scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
                     vendor_search_url=self.session.scrape_settings.vendor_search_url,
@@ -3344,6 +3427,8 @@ class ProductProspectorDesktopApp:
                     delay_seconds=self.session.scrape_settings.delay_seconds,
                     scrape_images=self.session.scrape_settings.scrape_images,
                     image_output_root=self.runtime_output_root / "images",
+                    search_terms_by_sku=dict(self.session.search_terms_by_sku or {}),
+                    requested_fields=requested_scrape_fields,
                 )
 
             products, build_stats = build_products_from_session(
@@ -3445,10 +3530,10 @@ class ProductProspectorDesktopApp:
                 "products": normalized_products,
                 "build_stats": build_stats,
                 "should_scrape": should_scrape,
+                "requested_scrape_fields": sorted(requested_scrape_fields),
                 "scrape_records": scrape_records,
                 "scrape_sku_errors": scrape_sku_errors,
                 "scrape_general_errors": scrape_general_errors,
-                "image_scrape_needed": image_scrape_needed,
                 "can_scrape": can_scrape,
                 "mapper": mapper,
             }
@@ -3481,7 +3566,7 @@ class ProductProspectorDesktopApp:
             build_stats = result_payload.get("build_stats")
             should_scrape = bool(result_payload.get("should_scrape"))
             can_scrape = bool(result_payload.get("can_scrape"))
-            image_scrape_needed = bool(result_payload.get("image_scrape_needed"))
+            requested_scrape_fields = list(result_payload.get("requested_scrape_fields") or [])
             scrape_records = dict(result_payload.get("scrape_records") or {})
             scrape_sku_errors = dict(result_payload.get("scrape_sku_errors") or {})
             scrape_general_errors = list(result_payload.get("scrape_general_errors") or [])
@@ -3502,6 +3587,7 @@ class ProductProspectorDesktopApp:
 
             rows_considered = int(getattr(build_stats, "rows_considered", len(normalized_products)))
             rows_skipped_no_shopify_match = int(getattr(build_stats, "rows_skipped_no_shopify_match", 0))
+            rows_built_without_shopify_match = int(getattr(build_stats, "rows_built_without_shopify_match", 0))
             rows_skipped_missing_sku = int(getattr(build_stats, "rows_skipped_missing_sku", 0))
             rows_flagged_gas = int(getattr(build_stats, "rows_flagged_gas", 0))
             eligible_products = sum(
@@ -3516,6 +3602,10 @@ class ProductProspectorDesktopApp:
             ]
             if rows_skipped_no_shopify_match:
                 status_parts.append(f"Skipped (no Shopify match): {rows_skipped_no_shopify_match}")
+            if rows_built_without_shopify_match:
+                status_parts.append(
+                    f"Review-only rows (no Shopify match): {rows_built_without_shopify_match}"
+                )
             if rows_skipped_missing_sku:
                 status_parts.append(f"Skipped (missing SKU): {rows_skipped_missing_sku}")
             if rows_flagged_gas:
@@ -3524,12 +3614,11 @@ class ProductProspectorDesktopApp:
             if self.session.missing_fields:
                 status_parts.append(f"Missing fields: {', '.join(self.session.missing_fields)}")
             if should_scrape:
+                if requested_scrape_fields:
+                    status_parts.append(f"Scrape target fields: {', '.join(requested_scrape_fields)}")
                 status_parts.append(f"Scraped: {len(scrape_records)} SKU hits")
                 if scrape_sku_errors:
                     status_parts.append(f"Scrape SKU failures: {len(scrape_sku_errors)}")
-                    first_error = next(iter(scrape_sku_errors.values()), "")
-                    if first_error:
-                        status_parts.append(f"First scrape error: {first_error}")
                 if scrape_general_errors:
                     status_parts.append(f"Scrape warnings: {len(scrape_general_errors)}")
                 downloaded_images = sum(
@@ -3539,10 +3628,7 @@ class ProductProspectorDesktopApp:
                 if downloaded_images:
                     status_parts.append(f"Downloaded images: {downloaded_images}")
             elif can_scrape:
-                if image_scrape_needed:
-                    status_parts.append("Scraper skipped unexpectedly for images. Enable Force Scrape and retry.")
-                else:
-                    status_parts.append("Scraper skipped: mapped data already covers requested fields.")
+                status_parts.append("Scraper skipped: mapped data already covers requested fields.")
             self.processing_status_text.set(" | ".join(status_parts))
             self.to_review_btn.configure(state="normal")
             self.review_refresh_pending = True
@@ -3621,6 +3707,9 @@ class ProductProspectorDesktopApp:
             text = str(value or "").strip()
             if not text:
                 return ""
+            compact = re.sub(r"[^A-Za-z0-9]+", "", text).upper()
+            if re.search(r"[A-Z]", compact):
+                return compact
             return re.sub(r"[^0-9]", "", text)
 
         def normalize_weight_text(value: object) -> str:
@@ -3759,9 +3848,13 @@ class ProductProspectorDesktopApp:
                 mismatches = collect_numeric_mismatches(product, payload)
                 product.scrape_mismatch_error = "; ".join(mismatches)
             else:
-                product.scrape_status = "fail X"
+                error_text = lookup_error(sku) or "No scrape data found"
+                if error_text.lower().startswith("unresolved vendor search route:"):
+                    product.scrape_status = "unresolved"
+                else:
+                    product.scrape_status = "fail X"
                 product.scrape_fields_found = ""
-                product.scrape_error = lookup_error(sku) or "No scrape data found"
+                product.scrape_error = error_text
                 product.scrape_mismatch_error = ""
 
             media_folder = str(payload.get("media_folder", "")).strip()
@@ -3772,6 +3865,7 @@ class ProductProspectorDesktopApp:
                     product.media_folder = media_folder
 
     def _refresh_review_tab(self) -> None:
+        self._apply_review_field_visibility()
         total = len(self.session.products)
         if total == 0:
             self.push_selected_skus = set()
@@ -3857,6 +3951,7 @@ class ProductProspectorDesktopApp:
         else:
             self._clear_review_variant_fields()
             self._set_variant_form_visible(False)
+        self._apply_review_field_visibility()
         self._highlight_review_table_current_product()
         self._refresh_push_button_state()
 
@@ -4904,6 +4999,12 @@ class ProductProspectorDesktopApp:
             self._set_setup_workflow_visible(False)
             self.setup_status_text.set("Select a Run Mode to begin.")
             self.sku_scope_help_text.set("")
+            self.update_lookup_skus = ()
+            self.update_lookup_search_terms_by_sku = {}
+            self.update_lookup_vendor.set("")
+            self.sku_text_status.set("")
+            self.mpn_text_status.set("")
+            self.product_id_text_status.set("")
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
             self.duplicate_check_text.set("")
@@ -4924,6 +5025,8 @@ class ProductProspectorDesktopApp:
         if mode == RUN_MODE_UPDATE:
             self.session.mode = MODE_UPDATE
             self.sku_scope_help_text.set("")
+            self.update_lookup_skus = ()
+            self.update_lookup_search_terms_by_sku = {}
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
             self.duplicate_check_text.set("")
@@ -4939,6 +5042,10 @@ class ProductProspectorDesktopApp:
         elif mode == RUN_MODE_CREATE:
             self.session.mode = MODE_NEW
             self.sku_scope_help_text.set("")
+            self.update_lookup_skus = ()
+            self.update_lookup_search_terms_by_sku = {}
+            self.update_lookup_vendor.set("")
+            self.mpn_text_status.set("")
             cached_count = 0
             try:
                 cached_count = int(len(load_shopify_sku_cache()))
@@ -4980,6 +5087,11 @@ class ProductProspectorDesktopApp:
             except Exception:
                 continue
         self.sku_text_widget.configure(state=state)
+        mpn_state = state if enabled and self.session.mode == MODE_UPDATE else "disabled"
+        if hasattr(self, "mpn_text_widget"):
+            self.mpn_text_widget.configure(state=mpn_state)
+        if hasattr(self, "update_lookup_vendor_combo"):
+            self.update_lookup_vendor_combo.configure(state="readonly" if enabled and self.session.mode == MODE_UPDATE else "disabled")
         product_id_state = state if enabled and self.session.mode == MODE_UPDATE else "disabled"
         self.product_id_text_widget.configure(state=product_id_state)
         if hasattr(self, "load_product_ids_btn"):
@@ -4998,15 +5110,18 @@ class ProductProspectorDesktopApp:
     def _refresh_product_id_scope_visibility(self) -> None:
         if not hasattr(self, "text_input_wrap"):
             return
-        show_product_id = self.session.mode == MODE_UPDATE
+        show_update_lookup = self.session.mode == MODE_UPDATE
         self.text_input_wrap.columnconfigure(0, weight=1)
-        if show_product_id:
+        self.text_input_wrap.columnconfigure(1, weight=1 if show_update_lookup else 0)
+        self.text_input_wrap.columnconfigure(2, weight=1 if show_update_lookup else 0)
+        if show_update_lookup:
             self.text_input_wrap.columnconfigure(1, weight=1)
-            self.sku_scope_frame.grid_configure(padx=(0, 6))
-            self.product_id_scope_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            self.sku_scope_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+            self.mpn_scope_frame.grid(row=0, column=1, sticky="nsew", padx=6)
+            self.product_id_scope_frame.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
             return
-        self.text_input_wrap.columnconfigure(1, weight=0)
-        self.sku_scope_frame.grid_configure(padx=(0, 0))
+        self.sku_scope_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 0))
+        self.mpn_scope_frame.grid_remove()
         self.product_id_scope_frame.grid_remove()
 
     def _refresh_new_mode_check_controls(self) -> None:
@@ -5043,10 +5158,14 @@ class ProductProspectorDesktopApp:
     def _refresh_sku_action_labels(self) -> None:
         if self.session.mode == MODE_NEW:
             self.load_pasted_btn.configure(text="Load and Check SKUs")
+            if hasattr(self, "load_mpn_btn"):
+                self.load_mpn_btn.configure(text="Load and Check MPNs")
             self.load_sheet_btn.configure(text="Load Price Sheet and Check SKUs")
             self.load_product_ids_btn.configure(text="Load Product IDs")
             return
-        self.load_pasted_btn.configure(text="Load Pasted SKUs")
+        self.load_pasted_btn.configure(text="Load and Check SKUs")
+        if hasattr(self, "load_mpn_btn"):
+            self.load_mpn_btn.configure(text="Load and Check MPNs")
         self.load_sheet_btn.configure(text="Load Vendor Price Sheet (CSV/XLS/XLSX/XLSB)")
         self.load_product_ids_btn.configure(text="Load Product IDs")
 
@@ -5111,6 +5230,132 @@ class ProductProspectorDesktopApp:
 
     def _pasted_scope_skus(self) -> list[str]:
         return self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+
+    def _pasted_scope_mpns(self) -> list[str]:
+        if not hasattr(self, "mpn_text_widget"):
+            return []
+        return self._parse_sku_text(self.mpn_text_widget.get("1.0", END))
+
+    def _load_cached_shopify_catalog(self) -> pd.DataFrame:
+        cached_df = load_shopify_sku_cache()
+        if cached_df is not None and not cached_df.empty:
+            self.shopify_df_raw = cached_df.copy()
+            self.shopify_cache_ready = True
+            return cached_df.copy()
+        if self.shopify_df_raw is not None and not self.shopify_df_raw.empty and "sku" in self.shopify_df_raw.columns:
+            return self.shopify_df_raw.copy()
+        return pd.DataFrame(columns=["sku"])
+
+    def _lookup_update_skus_in_cache(
+        self,
+        sku_inputs: list[str],
+    ) -> tuple[list[str], list[str], str | None]:
+        normalized = list(dict.fromkeys(normalize_sku(value) for value in sku_inputs if normalize_sku(value)))
+        if not normalized:
+            return [], [], None
+        cached_df = self._load_cached_shopify_catalog()
+        if cached_df.empty or "sku" not in cached_df.columns:
+            return [], normalized, "Shopify SKU cache is not ready. Download cache first."
+        cached_skus = {normalize_sku(value) for value in cached_df["sku"].astype(str).tolist() if normalize_sku(value)}
+        matched = [sku for sku in normalized if sku in cached_skus]
+        missing = [sku for sku in normalized if sku not in cached_skus]
+        return matched, missing, None
+
+    def _lookup_update_mpns_in_cache(
+        self,
+        mpn_inputs: list[str],
+        vendor_name: str,
+    ) -> tuple[list[str], dict[str, str], list[str], str, str | None]:
+        normalized = list(dict.fromkeys(normalize_sku(value) for value in mpn_inputs if normalize_sku(value)))
+        if not normalized:
+            return [], {}, [], "", None
+        vendor_value = str(vendor_name or "").strip()
+        if not vendor_value:
+            return [], {}, normalized, "", "Choose a vendor before loading MPNs."
+
+        cached_df = self._load_cached_shopify_catalog()
+        if cached_df.empty or "sku" not in cached_df.columns:
+            return [], {}, normalized, "", "Shopify SKU cache is not ready. Download cache first."
+
+        profile = resolve_vendor_profile(vendor_value, required_root=self.required_root)
+        sku_prefix = str(profile.sku_prefix or "").strip() if profile is not None else ""
+        cached_skus = {normalize_sku(value) for value in cached_df["sku"].astype(str).tolist() if normalize_sku(value)}
+
+        matched_skus: list[str] = []
+        search_terms_by_sku: dict[str, str] = {}
+        missing_mpns: list[str] = []
+        seen_matched: set[str] = set()
+        for mpn in normalized:
+            derived_sku = _apply_lookup_vendor_prefix(mpn, sku_prefix)
+            if derived_sku in cached_skus:
+                if derived_sku not in seen_matched:
+                    seen_matched.add(derived_sku)
+                    matched_skus.append(derived_sku)
+                search_terms_by_sku[derived_sku] = mpn
+            else:
+                missing_mpns.append(mpn)
+        return matched_skus, search_terms_by_sku, missing_mpns, sku_prefix, None
+
+    def _resolve_update_lookup_scope(
+        self,
+        sku_inputs: list[str] | None = None,
+        mpn_inputs: list[str] | None = None,
+        vendor_name: str | None = None,
+    ) -> tuple[list[str], dict[str, str], dict[str, object]]:
+        sku_values = sku_inputs if sku_inputs is not None else self._pasted_scope_skus()
+        mpn_values = mpn_inputs if mpn_inputs is not None else self._pasted_scope_mpns()
+        vendor_value = str(vendor_name if vendor_name is not None else self.update_lookup_vendor.get()).strip()
+
+        matched_skus: list[str] = []
+        search_terms_by_sku: dict[str, str] = {}
+        seen: set[str] = set()
+        summary: dict[str, object] = {
+            "matched_input_skus": [],
+            "missing_input_skus": [],
+            "matched_input_mpns": [],
+            "missing_input_mpns": [],
+            "vendor": vendor_value,
+            "vendor_prefix": "",
+            "error": "",
+        }
+
+        sku_matched, sku_missing, sku_error = self._lookup_update_skus_in_cache(list(sku_values or []))
+        if sku_error:
+            summary["error"] = sku_error
+            return [], {}, summary
+        summary["matched_input_skus"] = list(sku_matched)
+        summary["missing_input_skus"] = list(sku_missing)
+        for sku in sku_matched:
+            if sku not in seen:
+                seen.add(sku)
+                matched_skus.append(sku)
+            search_terms_by_sku.setdefault(sku, sku)
+
+        mpn_matched_skus, mpn_search_terms, mpn_missing, sku_prefix, mpn_error = self._lookup_update_mpns_in_cache(
+            list(mpn_values or []),
+            vendor_value,
+        )
+        if mpn_error and mpn_values:
+            summary["error"] = mpn_error
+            return [], {}, summary
+        summary["matched_input_mpns"] = list(mpn_search_terms.values())
+        summary["missing_input_mpns"] = list(mpn_missing)
+        summary["vendor_prefix"] = sku_prefix
+        for sku in mpn_matched_skus:
+            if sku not in seen:
+                seen.add(sku)
+                matched_skus.append(sku)
+            search_terms_by_sku[sku] = mpn_search_terms.get(sku, sku)
+
+        return matched_skus, search_terms_by_sku, summary
+
+    def _set_update_lookup_scope_state(self, matched_skus: list[str], search_terms_by_sku: dict[str, str]) -> None:
+        self.update_lookup_skus = tuple(matched_skus)
+        self.update_lookup_search_terms_by_sku = {
+            normalize_sku(key): normalize_sku(value) or normalize_sku(key)
+            for key, value in search_terms_by_sku.items()
+            if normalize_sku(key)
+        }
 
     def _build_vendor_preview_for_scope(
         self, rows: int = 30
@@ -5480,6 +5725,129 @@ class ProductProspectorDesktopApp:
             selected.append("application")
         return selected
 
+    def _requested_scrape_fields(self) -> set[str]:
+        field_map = {
+            "title": "title",
+            "description": "description_html",
+            "media": "media_urls",
+            "price": "price",
+            "cost": "cost",
+            "vendor": "vendor",
+            "weight": "weight",
+            "barcode": "barcode",
+            "application": "application",
+        }
+        requested: set[str] = set()
+        for field_name in self.session.missing_fields or []:
+            mapped = field_map.get(str(field_name or "").strip())
+            if mapped:
+                requested.add(mapped)
+        if self.session.mode == MODE_UPDATE and "core_charge_product_code" in (self.session.update_fields or []):
+            requested.add("core_charge_product_code")
+        return requested
+
+    def _effective_update_review_fields(self) -> set[str] | None:
+        if self.session.mode != MODE_UPDATE:
+            return None
+        selected = {field for field in (self.session.update_fields or []) if str(field or "").strip()}
+        if not selected:
+            return None
+        return {"vendor", "sku", "mpn", *selected}
+
+    def _apply_update_scope_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        visible_fields = self._effective_update_review_fields()
+        if visible_fields is None:
+            return df
+        operational_columns = [
+            "push",
+            "remove",
+            "record_type",
+            "status",
+            "product_url",
+            "scrape_status",
+            "excluded",
+            "exclusion_reason",
+            "scrape_fields_found",
+            "scrape_error",
+            "scrape_mismatch_error",
+            "media_folder",
+        ]
+        ordered_business_columns = [
+            "sku",
+            "vendor",
+            "mpn",
+            "title",
+            "description_html",
+            "media_urls",
+            "price",
+            "cost",
+            "barcode",
+            "weight",
+            "type",
+            "google_product_type",
+            "category_code",
+            "product_subtype",
+            "application",
+            "inventory",
+            "brand",
+            "core_charge_product_code",
+            "collections",
+            "tags",
+        ]
+        keep = [column for column in operational_columns if column in df.columns]
+        keep.extend(
+            [
+                column
+                for column in ordered_business_columns
+                if column in df.columns and column in visible_fields and column not in keep
+            ]
+        )
+        if not keep:
+            return df
+        return df.loc[:, keep]
+
+    def _apply_review_field_visibility(self) -> None:
+        visible_fields = self._effective_update_review_fields()
+        ordered_fields = sorted(
+            self.review_field_widgets.keys(),
+            key=lambda field_name: self.review_field_layouts.get(field_name, (999, 999)),
+        )
+
+        next_row_by_column = {0: 0, 2: 0}
+        for field_name in ordered_fields:
+            label_widget, value_widget = self.review_field_widgets[field_name]
+            original_row, col_offset = self.review_field_layouts.get(field_name, (0, 0))
+            show = visible_fields is None or field_name in visible_fields
+            if not show:
+                try:
+                    if label_widget.winfo_manager():
+                        label_widget.grid_remove()
+                except Exception:
+                    pass
+                try:
+                    if value_widget.winfo_manager():
+                        value_widget.grid_remove()
+                except Exception:
+                    pass
+                continue
+
+            target_row = next_row_by_column.get(col_offset, original_row)
+            next_row_by_column[col_offset] = target_row + 1
+            try:
+                if not label_widget.winfo_manager():
+                    label_widget.grid()
+                label_widget.grid_configure(row=target_row, column=col_offset)
+            except Exception:
+                pass
+            try:
+                if not value_widget.winfo_manager():
+                    value_widget.grid()
+                value_widget.grid_configure(row=target_row, column=col_offset + 1)
+            except Exception:
+                pass
+
     def _update_tab_access(self) -> None:
         if not hasattr(self, "notebook"):
             return
@@ -5504,11 +5872,27 @@ class ProductProspectorDesktopApp:
                 messagebox.showwarning(APP_TITLE, "Select a Run Mode first.")
             return False
 
-        pasted_skus = self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+        raw_pasted_skus = self._parse_sku_text(self.sku_text_widget.get("1.0", END))
+        raw_pasted_mpns = self._pasted_scope_mpns()
         pasted_product_ids = self._parse_product_id_text(self.product_id_text_widget.get("1.0", END))
         has_sheet = self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty
         bypass_sheet_for_skip = bool(skip_to_review and self.session.mode == MODE_UPDATE)
         self._enforce_unique_vendor_mappings()
+        resolved_update_skus: list[str] = []
+        search_terms_by_sku: dict[str, str] = {}
+        if self.session.mode == MODE_UPDATE:
+            resolved_update_skus, search_terms_by_sku, update_summary = self._resolve_update_lookup_scope(
+                sku_inputs=raw_pasted_skus,
+                mpn_inputs=raw_pasted_mpns,
+                vendor_name=self.update_lookup_vendor.get(),
+            )
+            update_error = str(update_summary.get("error", "") or "").strip()
+            if update_error and (raw_pasted_skus or raw_pasted_mpns):
+                if show_messages:
+                    messagebox.showwarning(APP_TITLE, update_error)
+                return False
+            self._set_update_lookup_scope_state(resolved_update_skus, search_terms_by_sku)
+        pasted_skus = resolved_update_skus if self.session.mode == MODE_UPDATE else list(raw_pasted_skus)
 
         self.session.source_mapping.vendor = self.vendor_vendor_column.get().strip()
         self.session.source_mapping.title = self.vendor_title_column.get().strip()
@@ -5567,7 +5951,12 @@ class ProductProspectorDesktopApp:
         has_update_product_ids = self.session.mode == MODE_UPDATE and bool(pasted_product_ids)
         if not target_skus and not (skip_to_review and has_update_product_ids):
             if show_messages:
-                if has_sheet:
+                if self.session.mode == MODE_UPDATE and (raw_pasted_skus or raw_pasted_mpns):
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "No pasted SKU/MPN inputs matched the Shopify SKU cache.\n\nRefresh the cache or verify vendor prefix + input values.",
+                    )
+                elif has_sheet:
                     messagebox.showwarning(
                         APP_TITLE,
                         "Paste SKUs or map the spreadsheet SKU column to include sheet SKUs in scope.",
@@ -5647,16 +6036,16 @@ class ProductProspectorDesktopApp:
 
         self.session.vendor_df = filtered_vendor_df if (has_sheet and not bypass_sheet_for_skip) else None
         self.session.pasted_skus = target_skus
+        self.session.search_terms_by_sku = {
+            sku: normalize_sku(search_terms_by_sku.get(sku, sku)) or sku
+            for sku in target_skus
+            if normalize_sku(sku)
+        }
         self.session.target_skus = target_skus
         self.session.target_product_ids = pasted_product_ids
 
         if self.session.mode == MODE_UPDATE:
-            selected = self._selected_update_fields()
-            if not selected and not skip_to_review:
-                if show_messages:
-                    messagebox.showwarning(APP_TITLE, "Select at least one update field for Update mode.")
-                return False
-            self.session.update_fields = selected
+            self.session.update_fields = self._selected_update_fields()
         else:
             self.session.update_fields = []
 
@@ -6277,6 +6666,11 @@ class ProductProspectorDesktopApp:
     def _clear_pasted_skus(self) -> None:
         self.sku_text_widget.delete("1.0", END)
         self.sku_text_status.set("")
+        if self.session.mode == MODE_UPDATE:
+            self.update_lookup_skus = ()
+            self.update_lookup_search_terms_by_sku = {}
+            self.duplicate_check_text.set("")
+            self.source_status_text.set("")
         self._refresh_vendor_preview_for_scope()
         if self.session.mode == MODE_NEW:
             self.create_existing_skus = set()
@@ -6289,6 +6683,18 @@ class ProductProspectorDesktopApp:
                     self.duplicate_check_text.set("Duplicate check is preparing. Try again shortly.")
             else:
                 self.duplicate_check_text.set("Shopify duplicate check runs when SKU scope is loaded.")
+        self._refresh_input_metrics()
+
+    def _clear_pasted_mpns(self) -> None:
+        if not hasattr(self, "mpn_text_widget"):
+            return
+        self.mpn_text_widget.delete("1.0", END)
+        self.mpn_text_status.set("")
+        self.update_lookup_skus = ()
+        self.update_lookup_search_terms_by_sku = {}
+        if self.session.mode == MODE_UPDATE:
+            self.duplicate_check_text.set("")
+            self.source_status_text.set("")
         self._refresh_input_metrics()
 
     def _clear_product_ids(self) -> None:
@@ -6343,12 +6749,96 @@ class ProductProspectorDesktopApp:
             messagebox.showwarning(APP_TITLE, "No valid SKUs found in pasted text.")
             return
 
+        if self.session.mode == MODE_UPDATE:
+            matched_skus, search_terms_by_sku, summary = self._resolve_update_lookup_scope(
+                sku_inputs=skus,
+                mpn_inputs=self._pasted_scope_mpns() if self.update_lookup_vendor.get().strip() else [],
+                vendor_name=self.update_lookup_vendor.get(),
+            )
+            error_text = str(summary.get("error", "") or "").strip()
+            if error_text:
+                self.sku_text_status.set(error_text)
+                self.source_status_text.set(error_text)
+                self.duplicate_check_text.set(error_text)
+                self._set_update_lookup_scope_state([], {})
+                self._refresh_input_metrics()
+                return
+            matched_input_skus = list(summary.get("matched_input_skus") or [])
+            missing_input_skus = list(summary.get("missing_input_skus") or [])
+            self.sku_text_status.set(
+                f"Matched {len(matched_input_skus)}/{len(skus)} SKU(s)"
+                + (f" | Missing: {len(missing_input_skus)}" if missing_input_skus else "")
+            )
+            self.duplicate_check_text.set(
+                f"Update cache check ready: {len(matched_skus)} matched SKU(s)"
+                + (
+                    f" | Missing SKU inputs: {len(missing_input_skus)}"
+                    if missing_input_skus
+                    else ""
+                )
+                + (
+                    f" | Missing MPN inputs: {len(list(summary.get('missing_input_mpns') or []))}"
+                    if list(summary.get("missing_input_mpns") or [])
+                    else ""
+                )
+            )
+            self.source_status_text.set(f"Update scope ready: {len(matched_skus)} cache-matched SKU(s).")
+            self._set_update_lookup_scope_state(matched_skus, search_terms_by_sku)
+            self._refresh_vendor_preview_for_scope()
+            self._refresh_input_metrics()
+            return
+
         self.sku_text_status.set(f"Found {len(skus)} unique SKUs in text scope")
         self.source_status_text.set(f"SKU text scope ready: {len(skus)} SKUs.")
         self._refresh_vendor_preview_for_scope()
         self._refresh_input_metrics()
         if self.session.mode == MODE_NEW:
             self._queue_create_duplicate_check(skus)
+
+    def _load_pasted_mpns(self) -> None:
+        raw_text = self.mpn_text_widget.get("1.0", END) if hasattr(self, "mpn_text_widget") else ""
+        mpns = self._parse_sku_text(raw_text)
+        if not mpns:
+            messagebox.showwarning(APP_TITLE, "No valid MPNs found in pasted text.")
+            return
+        matched_skus, search_terms_by_sku, summary = self._resolve_update_lookup_scope(
+            sku_inputs=self._pasted_scope_skus(),
+            mpn_inputs=mpns,
+            vendor_name=self.update_lookup_vendor.get(),
+        )
+        error_text = str(summary.get("error", "") or "").strip()
+        if error_text:
+            self.mpn_text_status.set(error_text)
+            self.source_status_text.set(error_text)
+            self.duplicate_check_text.set(error_text)
+            self._set_update_lookup_scope_state([], {})
+            self._refresh_input_metrics()
+            return
+
+        matched_input_mpns = list(summary.get("matched_input_mpns") or [])
+        missing_input_mpns = list(summary.get("missing_input_mpns") or [])
+        vendor_prefix = str(summary.get("vendor_prefix", "") or "").strip()
+        prefix_text = f" via prefix {vendor_prefix}" if vendor_prefix else ""
+        self.mpn_text_status.set(
+            f"Matched {len(matched_input_mpns)}/{len(mpns)} MPN(s){prefix_text}"
+            + (f" | Missing: {len(missing_input_mpns)}" if missing_input_mpns else "")
+        )
+        self.duplicate_check_text.set(
+            f"Update cache check ready: {len(matched_skus)} matched SKU(s)"
+            + (
+                f" | Missing MPN inputs: {len(missing_input_mpns)}"
+                if missing_input_mpns
+                else ""
+            )
+            + (
+                f" | Missing SKU inputs: {len(list(summary.get('missing_input_skus') or []))}"
+                if list(summary.get("missing_input_skus") or [])
+                else ""
+            )
+        )
+        self.source_status_text.set(f"Update scope ready: {len(matched_skus)} cache-matched SKU(s).")
+        self._set_update_lookup_scope_state(matched_skus, search_terms_by_sku)
+        self._refresh_input_metrics()
 
     def _load_product_ids(self) -> None:
         raw_text = self.product_id_text_widget.get("1.0", END)
@@ -6434,13 +6924,15 @@ class ProductProspectorDesktopApp:
                 vendor_skus = int(len(self.vendor_df_raw))
 
         scoped_skus = len(self._pasted_scope_skus())
+        scoped_mpns = len(self._pasted_scope_mpns())
         scoped_product_ids = len(self._parse_product_id_text(self.product_id_text_widget.get("1.0", END)))
         if self.session.mode == MODE_NEW:
             scoped_skus = len(self._create_scope_skus_for_duplicate_check())
+            scoped_mpns = 0
 
         shopify_rows = int(len(self.shopify_df_raw)) if self.shopify_df_raw is not None else 0
         self.input_metrics_text.set(
-            f"Vendor SKUs: {vendor_skus} | Scoped SKUs: {scoped_skus} | Scoped Product IDs: {scoped_product_ids} | Shopify Catalog SKUs: {shopify_rows}"
+            f"Vendor SKUs: {vendor_skus} | Scoped SKUs: {scoped_skus} | Scoped MPNs: {scoped_mpns} | Scoped Product IDs: {scoped_product_ids} | Shopify Catalog SKUs: {shopify_rows}"
         )
         self._refresh_shopify_cache_inline_text()
 

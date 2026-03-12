@@ -1,0 +1,1476 @@
+[
+  {
+    "detail": {
+      "vendor": "Mac's Custom Tie Downs",
+      "display_name": "Mac's Custom Tie Downs",
+      "search_family": "asp_search_ss",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.macscustomtiedowns.com/search.aspx?ss={sku}",
+      "tested_skus": "MAC-520215 | MACS-520010",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "MAC-520215 | MACS-520010",
+      "failed_skus": "",
+      "first_product_url": "https://www.macscustomtiedowns.com/nosearchresults.aspx?ss=MAC-520215",
+      "first_title": "Search Results",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "4.06"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "MAC-520215",
+        "status": "success",
+        "product_url": "https://www.macscustomtiedowns.com/nosearchresults.aspx?ss=MAC-520215",
+        "title": "Search Results",
+        "error": "",
+        "fields_found": "product_url, search_provider, search_url, source_url, title, weight"
+      },
+      {
+        "sku": "MACS-520010",
+        "status": "success",
+        "product_url": "https://www.macscustomtiedowns.com/nosearchresults.aspx?ss=MACS-520010",
+        "title": "Search Results",
+        "error": "",
+        "fields_found": "product_url, search_provider, search_url, source_url, title, weight"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Aeroturbine",
+      "display_name": "Aeroturbine",
+      "search_family": "bigcommerce_search_html_q",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://aeroexhaust.com/search.html?q={sku}",
+      "tested_skus": "AERO-AR20 | AERO-AR25",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "AERO-AR20 | AERO-AR25",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "2.06"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AERO-AR20",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "AERO-AR25",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Bosch",
+      "display_name": "Bosch",
+      "search_family": "bigcommerce_search_html_q",
+      "interaction_strategy": "",
+      "runtime_preference": "browser_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.bosch.us/search.html?q={sku}",
+      "tested_skus": "BOS-HP004X | BOSCH-0281006325",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "BOS-HP004X | BOSCH-0281006325",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "9.86"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "BOS-HP004X",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "BOSCH-0281006325",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Beans Diesel | Bean Machine",
+      "display_name": "Beans Diesel | Bean Machine",
+      "search_family": "bigcommerce_search_php_query",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://bdpshop.com/search.php?search_query={sku}",
+      "tested_skus": "BDP-280003 | BDP-280032",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "BDP-280003 | BDP-280032",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "3.29"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "BDP-280003",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "BDP-280032",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Longhorn Fab Shop",
+      "display_name": "Longhorn Fab Shop",
+      "search_family": "bigcommerce_search_php_query",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://longhornfabshop.com/search.php?search_query={sku}",
+      "tested_skus": "LFS-201051 | LFS-200997",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "LFS-201051 | LFS-200997",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "3.46"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "LFS-201051",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "LFS-200997",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "BorgWarner",
+      "display_name": "BorgWarner",
+      "search_family": "custom_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.borgwarner.com/search?indexCatalogue=default&searchQuery={sku}&wordsMode=0",
+      "tested_skus": "BW-179425 | BW-59001107387",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "BW-179425 | BW-59001107387",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "3.47"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "BW-179425",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "BW-59001107387",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Camburg Suspension",
+      "display_name": "Camburg Suspension",
+      "search_family": "custom_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.suspensionlifts.com/?post_type=product&s={sku}&asp_active=1&p_asid=1&p_asp_data=1&filters_initial=1&filters_changed=0&qtranslate_lang=0&woo_currency=USD&current_page_id=701",
+      "tested_skus": "CAM-030061 | CAM-030049",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "CAM-030061 | CAM-030049",
+      "failed_skus": "",
+      "first_product_url": "https://www.suspensionlifts.com/?post_type=product&s=CAM-030061&asp_active=1&p_asid=1&p_asp_data=1&filters_initial=1&filters_changed=0&qtranslate_lang=0&woo_currency=USD&current_page_id=701",
+      "first_title": "You searched for CAM-030061 -",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "13.82"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "CAM-030061",
+        "status": "success",
+        "product_url": "https://www.suspensionlifts.com/?post_type=product&s=CAM-030061&asp_active=1&p_asid=1&p_asp_data=1&filters_initial=1&filters_changed=0&qtranslate_lang=0&woo_currency=USD&current_page_id=701",
+        "title": "You searched for CAM-030061 -",
+        "error": "",
+        "fields_found": "source_url, title, vendor"
+      },
+      {
+        "sku": "CAM-030049",
+        "status": "success",
+        "product_url": "https://www.suspensionlifts.com/?post_type=product&s=CAM-030049&asp_active=1&p_asid=1&p_asp_data=1&filters_initial=1&filters_changed=0&qtranslate_lang=0&woo_currency=USD&current_page_id=701",
+        "title": "You searched for CAM-030049 -",
+        "error": "",
+        "fields_found": "source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Suspension MAXX",
+      "display_name": "Suspension MAXX",
+      "search_family": "drupal_search_api",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://suspensionmaxx.com/catalog?search_api_fulltext={sku}",
+      "tested_skus": "SMX-2535 | SMX-122690EX",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "SMX-2535 | SMX-122690EX",
+      "failed_skus": "",
+      "first_product_url": "https://suspensionmaxx.com/catalog",
+      "first_title": "| Suspension Maxx",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "1.59"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "SMX-2535",
+        "status": "success",
+        "product_url": "https://suspensionmaxx.com/catalog",
+        "title": "| Suspension Maxx",
+        "error": "",
+        "fields_found": "description_html, product_url, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "SMX-122690EX",
+        "status": "success",
+        "product_url": "https://suspensionmaxx.com/catalog",
+        "title": "| Suspension Maxx",
+        "error": "",
+        "fields_found": "description_html, product_url, search_url, source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "BMC Lights",
+      "display_name": "BMC Lights",
+      "search_family": "generic_keyword_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://bmclights.com/shop-for-bmc-kits/ols/search?keywords={sku}",
+      "tested_skus": "BMC-RAM-250-HB-RGD-STD | BMC-FRD-F25-F45-HTC-FLD-RGD-IGN",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "BMC-RAM-250-HB-RGD-STD | BMC-FRD-F25-F45-HTC-FLD-RGD-IGN",
+      "failed_skus": "",
+      "first_product_url": "https://bmclights.com/shop-for-bmc-kits",
+      "first_title": "BMC Lights",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "1.39"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "BMC-RAM-250-HB-RGD-STD",
+        "status": "success",
+        "product_url": "https://bmclights.com/shop-for-bmc-kits",
+        "title": "BMC Lights",
+        "error": "",
+        "fields_found": "description_html, product_url, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "BMC-FRD-F25-F45-HTC-FLD-RGD-IGN",
+        "status": "success",
+        "product_url": "https://bmclights.com/shop-for-bmc-kits",
+        "title": "BMC Lights",
+        "error": "",
+        "fields_found": "description_html, product_url, search_url, source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "RockJock",
+      "display_name": "RockJock",
+      "search_family": "generic_keyword_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.rockjock4x4.com/search?keywords={sku}",
+      "tested_skus": "RJ-CE-9114 | RJ-256200-101",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "RJ-CE-9114 | RJ-256200-101",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "2.31"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "RJ-CE-9114",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "RJ-256200-101",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "AccuAir Suspension",
+      "display_name": "AccuAir Suspension",
+      "search_family": "generic_q_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://accuair.com/search?q={sku}&options%5Bprefix%5D=last",
+      "tested_skus": "AA-3837 | AA-3836",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "AA-3837 | AA-3836",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "2.64"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AA-3837",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "AA-3836",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "AEV | American Expedition Vehicles",
+      "display_name": "AEV | American Expedition Vehicles",
+      "search_family": "generic_q_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://aev-conversions.com/search?q={sku}",
+      "tested_skus": "AEV-N0340000AB | AEV-N0340001AB",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "AEV-N0340000AB | AEV-N0340001AB",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "2.49"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AEV-N0340000AB",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "AEV-N0340001AB",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Power Driven Diesel",
+      "display_name": "Power Driven Diesel",
+      "search_family": "generic_query_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://powerdriven.com/pages/search?query={sku}",
+      "tested_skus": "PDD-RIT0001 | PDD-60000000236",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "PDD-RIT0001 | PDD-60000000236",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page. https://powerdriven.com/products/vp44 (HTTP 404) | https://powerdriven.com/products/ford (HTTP 404) | https://powerdriven.com/products/turbo (HTTP 404)",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "19.69"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "PDD-RIT0001",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page. https://powerdriven.com/products/vp44 (HTTP 404) | https://powerdriven.com/products/ford (HTTP 404) | https://powerdriven.com/products/turbo (HTTP 404)",
+        "fields_found": ""
+      },
+      {
+        "sku": "PDD-60000000236",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "S&B",
+      "display_name": "S&B",
+      "search_family": "generic_query_search",
+      "interaction_strategy": "",
+      "runtime_preference": "browser_first",
+      "blocking_risk": "high",
+      "verification_level": "verified",
+      "search_url_template": "https://sbfilters.com/pages/search?query={sku}",
+      "tested_skus": "SB-832018 | SB-75-5082",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "SB-832018 | SB-75-5082",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "8.70"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "SB-832018",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "SB-75-5082",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "FASS Fuel Systems",
+      "display_name": "FASS Fuel Systems",
+      "search_family": "json_product_search",
+      "interaction_strategy": "json_api_id_detail",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://shop.fassride.com/Products/Search?search={sku}",
+      "tested_skus": "DDP-RK-04 | FASS-PFD-1001",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "DDP-RK-04 | FASS-PFD-1001",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "JSON API search returned no results",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "2.54"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "DDP-RK-04",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "JSON API search returned no results",
+        "fields_found": ""
+      },
+      {
+        "sku": "FASS-PFD-1001",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "JSON API search returned no confident SKU match",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "AFE",
+      "display_name": "AFE",
+      "search_family": "magento_catalogsearch",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://afepower.com/catalogsearch/result/?q={sku}",
+      "tested_skus": "46-71370B | AFE-46-20039",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "46-71370B | AFE-46-20039",
+      "failed_skus": "",
+      "first_product_url": "https://afepower.com/afe-power-46-71370b-engine-oil-pan-black-finish-machined-fins",
+      "first_title": "aFe POWER Pro Series Engine Oil Pan Black w/ Machined Fins",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "71.47"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "46-71370B",
+        "status": "success",
+        "product_url": "https://afepower.com/afe-power-46-71370b-engine-oil-pan-black-finish-machined-fins",
+        "title": "aFe POWER Pro Series Engine Oil Pan Black w/ Machined Fins",
+        "error": "",
+        "fields_found": "core_charge_product_code, description_html, media_urls, price, product_url, search_provider, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "AFE-46-20039",
+        "status": "success",
+        "product_url": "https://afepower.com/catalogsearch/result/?p=2&q=AFE-46-20039",
+        "title": "Search results for: 'AFE-46-20039'  | aFe POWER",
+        "error": "",
+        "fields_found": "product_url, search_provider, search_url, source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "American Racing Wheels | ATX Series",
+      "display_name": "American Racing Wheels | ATX Series",
+      "search_family": "magento_catalogsearch",
+      "interaction_strategy": "",
+      "runtime_preference": "browser_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.atxwheels.com/catalogsearch/result/?q={sku}",
+      "tested_skus": "AR-AR1726882 | AR-AR1726882B",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "AR-AR1726882 | AR-AR1726882B",
+      "failed_skus": "",
+      "first_product_url": "https://www.atxwheels.com/catalogsearch/result/index/",
+      "first_title": "Search results for: 'AR-AR1726882'  | American Racing HD",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "4.24"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AR-AR1726882",
+        "status": "success",
+        "product_url": "https://www.atxwheels.com/catalogsearch/result/index/",
+        "title": "Search results for: 'AR-AR1726882'  | American Racing HD",
+        "error": "",
+        "fields_found": "description_html, product_url, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "AR-AR1726882B",
+        "status": "success",
+        "product_url": "https://www.atxwheels.com/catalogsearch/result/index/",
+        "title": "Search results for: 'AR-AR1726882B'  | American Racing HD",
+        "error": "",
+        "fields_found": "description_html, product_url, search_url, source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "ISSPRO",
+      "display_name": "ISSPRO",
+      "search_family": "part_number_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "probed",
+      "search_url_template": "https://isspro.com/Search/PartNoSearch?q={sku}",
+      "tested_skus": "ISS-R8912 | ISSPRO-0107BYOGM",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "ISS-R8912 | ISSPRO-0107BYOGM",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "2.21"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "ISS-R8912",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "ISSPRO-0107BYOGM",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Wilwood Engineering, Inc.",
+      "display_name": "Wilwood Engineering, Inc.",
+      "search_family": "part_number_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://wilwood.com/Search/PartNoSearch?q={sku}",
+      "tested_skus": "WIL-220-9811 | WIL-140-13874-R",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "WIL-220-9811 | WIL-140-13874-R",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "3.39"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "WIL-220-9811",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "WIL-140-13874-R",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "No Limit Fabrication",
+      "display_name": "No Limit Fabrication",
+      "search_family": "partslogic_search_redirect",
+      "interaction_strategy": "results_page_clickthrough",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://nolimitfabrication.com/search.html?q={sku}",
+      "tested_skus": "NL-67OP | NL-67ICP11161",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "NL-67OP | NL-67ICP11161",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "3.63"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "NL-67OP",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "NL-67ICP11161",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "ADS Shocks",
+      "display_name": "ADS Shocks",
+      "search_family": "path_or_query_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.adsshocks.com/search/?q={sku}",
+      "tested_skus": "ADS-100ADS-10084 | ADS-250-F2R45-000",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "ADS-100ADS-10084 | ADS-250-F2R45-000",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "https://www.adsshocks.com/search/?q=ADS-100ADS-10084 (Bot challenge page detected)",
+      "warning_count": "1",
+      "first_warning": "Vendor throttling detected; using safe scrape mode for this run.",
+      "runtime_seconds": "41.15"
+    },
+    "warnings": [
+      "Vendor throttling detected; using safe scrape mode for this run."
+    ],
+    "sku_results": [
+      {
+        "sku": "ADS-100ADS-10084",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "https://www.adsshocks.com/search/?q=ADS-100ADS-10084 (Bot challenge page detected)",
+        "fields_found": ""
+      },
+      {
+        "sku": "ADS-250-F2R45-000",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "https://www.adsshocks.com/search/?q=ADS-250-F2R45-000 (Bot challenge page detected)",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Anvil Off-Road",
+      "display_name": "Anvil Off-Road",
+      "search_family": "path_or_query_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.holley.com/search/?q={sku}",
+      "tested_skus": "AOR-2791AOR | AOR-17011AOR",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "AOR-2791AOR | AOR-17011AOR",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "151.34"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AOR-2791AOR",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "AOR-17011AOR",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Nitrous Express",
+      "display_name": "Nitrous Express",
+      "search_family": "product_search_search_prod",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.nitrousexpress.com/search.asp?search_prod={sku}",
+      "tested_skus": "NX-D1000 | NX-D11110",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "NX-D1000 | NX-D11110",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "8.15"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "NX-D1000",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "NX-D11110",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Snow Performance",
+      "display_name": "Snow Performance",
+      "search_family": "product_search_search_prod",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.nitrousexpress.com/search.asp?search_prod={sku}",
+      "tested_skus": "SP-430 | SP-40016",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "SP-430 | SP-40016",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "7.17"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "SP-430",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "SP-40016",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Expedition One",
+      "display_name": "Expedition One",
+      "search_family": "searchasp_keyword",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.expeditiononestore.com/search.asp?keyword={sku}",
+      "tested_skus": "EXP1-FORDSD-17-FB-PC | EXP1-RAM25/35-19+FB-BARE",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "EXP1-FORDSD-17-FB-PC | EXP1-RAM25/35-19+FB-BARE",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "4.17"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "EXP1-FORDSD-17-FB-PC",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      },
+      {
+        "sku": "EXP1-RAM25/35-19+FB-BARE",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "PMF Suspension",
+      "display_name": "PMF Suspension",
+      "search_family": "searchasp_keyword",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "medium",
+      "verification_level": "verified",
+      "search_url_template": "https://www.pmfsuspension.com/search.asp?keyword={sku}",
+      "tested_skus": "PMF-FRD-5004 | PMF-SD-05PASSTR-XRF",
+      "tested_sku_count": "2",
+      "success_count": "1",
+      "success_ratio": "0.50",
+      "validation_status": "partial",
+      "success_skus": "PMF-FRD-5004",
+      "failed_skus": "PMF-SD-05PASSTR-XRF",
+      "first_product_url": "https://www.pmfsuspension.com/2017-26-Ford-F-250350-HD-Direct-Replacement-Adjustable-Trackbar_p_170.html",
+      "first_title": "2017-26 Ford F-250/350 HD Direct Replacement Adjustable Trac",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "6.39"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "PMF-FRD-5004",
+        "status": "success",
+        "product_url": "https://www.pmfsuspension.com/2017-26-Ford-F-250350-HD-Direct-Replacement-Adjustable-Trackbar_p_170.html",
+        "title": "2017-26 Ford F-250/350 HD Direct Replacement Adjustable Trac",
+        "error": "",
+        "fields_found": "application, core_charge_product_code, description_html, price, product_url, search_provider, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "PMF-SD-05PASSTR-XRF",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "ADDICTIVE DESERT DESIGNS",
+      "display_name": "ADDICTIVE DESERT DESIGNS",
+      "search_family": "shopify_product_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.addictivedesertdesigns.com/search?type=product&options[prefix]=last&q={sku}",
+      "tested_skus": "ADD-AC8101801NA",
+      "tested_sku_count": "1",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "ADD-AC8101801NA",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No SKU-specific product result found from search page.",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "1.73"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "ADD-AC8101801NA",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "No SKU-specific product result found from search page.",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Empire Performance Engineering",
+      "display_name": "Empire Performance Engineering",
+      "search_family": "shopify_product_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://empireperformance.com.au/search?type=product&q={sku}",
+      "tested_skus": "",
+      "tested_sku_count": "0",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "no_samples",
+      "success_skus": "",
+      "failed_skus": "",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "No sample SKUs available",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "0.00"
+    },
+    "sku_results": []
+  },
+  {
+    "detail": {
+      "vendor": "Borgeson",
+      "display_name": "Borgeson",
+      "search_family": "substring_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.borgeson.com/?target=search&mode=search&substring={sku}&including=all",
+      "tested_skus": "BG-800123 | BG-800328",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "BG-800123 | BG-800328",
+      "failed_skus": "",
+      "first_product_url": "https://www.borgeson.com/?target=search&mode=search&substring=BG-800123&including=all",
+      "first_title": "Search > Borgeson Universal Company : BG-800123",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "4.68"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "BG-800123",
+        "status": "success",
+        "product_url": "https://www.borgeson.com/?target=search&mode=search&substring=BG-800123&including=all",
+        "title": "Search > Borgeson Universal Company : BG-800123",
+        "error": "",
+        "fields_found": "application, description_html, source_url, title, vendor"
+      },
+      {
+        "sku": "BG-800328",
+        "status": "success",
+        "product_url": "https://www.borgeson.com/?target=search&mode=search&substring=BG-800328&including=all",
+        "title": "Search > Borgeson Universal Company : BG-800328",
+        "error": "",
+        "fields_found": "application, description_html, source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Fumoto Engineering",
+      "display_name": "Fumoto Engineering",
+      "search_family": "substring_search",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://www.fumotousa.com/?target=search&mode=search&substring={sku}&including=all",
+      "tested_skus": "F-104 | F-106",
+      "tested_sku_count": "2",
+      "success_count": "0",
+      "success_ratio": "0.00",
+      "validation_status": "failed",
+      "success_skus": "",
+      "failed_skus": "F-104 | F-106",
+      "first_product_url": "",
+      "first_title": "",
+      "dominant_error": "https://www.fumotousa.com/?target=search&mode=search&substring=F-104&including=all (Bot challenge page detected)",
+      "warning_count": "1",
+      "first_warning": "Vendor throttling detected; using safe scrape mode for this run.",
+      "runtime_seconds": "103.76"
+    },
+    "warnings": [
+      "Vendor throttling detected; using safe scrape mode for this run."
+    ],
+    "sku_results": [
+      {
+        "sku": "F-104",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "https://www.fumotousa.com/?target=search&mode=search&substring=F-104&including=all (Bot challenge page detected)",
+        "fields_found": ""
+      },
+      {
+        "sku": "F-106",
+        "status": "fail",
+        "product_url": "",
+        "title": "",
+        "error": "https://www.fumotousa.com/?target=search&mode=search&substring=F-106&including=all (Bot challenge page detected)",
+        "fields_found": ""
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "AirDog | PureFlow Technologies",
+      "display_name": "AirDog | PureFlow Technologies",
+      "search_family": "wordpress_s_query",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://airdogdiesel.com/?s={sku}",
+      "tested_skus": "PFT-WS100 | PF-R3SBD100",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "PFT-WS100 | PF-R3SBD100",
+      "failed_skus": "",
+      "first_product_url": "https://airdogdiesel.com/?s=PFT-WS100",
+      "first_title": "\"PFT-WS100\" | AirDog Diesel",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "6.36"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "PFT-WS100",
+        "status": "success",
+        "product_url": "https://airdogdiesel.com/?s=PFT-WS100",
+        "title": "\"PFT-WS100\" | AirDog Diesel",
+        "error": "",
+        "fields_found": "source_url, title, vendor"
+      },
+      {
+        "sku": "PF-R3SBD100",
+        "status": "success",
+        "product_url": "https://airdogdiesel.com/?s=PF-R3SBD100",
+        "title": "\"PF-R3SBD100\" | AirDog Diesel",
+        "error": "",
+        "fields_found": "source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "AMP Research",
+      "display_name": "AMP Research",
+      "search_family": "wordpress_s_query",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first",
+      "blocking_risk": "low",
+      "verification_level": "verified",
+      "search_url_template": "https://ampresearchco.com/?s={sku}",
+      "tested_skus": "AMP-75301-01A | AMP-75146-01A",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "AMP-75301-01A | AMP-75146-01A",
+      "failed_skus": "",
+      "first_product_url": "https://ampresearchco.com/?s=AMP-75301-01A",
+      "first_title": "You searched for AMP-75301-01A - Amp Research",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "3.05"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AMP-75301-01A",
+        "status": "success",
+        "product_url": "https://ampresearchco.com/?s=AMP-75301-01A",
+        "title": "You searched for AMP-75301-01A - Amp Research",
+        "error": "",
+        "fields_found": "source_url, title, vendor"
+      },
+      {
+        "sku": "AMP-75146-01A",
+        "status": "success",
+        "product_url": "https://ampresearchco.com/?s=AMP-75146-01A",
+        "title": "You searched for AMP-75146-01A - Amp Research",
+        "error": "",
+        "fields_found": "source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "Airaid",
+      "display_name": "Airaid",
+      "search_family": "wordpress_search_path",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "medium",
+      "verification_level": "verified",
+      "search_url_template": "https://www.airaid.com/search/{sku}",
+      "tested_skus": "AIR-300-128 | AIR-790-550",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "AIR-300-128 | AIR-790-550",
+      "failed_skus": "",
+      "first_product_url": "https://www.airaid.com/aw_blog/block/render/q/AIR-300-128/",
+      "first_title": "Cool Air Intake Systems & Replacement Air Filters | Airaid",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "41.54"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "AIR-300-128",
+        "status": "success",
+        "product_url": "https://www.airaid.com/aw_blog/block/render/q/AIR-300-128/",
+        "title": "Cool Air Intake Systems & Replacement Air Filters | Airaid",
+        "error": "",
+        "fields_found": "description_html, product_url, search_provider, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "AIR-790-550",
+        "status": "success",
+        "product_url": "https://www.airaid.com/aw_blog/block/render/q/AIR-790-550/",
+        "title": "Cool Air Intake Systems & Replacement Air Filters | Airaid",
+        "error": "",
+        "fields_found": "description_html, product_url, search_provider, search_url, source_url, title, vendor"
+      }
+    ]
+  },
+  {
+    "detail": {
+      "vendor": "K&N Filters",
+      "display_name": "K&N Filters",
+      "search_family": "wordpress_search_path",
+      "interaction_strategy": "",
+      "runtime_preference": "http_first_with_browser_fallback",
+      "blocking_risk": "medium",
+      "verification_level": "verified",
+      "search_url_template": "https://www.knfilters.com/search/{sku}",
+      "tested_skus": "KN-E-0776 | KN-57-1532",
+      "tested_sku_count": "2",
+      "success_count": "2",
+      "success_ratio": "1.00",
+      "validation_status": "validated",
+      "success_skus": "KN-E-0776 | KN-57-1532",
+      "failed_skus": "",
+      "first_product_url": "https://www.knfilters.com/aw_blog/block/render/q/KN-E-0776/",
+      "first_title": "Washable Air Filters, Cabin Filters, Cold Air Kits & Oil Filters | K&N",
+      "dominant_error": "",
+      "warning_count": "0",
+      "first_warning": "",
+      "runtime_seconds": "114.64"
+    },
+    "warnings": [],
+    "sku_results": [
+      {
+        "sku": "KN-E-0776",
+        "status": "success",
+        "product_url": "https://www.knfilters.com/aw_blog/block/render/q/KN-E-0776/",
+        "title": "Washable Air Filters, Cabin Filters, Cold Air Kits & Oil Filters | K&N",
+        "error": "",
+        "fields_found": "description_html, product_url, search_provider, search_url, source_url, title, vendor"
+      },
+      {
+        "sku": "KN-57-1532",
+        "status": "success",
+        "product_url": "https://www.knfilters.com/aw_blog/block/render/q/KN-57-1532/",
+        "title": "Washable Air Filters, Cabin Filters, Cold Air Kits & Oil Filters | K&N",
+        "error": "",
+        "fields_found": "description_html, product_url, search_provider, search_url, source_url, title, vendor"
+      }
+    ]
+  }
+]

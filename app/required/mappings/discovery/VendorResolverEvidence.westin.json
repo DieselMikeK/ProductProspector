@@ -1,0 +1,209 @@
+[
+  {
+    "vendor": "Westin",
+    "display_name": "Westin Automotive Products",
+    "official_website_url": "https://www.westinautomotive.com/",
+    "search_url_template": "https://westinautomotive.com/search?q={sku}",
+    "sample_sku_primary": "WES-21-1315",
+    "validation_sample_skus": "WES-21-1315|WES-19-43995|WES-19-44745",
+    "validation_success_count": 0,
+    "validation_total_count": 3,
+    "validation_summary": "WES-21-1315:search_results(Search results page but SKU not visible in HTML (possible JS-rendered results)) | WES-19-43995:search_results(Search results page but SKU not visible in HTML (possible JS-rendered results)) | WES-19-44745:search_results(Search results page but SKU not visible in HTML (possible JS-rendered results))",
+    "search_recipe_kind": "direct_template_get",
+    "search_submit_status": "review",
+    "dom_search_candidates_found": 0,
+    "dom_search_input_selector": "",
+    "dom_search_input_name": "",
+    "dom_search_input_type": "",
+    "dom_search_input_visible": "",
+    "dom_form_selector": "",
+    "dom_form_action": "",
+    "dom_form_method": "",
+    "dom_submit_selector": "",
+    "primary_request_method": "GET",
+    "primary_request_resource_type": "document",
+    "primary_request_url_template": "https://westinautomotive.com/search?q={sku}",
+    "primary_request_post_data_template": "",
+    "primary_request_status": "0",
+    "primary_request_header_names": "",
+    "primary_request_cookie_header": "",
+    "primary_request_curl": "curl -X GET 'https://westinautomotive.com/search?q=WES-21-1315'",
+    "primary_xhr_method": "",
+    "primary_xhr_url_template": "",
+    "primary_xhr_post_data_template": "",
+    "primary_xhr_status": "",
+    "primary_xhr_header_names": "",
+    "primary_xhr_cookie_header": "",
+    "primary_xhr_curl": "",
+    "all_relevant_xhr_templates": "",
+    "final_url_template": "https://www.westinautomotive.com/",
+    "final_result_kind": "blocked",
+    "api_observed": "no",
+    "hidden_form_observed": "no",
+    "browser_required_observed": "yes",
+    "notes": "No visible search input found",
+    "platform_family": "generic_get_search",
+    "search_family": "generic_q_search",
+    "transport": "GET",
+    "parameter_name": "q",
+    "confidence_bucket": "medium",
+    "resolver_hint": "common_template_probe",
+    "existing_review_notes": "",
+    "dom_candidates": [],
+    "chosen_dom": {},
+    "relevant_requests": [
+      {
+        "url": "https://westinautomotive.com/search?q=WES-21-1315",
+        "method": "GET",
+        "resource_type": "document",
+        "headers": {},
+        "post_data": "",
+        "status": 0,
+        "url_template": "https://westinautomotive.com/search?q={sku}",
+        "post_data_template": "",
+        "synthetic": true
+      },
+      {
+        "url": "https://westinautomotive.com/",
+        "method": "GET",
+        "resource_type": "document",
+        "headers": {
+          ":authority": "westinautomotive.com",
+          ":method": "GET",
+          ":path": "/",
+          ":scheme": "https",
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-encoding": "gzip, deflate, br, zstd",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Not:A-Brand\";v=\"99\", \"HeadlessChrome\";v=\"145\", \"Chromium\";v=\"145\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Windows\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        },
+        "post_data": "",
+        "status": 0,
+        "url_template": "https://westinautomotive.com/",
+        "post_data_template": ""
+      }
+    ],
+    "primary_request_full": {
+      "url": "https://westinautomotive.com/search?q=WES-21-1315",
+      "method": "GET",
+      "resource_type": "document",
+      "headers": {},
+      "post_data": "",
+      "status": 0,
+      "url_template": "https://westinautomotive.com/search?q={sku}",
+      "post_data_template": "",
+      "synthetic": true,
+      "curl": "curl -X GET 'https://westinautomotive.com/search?q=WES-21-1315'"
+    },
+    "primary_xhr_full": {
+      "curl": ""
+    },
+    "context_cookies": [
+      {
+        "name": "Fastly-Session",
+        "value": "EmKlcynZ9EANlBJPcQo4YgMDkQu0evhzC8tx3wzRXucJpBbmDitqXQ8mZ0Hjnlx5lTS1F+/RCTndQEjhq0iucF/osXNAtcSsmWFN09YaOyANAlsEQqLqMIkoxHi4xnUP",
+        "domain": "westinautomotive.com",
+        "path": "/",
+        "expires": 1773030837.745461,
+        "httpOnly": false,
+        "secure": false,
+        "sameSite": "Lax"
+      },
+      {
+        "name": "Fastly-Session",
+        "value": "EmKlcynZ9EANlBJPcQo4YtdeHNiDOW090nXkL1L9xUil6vvVHlAJ5n2dxXpIPJeKY8UtqEjT3zdfwIfNhldGj8EGxJFeGNkMFwhLCfmMXLs1ljkk8XNwGgu74imke5Vw",
+        "domain": "www.westinautomotive.com",
+        "path": "/",
+        "expires": 1773030838.945753,
+        "httpOnly": false,
+        "secure": false,
+        "sameSite": "Lax"
+      },
+      {
+        "name": "_fs_ch_st_FSBmUei20MqUiJb9",
+        "value": "AVnKt_CrD1FoTP8HgCWAxH7d4EdyMCeafLO5Jeeh2X9VmHMfEWbReIhhL2W259KaHOrQO_FcwphF76kwz2dAs3r7ZJS3VRtzhPJ7jAPuiZdlPUznPJAgZbrBU-xOiBAnUXZX5j8BYZOmI5hcHMFjewSwYx3KPc6szuAiHl5wmMh4g684Drh50yMCQICq-uLouqvjId7JcuPv-_8Unb2hEkgM-OloPPyJFwPar-ONXxPBUdx_aQ0dZ5N4MJ4oF-Q_hV57Ljel3xeIcEq44vEoFi4m4e4x9Sa61Z1OU5ZrS9kQMBjsySHyNeDOM5AUWv7-WamXzDL7T5XQPrfEJn_A3emAjJHWpDrU9srVnrxaLiVQjJ4QYkqyg3I3tuklmie5KawkaITdX6jGvo_D",
+        "domain": "www.westinautomotive.com",
+        "path": "/",
+        "expires": 1773029048.94571,
+        "httpOnly": true,
+        "secure": false,
+        "sameSite": "Lax"
+      }
+    ],
+    "validation_results": [
+      {
+        "sku": "WES-21-1315",
+        "probe_url": "https://westinautomotive.com/search?q=WES-21-1315",
+        "final_url": "https://www.westinautomotive.com/search?q=WES-21-1315",
+        "status": 200,
+        "result_kind": "search_results",
+        "success": false,
+        "blocked": false,
+        "notes": "Search results page but SKU not visible in HTML (possible JS-rendered results)"
+      },
+      {
+        "sku": "WES-19-43995",
+        "probe_url": "https://westinautomotive.com/search?q=WES-19-43995",
+        "final_url": "https://www.westinautomotive.com/search?q=WES-19-43995",
+        "status": 200,
+        "result_kind": "search_results",
+        "success": false,
+        "blocked": false,
+        "notes": "Search results page but SKU not visible in HTML (possible JS-rendered results)"
+      },
+      {
+        "sku": "WES-19-44745",
+        "probe_url": "https://westinautomotive.com/search?q=WES-19-44745",
+        "final_url": "https://www.westinautomotive.com/search?q=WES-19-44745",
+        "status": 200,
+        "result_kind": "search_results",
+        "success": false,
+        "blocked": false,
+        "notes": "Search results page but SKU not visible in HTML (possible JS-rendered results)"
+      }
+    ],
+    "machine_recipe": {
+      "entry_url": "https://www.westinautomotive.com/",
+      "search_url_template": "https://westinautomotive.com/search?q={sku}",
+      "recipe_kind": "direct_template_get",
+      "dom": {
+        "input_selector": "",
+        "input_name": "",
+        "form_selector": "",
+        "form_action": "",
+        "form_method": "",
+        "submit_selector": ""
+      },
+      "request": {
+        "method": "GET",
+        "resource_type": "document",
+        "url_template": "https://westinautomotive.com/search?q={sku}",
+        "post_data_template": ""
+      },
+      "xhr": {
+        "method": "",
+        "url_template": "",
+        "post_data_template": ""
+      },
+      "validation_sample_skus": [
+        "WES-21-1315",
+        "WES-19-43995",
+        "WES-19-44745"
+      ],
+      "validation_success_count": 0,
+      "validation_total_count": 3,
+      "final_result_kind": "blocked",
+      "api_observed": "no",
+      "hidden_form_observed": "no",
+      "browser_required_observed": "yes"
+    }
+  }
+]

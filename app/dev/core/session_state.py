@@ -47,6 +47,7 @@ class AppSession:
     vendor_df: pd.DataFrame | None = None
     source_mapping: SourceMapping = field(default_factory=SourceMapping)
     pasted_skus: list[str] = field(default_factory=list)
+    search_terms_by_sku: dict[str, str] = field(default_factory=dict)
     target_product_ids: list[str] = field(default_factory=list)
     target_skus: list[str] = field(default_factory=list)
     missing_fields: list[str] = field(default_factory=list)
@@ -61,6 +62,7 @@ class AppSession:
         self.vendor_df = None
         self.source_mapping = SourceMapping()
         self.pasted_skus = []
+        self.search_terms_by_sku = {}
         self.target_product_ids = []
         self.target_skus = []
         self.missing_fields = []
