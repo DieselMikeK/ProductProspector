@@ -16,6 +16,7 @@ if str(DEV_ROOT) not in sys.path:
 
 import discover_vendor_search_urls as dv
 import fill_vendor_search_urls as fv
+from product_prospector.core.processing import normalize_sku
 
 
 SEARCH_HINT_TOKENS = ("search", "query", "autocomplete", "catalogsearch", "find", "lookup")
@@ -100,7 +101,39 @@ def _load_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _load_sample_map(hints_path: Path, vendor_profiles_path: Path) -> dict[str, list[str]]:
+def _append_unique_sample(samples: list[str], sku: str) -> None:
+    normalized = normalize_sku(sku)
+    if not normalized:
+        return
+    seen = {normalize_sku(item) for item in samples if normalize_sku(item)}
+    if normalized in seen:
+        return
+    samples.append(_clean(sku))
+
+
+def _vendor_name_keys(
+    source_vendor: str,
+    alias_map: dict[str, str],
+    canonical_aliases: dict[str, set[str]],
+) -> set[str]:
+    canonical = alias_map.get(_norm_key(source_vendor), source_vendor)
+    return {
+        key
+        for key in {
+            _norm_key(source_vendor),
+            _norm_key(canonical),
+            *(_norm_key(name) for name in canonical_aliases.get(canonical, set())),
+        }
+        if key
+    }
+
+
+def _load_sample_map(
+    hints_path: Path,
+    vendor_profiles_path: Path,
+    active_samples_path: Path | None = None,
+    interaction_profiles_path: Path | None = None,
+) -> dict[str, list[str]]:
     profiles = dv._load_vendor_profiles(vendor_profiles_path)
     alias_map = dv._build_alias_map(profiles)
     canonical_aliases: dict[str, set[str]] = {}
@@ -112,29 +145,58 @@ def _load_sample_map(hints_path: Path, vendor_profiles_path: Path) -> dict[str, 
                 names.add(text)
 
     output: dict[str, list[str]] = {}
+
+    if active_samples_path is not None and active_samples_path.exists():
+        with active_samples_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                source_vendor = _clean(row.get("vendor") or row.get("display_name"))
+                if not source_vendor:
+                    continue
+                name_keys = _vendor_name_keys(source_vendor, alias_map, canonical_aliases)
+                row_samples: list[str] = []
+                for field in ("active_search_sku_1", "active_search_sku_2", "candidate_search_sku_1", "candidate_search_sku_2"):
+                    _append_unique_sample(row_samples, _clean(row.get(field)))
+                if not row_samples:
+                    continue
+                for key in name_keys:
+                    existing = output.setdefault(key, [])
+                    for sku in row_samples:
+                        _append_unique_sample(existing, sku)
+
+    if interaction_profiles_path is not None and interaction_profiles_path.exists():
+        with interaction_profiles_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                source_vendor = _clean(row.get("vendor") or row.get("display_name"))
+                if not source_vendor:
+                    continue
+                name_keys = _vendor_name_keys(source_vendor, alias_map, canonical_aliases)
+                row_samples: list[str] = []
+                for sku in re.split(r"[|,\n;]+", _clean(row.get("validation_sample_skus"))):
+                    _append_unique_sample(row_samples, sku)
+                if not row_samples:
+                    continue
+                for key in name_keys:
+                    existing = output.setdefault(key, [])
+                    for sku in row_samples:
+                        _append_unique_sample(existing, sku)
+
     with hints_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             source_vendor = _clean(row.get("shopify_vendor"))
             if not source_vendor:
                 continue
-            samples = []
+            samples: list[str] = []
             for field in ("sample_sku_1", "sample_sku_2", "sample_sku_3"):
-                sku = _clean(row.get(field))
-                if sku and sku not in samples:
-                    samples.append(sku)
+                _append_unique_sample(samples, _clean(row.get(field)))
             if not samples:
                 continue
-            canonical = alias_map.get(_norm_key(source_vendor), source_vendor)
-            all_names = {source_vendor, canonical, *canonical_aliases.get(canonical, set())}
-            for name in all_names:
-                key = _norm_key(name)
-                if not key:
-                    continue
+            for key in _vendor_name_keys(source_vendor, alias_map, canonical_aliases):
                 existing = output.setdefault(key, [])
                 for sku in samples:
-                    if sku not in existing:
-                        existing.append(sku)
+                    _append_unique_sample(existing, sku)
     return output
 
 
@@ -937,9 +999,12 @@ def main() -> int:
     parser.add_argument("--resolved", default="app/required/mappings/discovery/VendorDiscoveryResolvedWorklist.csv")
     parser.add_argument("--vendor-profiles", default="app/required/mappings/VendorProfiles.csv")
     parser.add_argument("--sample-hints", default="app/required/mappings/VendorSkuPrefixHints.csv")
+    parser.add_argument("--active-search-samples", default="app/required/mappings/discovery/VendorActiveSearchSamples.csv")
+    parser.add_argument("--interaction-profiles", default="app/required/mappings/discovery/VendorSearchInteractionProfiles.csv")
     parser.add_argument("--csv-output", default="app/required/mappings/discovery/VendorResolverEvidence.csv")
     parser.add_argument("--json-output", default="app/required/mappings/discovery/VendorResolverEvidence.json")
     parser.add_argument("--vendor-filter", default="")
+    parser.add_argument("--family-filter", default="")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--validation-limit", type=int, default=3)
@@ -948,18 +1013,29 @@ def main() -> int:
     resolved_path = Path(args.resolved).expanduser().resolve()
     vendor_profiles_path = Path(args.vendor_profiles).expanduser().resolve()
     sample_hints_path = Path(args.sample_hints).expanduser().resolve()
+    active_search_samples_path = Path(args.active_search_samples).expanduser().resolve()
+    interaction_profiles_path = Path(args.interaction_profiles).expanduser().resolve()
     csv_output_path = Path(args.csv_output).expanduser().resolve()
     json_output_path = Path(args.json_output).expanduser().resolve()
 
     rows = _load_csv(resolved_path)
-    sample_map = _load_sample_map(sample_hints_path, vendor_profiles_path)
+    sample_map = _load_sample_map(
+        sample_hints_path,
+        vendor_profiles_path,
+        active_samples_path=active_search_samples_path,
+        interaction_profiles_path=interaction_profiles_path,
+    )
 
     needle = _clean(args.vendor_filter).lower()
+    family_needle = _clean(args.family_filter).lower()
     targets: list[tuple[dict[str, str], list[str]]] = []
     for row in rows:
         vendor = _clean(row.get("vendor"))
         display_name = _clean(row.get("display_name"))
+        search_family = _clean(row.get("search_family"))
         if needle and needle not in vendor.lower() and needle not in display_name.lower():
+            continue
+        if family_needle and family_needle not in search_family.lower():
             continue
         sample_skus = _sample_skus_for_row(row, sample_map, max(1, args.validation_limit))
         if not sample_skus:

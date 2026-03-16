@@ -625,6 +625,46 @@ def _build_alias_map(profiles: Iterable[VendorProfile]) -> dict[str, str]:
 def _load_vendor_sample_skus(sku_csv_path: Path, alias_map: dict[str, str]) -> dict[str, list[str]]:
     vendor_candidates = ["vendor", "shopify_vendor", "canonical_vendor", "brand_name"]
     sku_candidates = ["sku", "variant_sku"]
+    product_id_candidates = ["product_id", "product_gid", "parent_id"]
+
+    def _extract_numeric_id(value: object) -> str:
+        text = _clean_text(value)
+        if not text:
+            return ""
+        if text.isdigit():
+            return text
+        if "/" in text:
+            tail = text.rsplit("/", 1)[-1].strip()
+            if tail.isdigit():
+                return tail
+        return ""
+
+    def _sample_quality_tuple(value: str) -> tuple[int, int]:
+        text = _clean_text(value)
+        has_alpha = bool(re.search(r"[A-Za-z]", text))
+        has_digit = bool(re.search(r"[0-9]", text))
+        quality = 0
+        if has_alpha and has_digit:
+            quality += 4
+        elif has_digit:
+            quality += 2
+        if 5 <= len(text) <= 24:
+            quality += 2
+        if "-" in text:
+            quality += 1
+        if "/" in text or " " in text:
+            quality -= 1
+        return quality, -len(text)
+
+    def _variant_risk_bucket(product_id: str, sibling_count: int) -> int:
+        if product_id and sibling_count <= 1:
+            return 0
+        if not product_id:
+            return 1
+        return 2
+
+    def _looks_like_suffix_variant(value: str) -> bool:
+        return bool(re.search(r"\d[A-Z]$", _clean_text(value).upper()))
 
     with sku_csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -633,11 +673,12 @@ def _load_vendor_sample_skus(sku_csv_path: Path, alias_map: dict[str, str]) -> d
         fields = [str(field) for field in reader.fieldnames]
         vendor_col = next((field for field in vendor_candidates if field in fields), "")
         sku_col = next((field for field in sku_candidates if field in fields), "")
+        product_id_col = next((field for field in product_id_candidates if field in fields), "")
         if not vendor_col or not sku_col:
             return {}
 
-        output: dict[str, list[str]] = {}
-        seen_by_vendor: dict[str, set[str]] = {}
+        candidates_by_vendor: dict[str, list[tuple[str, str]]] = {}
+        sibling_counts_by_vendor: dict[str, dict[str, int]] = {}
         for row in reader:
             raw_vendor = _clean_text(row.get(vendor_col, ""))
             raw_sku = _clean_text(row.get(sku_col, ""))
@@ -650,6 +691,32 @@ def _load_vendor_sample_skus(sku_csv_path: Path, alias_map: dict[str, str]) -> d
             vendor_key = _norm_key(raw_vendor)
             canonical_vendor = alias_map.get(vendor_key, raw_vendor)
             normalized_sku = _compact_space(raw_sku)
+            product_id = _extract_numeric_id(row.get(product_id_col, "")) if product_id_col else ""
+            candidates_by_vendor.setdefault(canonical_vendor, []).append((normalized_sku, product_id))
+            sibling_counts_by_vendor.setdefault(canonical_vendor, {})
+            if product_id:
+                sibling_counts_by_vendor[canonical_vendor][product_id] = (
+                    sibling_counts_by_vendor[canonical_vendor].get(product_id, 0) + 1
+                )
+
+    output: dict[str, list[str]] = {}
+    seen_by_vendor: dict[str, set[str]] = {}
+    for canonical_vendor, candidates in candidates_by_vendor.items():
+        sibling_counts = sibling_counts_by_vendor.get(canonical_vendor, {})
+
+        def _sort_key(entry: tuple[str, str]) -> tuple[int, int, int, int]:
+            sku_value, product_id = entry
+            quality, negative_length = _sample_quality_tuple(sku_value)
+            sibling_count = sibling_counts.get(product_id, 0)
+            return (
+                _variant_risk_bucket(product_id, sibling_count),
+                1 if _looks_like_suffix_variant(sku_value) else 0,
+                -quality,
+                -negative_length,
+            )
+
+        ordered = sorted(candidates, key=_sort_key)
+        for normalized_sku, _ in ordered:
             output.setdefault(canonical_vendor, [])
             seen_by_vendor.setdefault(canonical_vendor, set())
             dedupe_key = _norm_key(normalized_sku)

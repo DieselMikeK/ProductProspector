@@ -7,7 +7,7 @@ import pandas as pd
 from product_prospector.core.config_store import APP_BASE_DIR
 
 
-CACHE_COLUMNS = ["sku", "product_id", "title", "description", "fitment", "product_type", "vendor", "barcode"]
+CACHE_COLUMNS = ["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
 CACHE_PATH = APP_BASE_DIR / "config" / "shopify_sku_cache.csv"
 
 
@@ -42,6 +42,7 @@ def load_shopify_sku_cache() -> pd.DataFrame:
     df = df[CACHE_COLUMNS].copy()
     df["sku"] = df["sku"].astype(str).str.strip()
     df["product_id"] = df["product_id"].map(_extract_numeric_id)
+    df["variant_id"] = df["variant_id"].map(_extract_numeric_id)
     df = df[df["sku"] != ""].copy()
     df = df.drop_duplicates(subset=["sku"], keep="first")
     return df.reset_index(drop=True)
@@ -57,6 +58,7 @@ def save_shopify_sku_cache(df: pd.DataFrame | None) -> int:
     out = out[CACHE_COLUMNS].copy()
     out["sku"] = out["sku"].astype(str).str.strip()
     out["product_id"] = out["product_id"].map(_extract_numeric_id)
+    out["variant_id"] = out["variant_id"].map(_extract_numeric_id)
     out = out[out["sku"] != ""].copy()
     out = out.drop_duplicates(subset=["sku"], keep="first")
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)

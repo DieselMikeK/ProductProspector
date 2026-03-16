@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -15,6 +16,7 @@ if str(DEV_ROOT) not in sys.path:
 
 import discover_vendor_search_urls as dv
 from product_prospector.core.processing import normalize_sku
+from core.scraper_engine import _apply_search_term_strategy
 from product_prospector.core.scraper_engine import scrape_vendor_records
 
 
@@ -95,8 +97,8 @@ def _load_hint_samples(path: Path, alias_map: dict[str, str]) -> dict[str, list[
     return output
 
 
-def _load_active_search_samples(path: Path, alias_map: dict[str, str]) -> dict[str, list[str]]:
-    output: dict[str, list[str]] = {}
+def _load_active_search_samples(path: Path, alias_map: dict[str, str]) -> dict[str, list[tuple[str, int]]]:
+    output: dict[str, list[tuple[str, int]]] = {}
     if not path.exists():
         return output
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -107,20 +109,107 @@ def _load_active_search_samples(path: Path, alias_map: dict[str, str]) -> dict[s
                 continue
             canonical_vendor = alias_map.get(dv._norm_key(source_vendor), source_vendor)
             values = output.setdefault(canonical_vendor, [])
-            seen = {normalize_sku(value) for value in values if normalize_sku(value)}
-            for field_name in [
-                "active_search_sku_1",
-                "active_search_sku_2",
-                "candidate_search_sku_1",
-                "candidate_search_sku_2",
+            seen = {normalize_sku(value) for value, _ in values if normalize_sku(value)}
+            for field_name, source_priority in [
+                ("active_search_sku_1", 0),
+                ("active_search_sku_2", 0),
+                ("candidate_search_sku_1", 1),
+                ("candidate_search_sku_2", 1),
             ]:
                 sku = _clean(row.get(field_name))
                 normalized = normalize_sku(sku)
                 if not normalized or normalized in seen:
                     continue
                 seen.add(normalized)
-                values.append(sku)
+                values.append((sku, source_priority))
     return output
+
+
+def _load_interaction_validation_samples(path: Path, alias_map: dict[str, str]) -> dict[str, list[tuple[str, int]]]:
+    output: dict[str, list[tuple[str, int]]] = {}
+    if not path.exists():
+        return output
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            source_vendor = _clean(row.get("vendor") or row.get("display_name"))
+            if not source_vendor:
+                continue
+            canonical_vendor = alias_map.get(dv._norm_key(source_vendor), source_vendor)
+            values = output.setdefault(canonical_vendor, [])
+            seen = {normalize_sku(value) for value, _ in values if normalize_sku(value)}
+            for sku in re.split(r"[|,\n;]+", _clean(row.get("validation_sample_skus"))):
+                normalized = normalize_sku(sku)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                values.append((sku.strip(), 0))
+    return output
+
+
+def _load_shopify_cache_context(path: Path, alias_map: dict[str, str]) -> dict[str, dict[str, tuple[str, int]]]:
+    output: dict[str, dict[str, tuple[str, int]]] = {}
+    if not path.exists():
+        return output
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return output
+        fields = [str(field) for field in reader.fieldnames]
+        vendor_col = next((field for field in ["vendor", "shopify_vendor", "canonical_vendor", "brand_name"] if field in fields), "")
+        sku_col = next((field for field in ["sku", "variant_sku"] if field in fields), "")
+        product_col = next((field for field in ["product_id", "product_gid", "parent_id"] if field in fields), "")
+        if not vendor_col or not sku_col:
+            return output
+
+        staged: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        sibling_counts: dict[str, dict[str, int]] = defaultdict(dict)
+        for row in reader:
+            raw_vendor = _clean(row.get(vendor_col))
+            raw_sku = _clean(row.get(sku_col))
+            if not raw_vendor or not raw_sku:
+                continue
+            canonical_vendor = alias_map.get(dv._norm_key(raw_vendor), raw_vendor)
+            normalized_sku = normalize_sku(raw_sku)
+            if not normalized_sku:
+                continue
+            product_id = _clean(row.get(product_col)) if product_col else ""
+            staged[canonical_vendor].append((normalized_sku, product_id))
+            if product_id:
+                sibling_counts[canonical_vendor][product_id] = sibling_counts[canonical_vendor].get(product_id, 0) + 1
+
+    for vendor, entries in staged.items():
+        per_sku: dict[str, tuple[str, int]] = {}
+        for normalized_sku, product_id in entries:
+            sibling_count = sibling_counts.get(vendor, {}).get(product_id, 0)
+            per_sku.setdefault(normalized_sku, (product_id, sibling_count))
+        output[vendor] = per_sku
+    return output
+
+
+def _sample_sort_key(sku: str, source_priority: int, cache_context: dict[str, tuple[str, int]]) -> tuple[int, int, int, int]:
+    normalized = normalize_sku(sku)
+    text = _clean(normalized)
+    quality = 0
+    if any(char.isalpha() for char in text) and any(char.isdigit() for char in text):
+        quality += 4
+    elif any(char.isdigit() for char in text):
+        quality += 2
+    if 5 <= len(text) <= 24:
+        quality += 2
+    if "-" in text:
+        quality += 1
+    if "/" in text or " " in text:
+        quality -= 1
+    product_id, sibling_count = cache_context.get(normalized, ("", 0))
+    if product_id and sibling_count <= 1:
+        variant_risk = 0
+    elif not product_id:
+        variant_risk = 1
+    else:
+        variant_risk = 2
+    suffix_variant = 1 if normalized and normalized[-1:].isalpha() and len(normalized) >= 2 and normalized[-2].isdigit() else 0
+    return (source_priority, variant_risk, suffix_variant, -quality, len(text))
 
 
 def _build_sample_sets(
@@ -133,9 +222,14 @@ def _build_sample_sets(
     profiles = dv._load_vendor_profiles(vendor_profiles_path)
     alias_map = dv._build_alias_map(profiles)
     cache_samples = dv._load_vendor_sample_skus(shopify_cache_path, alias_map)
+    cache_context = _load_shopify_cache_context(shopify_cache_path, alias_map)
     hint_samples = _load_hint_samples(hints_path, alias_map)
     active_search_samples = _load_active_search_samples(
         DEV_ROOT.parent / "required" / "mappings" / "discovery" / "VendorActiveSearchSamples.csv",
+        alias_map,
+    )
+    interaction_validation_samples = _load_interaction_validation_samples(
+        DEV_ROOT.parent / "required" / "mappings" / "discovery" / "VendorSearchInteractionProfiles.csv",
         alias_map,
     )
 
@@ -144,22 +238,31 @@ def _build_sample_sets(
         vendor = _clean(row.get("vendor"))
         display_name = _clean(row.get("display_name"))
         preferred = [_clean(row.get("sample_sku"))]
-        candidates = (
+        candidate_entries: list[tuple[str, int]] = (
             active_search_samples.get(vendor, [])
             + active_search_samples.get(display_name, [])
-            + preferred
-            + hint_samples.get(vendor, [])
-            + hint_samples.get(display_name, [])
-            + cache_samples.get(vendor, [])
-            + cache_samples.get(display_name, [])
+            + interaction_validation_samples.get(vendor, [])
+            + interaction_validation_samples.get(display_name, [])
+            + [(sku, 1) for sku in preferred if _clean(sku)]
+            + [(sku, 1) for sku in hint_samples.get(vendor, [])]
+            + [(sku, 1) for sku in hint_samples.get(display_name, [])]
+            + [(sku, 1) for sku in cache_samples.get(vendor, [])]
+            + [(sku, 1) for sku in cache_samples.get(display_name, [])]
         )
-        chosen: list[str] = []
-        seen: set[str] = set()
-        for sku in candidates:
+        best_by_normalized: dict[str, tuple[str, int]] = {}
+        vendor_context = cache_context.get(vendor) or cache_context.get(display_name) or {}
+        for sku, source_priority in candidate_entries:
             normalized = normalize_sku(sku)
-            if not normalized or normalized in seen:
+            if not normalized:
                 continue
-            seen.add(normalized)
+            existing = best_by_normalized.get(normalized)
+            if existing is None or source_priority < existing[1]:
+                best_by_normalized[normalized] = (sku, source_priority)
+        ranked_candidates = list(best_by_normalized.values())
+        ranked_candidates.sort(key=lambda entry: _sample_sort_key(entry[0], entry[1], vendor_context))
+
+        chosen: list[str] = []
+        for sku, _ in ranked_candidates:
             chosen.append(sku)
             if len(chosen) >= max_samples:
                 break
@@ -268,6 +371,14 @@ def _validate_vendor_runtime(
         }
         return detail, {"detail": detail, "sku_results": []}
 
+    strategy = _clean(row.get("search_term_strategy"))
+    search_terms_by_sku: dict[str, str] = {}
+    if strategy and strategy != "identity":
+        for sku in sample_skus:
+            term = _apply_search_term_strategy(sku, strategy)
+            if term and term != sku:
+                search_terms_by_sku[sku] = term
+
     records, errors, warnings = scrape_vendor_records(
         vendor_search_url=template,
         skus=sample_skus,
@@ -275,6 +386,7 @@ def _validate_vendor_runtime(
         retry_count=max(0, retry_count),
         delay_seconds=max(0.0, delay_seconds),
         scrape_images=False,
+        search_terms_by_sku=search_terms_by_sku if search_terms_by_sku else None,
     )
 
     success_skus: list[str] = []

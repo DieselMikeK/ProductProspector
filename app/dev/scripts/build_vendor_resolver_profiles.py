@@ -170,6 +170,8 @@ def build_profiles(
                 blocking_hint=blocking_hint,
             ),
             "interaction_strategy": _clean(interaction.get("interaction_strategy")),
+            "search_term_strategy": _clean(interaction.get("search_term_strategy")),
+            "search_term_fallbacks": _clean(interaction.get("search_term_fallbacks")),
             "direct_url_sufficient": _clean(interaction.get("direct_url_sufficient")),
             "search_entry_url": _clean(interaction.get("search_entry_url")),
             "search_container_selector": _clean(interaction.get("search_container_selector")),
