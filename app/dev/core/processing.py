@@ -12,6 +12,7 @@ from product_prospector.core.years import apply_year_policy, format_years_compac
 RUN_MODE_UPDATE = "Update Existing"
 RUN_MODE_CREATE = "Create New"
 RUN_MODE_UPSERT = "Upsert"
+RUN_MODE_IMAGE_CAPTURE = "Image Capture"
 
 
 @dataclass

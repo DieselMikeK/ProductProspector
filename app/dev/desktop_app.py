@@ -42,6 +42,7 @@ from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS, Produc
 from product_prospector.core.processing import (
     PlanningConfig,
     RUN_MODE_CREATE,
+    RUN_MODE_IMAGE_CAPTURE,
     RUN_MODE_UPDATE,
     RUN_MODE_UPSERT,
     build_action_plan,
@@ -505,6 +506,11 @@ class ProductProspectorDesktopApp:
         self.update_weight = BooleanVar(value=False)
         self.update_barcode = BooleanVar(value=False)
         self.update_application = BooleanVar(value=False)
+
+        self.image_capture_url = StringVar(value="")
+        self.image_capture_skus_text: tk.Text | None = None
+        self.image_capture_status = StringVar(value="")
+        self.image_capture_inflight = False
 
         self.scrape_search_url = StringVar(value="")
         self._scrape_search_url_auto_value = ""
@@ -1211,6 +1217,12 @@ class ProductProspectorDesktopApp:
             variable=self.run_mode,
             value=RUN_MODE_CREATE,
         ).pack(anchor=W, pady=2)
+        ttk.Radiobutton(
+            self.mode_options_wrap,
+            text="Image Capture",
+            variable=self.run_mode,
+            value=RUN_MODE_IMAGE_CAPTURE,
+        ).pack(anchor=W, pady=2)
 
         self.mode_summary_wrap = ttk.Frame(self.mode_selector_wrap, padding=(0, 10, 0, 0))
         ttk.Label(self.mode_summary_wrap, textvariable=self.run_mode_summary_text, font=("Segoe UI", 13, "bold")).pack(
@@ -1222,6 +1234,22 @@ class ProductProspectorDesktopApp:
         # until a run mode is selected.
         self.setup_workflow_wrap = ttk.Frame(self.setup_inner)
         self.setup_workflow_wrap.pack(fill=X)
+
+        # === Image Capture panel (only visible in Image Capture mode) ===
+        self.image_capture_wrap = ttk.LabelFrame(self.setup_inner, text="Image Capture", padding=12)
+        ic = self.image_capture_wrap
+        ttk.Label(ic, text="Vendor Search URL (with {sku} placeholder or direct product URL):").pack(anchor=W)
+        ttk.Entry(ic, textvariable=self.image_capture_url, width=80).pack(fill=X, pady=(4, 10))
+        ttk.Label(ic, text="SKUs  (one per line, or comma / space separated):").pack(anchor=W)
+        self.image_capture_skus_text = tk.Text(ic, height=6, wrap="word")
+        self.image_capture_skus_text.pack(fill=X, pady=(4, 10))
+        ic_btn_row = ttk.Frame(ic)
+        ic_btn_row.pack(fill=X)
+        self.image_capture_run_btn = ttk.Button(ic_btn_row, text="Run Image Capture", command=self._run_image_capture)
+        self.image_capture_run_btn.pack(side=LEFT)
+        self.image_capture_progress = ttk.Progressbar(ic_btn_row, mode="indeterminate", length=200)
+        self.image_capture_progress.pack(side=LEFT, padx=(12, 0))
+        ttk.Label(ic, textvariable=self.image_capture_status, foreground="#1f4e79", wraplength=600, justify=LEFT).pack(anchor=W, pady=(8, 0))
 
         input_box = ttk.Frame(self.setup_workflow_wrap, padding=8)
         input_box.pack(fill=X, pady=(0, 8))
@@ -1516,7 +1544,13 @@ class ProductProspectorDesktopApp:
     def _set_setup_workflow_visible(self, visible: bool) -> None:
         if not hasattr(self, "setup_workflow_wrap"):
             return
-        if visible:
+        is_image_capture = self.run_mode.get() == RUN_MODE_IMAGE_CAPTURE
+        if hasattr(self, "image_capture_wrap"):
+            if visible and is_image_capture:
+                self.image_capture_wrap.pack(fill=X, pady=(0, 8))
+            else:
+                self.image_capture_wrap.pack_forget()
+        if visible and not is_image_capture:
             if not self.setup_workflow_wrap.winfo_manager():
                 self.setup_workflow_wrap.pack(fill=X)
             return
@@ -5342,6 +5376,15 @@ class ProductProspectorDesktopApp:
             self.load_product_ids_btn.configure(state="disabled")
             self.clear_product_ids_btn.configure(state="disabled")
             self.product_id_text_widget.configure(state="disabled")
+        elif mode == RUN_MODE_IMAGE_CAPTURE:
+            self.session.mode = ""
+            self.image_capture_status.set("")
+            self.mode_help_text.set(
+                "Image Capture: Enter a vendor search URL and SKUs. "
+                "Downloads and resizes product images to 1500×1500 JPEG into a local images/ folder."
+            )
+            self._set_setup_workflow_visible(True)
+            return
         else:
             self.session.mode = ""
             self.mode_help_text.set("Select a valid run mode.")
@@ -6744,6 +6787,70 @@ class ProductProspectorDesktopApp:
         self.setup_status_text.set("Setup saved. All required fields mapped; generating review data now.")
         self.notebook.select(1)
         self._start_processing_clicked(auto_open_review=True)
+
+    def _run_image_capture(self) -> None:
+        if self.image_capture_inflight:
+            return
+        url = self.image_capture_url.get().strip()
+        if not url:
+            messagebox.showwarning(APP_TITLE, "Enter a vendor search URL before running.")
+            return
+        raw_skus = self.image_capture_skus_text.get("1.0", END).strip() if self.image_capture_skus_text else ""
+        skus = [s.strip() for s in re.split(r"[\r\n,;| \t]+", raw_skus) if s.strip()]
+        if not skus:
+            messagebox.showwarning(APP_TITLE, "Enter at least one SKU.")
+            return
+
+        self.image_capture_inflight = True
+        self.image_capture_run_btn.configure(state="disabled")
+        self.image_capture_status.set(f"Capturing images for {len(skus)} SKU(s)…")
+        self.image_capture_progress.start(12)
+
+        output_root = self.runtime_output_root / "images"
+
+        def _worker() -> None:
+            try:
+                from product_prospector.core.scraper_engine import scrape_vendor_records
+                results, sku_errors, general_errors = scrape_vendor_records(
+                    vendor_search_url=url,
+                    skus=skus,
+                    workers=1,
+                    retry_count=2,
+                    delay_seconds=0.35,
+                    scrape_images=True,
+                    image_output_root=output_root,
+                    requested_fields={"media_urls"},
+                    required_root=self.required_root,
+                )
+                total_images = 0
+                for sku in skus:
+                    sku_folder = output_root / sku
+                    if sku_folder.exists():
+                        total_images += sum(1 for f in sku_folder.iterdir() if f.is_file())
+
+                def _done() -> None:
+                    self.image_capture_progress.stop()
+                    self.image_capture_inflight = False
+                    self.image_capture_run_btn.configure(state="normal")
+                    if general_errors or sku_errors:
+                        err_summary = "; ".join(list(sku_errors.values())[:3] + general_errors[:2])
+                        self.image_capture_status.set(
+                            f"Done — {total_images} image(s) saved to {output_root}\nWarnings: {err_summary}"
+                        )
+                    else:
+                        self.image_capture_status.set(
+                            f"Done — {total_images} image(s) saved to {output_root}"
+                        )
+                self.root.after(0, _done)
+            except Exception as exc:
+                def _err() -> None:
+                    self.image_capture_progress.stop()
+                    self.image_capture_inflight = False
+                    self.image_capture_run_btn.configure(state="normal")
+                    self.image_capture_status.set(f"Error: {exc}")
+                self.root.after(0, _err)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _skip_to_review_from_setup(self) -> None:
         if self.processing_inflight or self.shopify_push_inflight:
