@@ -6641,11 +6641,15 @@ class ProductProspectorDesktopApp:
         self._refresh_skip_review_button_state()
 
     def _parse_sku_text(self, raw_text: str) -> list[str]:
-        tokens = re.split(r"[\s,;|]+", raw_text or "")
+        # Preserve internal spaces because many valid SKUs/MPNs use them
+        # (for example Yukon "YG F10.25-411L" or Shopify "YUK-YA G12471486").
+        tokens = re.split(r"[\r\n\t,;|]+", raw_text or "")
         seen: set[str] = set()
         values: list[str] = []
         for token in tokens:
-            sku = normalize_sku(token)
+            cleaned_token = re.sub(r"\([^)]*\)", " ", str(token or ""))
+            cleaned_token = cleaned_token.replace("(", " ").replace(")", " ")
+            sku = normalize_sku(cleaned_token)
             if not sku or sku in seen:
                 continue
             seen.add(sku)
@@ -6653,9 +6657,11 @@ class ProductProspectorDesktopApp:
         return values
 
     def _parse_product_id_text(self, raw_text: str) -> list[str]:
+        cleaned_text = re.sub(r"\([^)]*\)", " ", raw_text or "")
+        cleaned_text = cleaned_text.replace("(", " ").replace(")", " ")
         seen: set[str] = set()
         values: list[str] = []
-        for match in re.finditer(r"\b(\d{8,})\b", raw_text or ""):
+        for match in re.finditer(r"\b(\d{8,})\b", cleaned_text):
             product_id = str(match.group(1) or "").strip()
             if not product_id or product_id in seen:
                 continue

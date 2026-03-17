@@ -50,12 +50,24 @@ _UNRESOLVED_VENDOR_CACHE_ROWS: list[dict[str, str]] = []
 _BROWSER_DETAIL_CACHE_LOCK = threading.Lock()
 _BROWSER_DETAIL_CACHE: dict[str, dict[str, str]] = {}
 _BROWSER_DETAIL_SEMAPHORE = threading.Semaphore(1)
+_BROWSER_DETAIL_SKIP_LOCK = threading.Lock()
+_BROWSER_DETAIL_SKIP_SCOPES: set[str] = set()
 
 
 def _clean_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _normalize_numeric_gtin(value: object) -> str:
+    text = _clean_text(value)
+    if not text or not re.fullmatch(r"[0-9][0-9\s-]{6,24}[0-9]", text):
+        return ""
+    digits = re.sub(r"\D+", "", text)
+    if 8 <= len(digits) <= 14:
+        return digits
+    return ""
 
 
 def _discovery_mapping_path(filename: str) -> Path:
@@ -663,6 +675,21 @@ def _extract_profile_result_candidates(
 
         if _contains_compact_sku(f"{href} {anchor_text}", sku):
             score += 190
+        # Some result pages render the SKU in the surrounding card, not in the
+        # anchor text itself. Prefer those cards before falling back to position.
+        if "results_page_clickthrough" in resolver_hint or "exact_sku_in_result_block" in match_mode:
+            nearby_sku_match = False
+            if path:
+                for path_match in re.finditer(re.escape(path), result_html, flags=re.IGNORECASE):
+                    context_start = max(0, path_match.start() - 900)
+                    context_end = min(len(result_html), path_match.end() + 900)
+                    context_html = result_html[context_start:context_end]
+                    context_text = _clean_text(unescape(re.sub(r"<[^>]+>", " ", context_html)))
+                    if _contains_compact_sku(context_text, sku):
+                        nearby_sku_match = True
+                        break
+            if nearby_sku_match:
+                score += 260
         if "/i-" in path:
             score += 85
         if "/details" in path or "details?id=" in href.lower():
@@ -843,6 +870,30 @@ def _host_key_from_url(url: str) -> str:
         return _clean_text(urllib.parse.urlparse(url).netloc).lower()
     except Exception:
         return ""
+
+
+def _browser_detail_skip_active(scope_key: str) -> bool:
+    key = _clean_text(scope_key)
+    if not key:
+        return False
+    with _BROWSER_DETAIL_SKIP_LOCK:
+        return key in _BROWSER_DETAIL_SKIP_SCOPES
+
+
+def _mark_browser_detail_skip(scope_key: str) -> None:
+    key = _clean_text(scope_key)
+    if not key:
+        return
+    with _BROWSER_DETAIL_SKIP_LOCK:
+        _BROWSER_DETAIL_SKIP_SCOPES.add(key)
+
+
+def _clear_browser_detail_skip(scope_key: str) -> None:
+    key = _clean_text(scope_key)
+    if not key:
+        return
+    with _BROWSER_DETAIL_SKIP_LOCK:
+        _BROWSER_DETAIL_SKIP_SCOPES.discard(key)
 
 
 def _sleep_for_host_backoff(url: str) -> None:
@@ -1284,6 +1335,7 @@ def _fetch_html_with_real_chrome(
     url: str,
     timeout_ms: int = 35000,
     settle_ms: int = 4500,
+    browser_skip_scope: str = "",
 ) -> tuple[str, str, list[tuple[str, str]], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -1298,7 +1350,11 @@ def _fetch_html_with_real_chrome(
     last_error = "Browser detail fetch failed"
 
     with _BROWSER_DETAIL_SEMAPHORE:
+        if _browser_detail_skip_active(browser_skip_scope):
+            return url, "", [], None
         for attempt in range(2):
+            if _browser_detail_skip_active(browser_skip_scope):
+                return url, "", [], None
             _sleep_for_host_backoff(url)
             response_refs: list[object] = []
             try:
@@ -1363,18 +1419,43 @@ def _fetch_html_with_real_chrome(
     return url, "", [], last_error
 
 
+def _is_barcode_only_request(requested_fields: set[str] | list[str] | tuple[str, ...] | None) -> bool:
+    requested = _normalize_requested_scrape_fields(requested_fields)
+    return requested == {"barcode"}
+
+
+def _normalize_xtreme_barcode_payload(
+    product_url: str,
+    payload: dict[str, str],
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+) -> None:
+    if not (_is_xtreme_diesel_url(product_url) and _is_barcode_only_request(requested_fields)):
+        return
+    normalized_barcode = _normalize_numeric_gtin(payload.get("barcode", ""))
+    if normalized_barcode:
+        payload["barcode"] = normalized_barcode
+        return
+    payload.pop("barcode", None)
+
+
 def _should_attempt_xtreme_browser_detail(
     product_url: str,
     payload: dict[str, str],
     requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+    browser_skip_scope: str = "",
 ) -> bool:
     if not _is_xtreme_diesel_url(product_url):
         return False
+
+    requested = _normalize_requested_scrape_fields(requested_fields)
+    barcode_only_request = _is_barcode_only_request(requested)
+    if barcode_only_request and _browser_detail_skip_active(browser_skip_scope):
+        return False
+
     title = _clean_text(payload.get("title", "")).lower()
     if title in {"just a moment...", "verifying your connection..."}:
         return True
 
-    requested = _normalize_requested_scrape_fields(requested_fields)
     if requested is None:
         fields_to_check = {"barcode"}
     else:
@@ -1384,6 +1465,8 @@ def _should_attempt_xtreme_browser_detail(
 
     for field_name in fields_to_check:
         value = _clean_text(payload.get(field_name, ""))
+        if barcode_only_request and field_name == "barcode":
+            value = _normalize_numeric_gtin(value)
         if not value or value.lower() in {"none", "nan", "null"}:
             return True
     return False
@@ -1393,14 +1476,21 @@ def _fetch_xtreme_detail_payload_via_browser(
     product_url: str,
     sku: str,
     scrape_images: bool,
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
+    browser_skip_scope: str = "",
 ) -> tuple[dict[str, str], str | None]:
     cache_key = _clean_text(product_url)
     with _BROWSER_DETAIL_CACHE_LOCK:
         cached = _BROWSER_DETAIL_CACHE.get(cache_key)
         if cached:
             return dict(cached), None
+    if _is_barcode_only_request(requested_fields) and _browser_detail_skip_active(browser_skip_scope):
+        return {}, None
 
-    final_url, html, network_bodies, error = _fetch_html_with_real_chrome(product_url)
+    final_url, html, network_bodies, error = _fetch_html_with_real_chrome(
+        product_url,
+        browser_skip_scope=browser_skip_scope,
+    )
     if error:
         return {}, error
 
@@ -1423,6 +1513,11 @@ def _fetch_xtreme_detail_payload_via_browser(
     if final_url and final_url != product_url:
         merged["product_url"] = final_url
         merged["source_url"] = final_url
+
+    _normalize_xtreme_barcode_payload(product_url, merged, requested_fields)
+    if _is_xtreme_diesel_url(product_url) and _is_barcode_only_request(requested_fields):
+        if not _normalize_numeric_gtin(merged.get("barcode", "")):
+            _mark_browser_detail_skip(browser_skip_scope)
 
     if merged:
         with _BROWSER_DETAIL_CACHE_LOCK:
@@ -4015,7 +4110,7 @@ def _extract_heuristic_barcode(html: str, context: str) -> str:
     for pattern in [
         r'(?is)<li[^>]+wsm-prod-upccode[^>]*>.*?<label>\s*UPC\s*#?:\s*</label>\s*(?:<span[^>]*>)?([^<]+)',
         r'(?is)<label[^>]*>\s*(?:UPC|GTIN|Barcode|EAN)\s*#?:?\s*</label>\s*(?:<span[^>]*>)?([^<]+)',
-        r'(?i)(?:upc|gtin|barcode|ean)\s*#?:?\s*([A-Z0-9][A-Z0-9._/-]{3,})',
+        r'(?i)\b(?:upc|gtin|barcode|ean)\b\s*#?:?\s*([A-Z0-9][A-Z0-9._/-]{3,})',
     ]:
         value = _clean_text(unescape(_extract_first(pattern, html, flags=re.IGNORECASE | re.DOTALL)))
         if value and value.lower() not in {"none", "nan", "null"}:
@@ -4157,6 +4252,7 @@ def _scrape_single_sku(
     image_output_root: Path | None,
     search_term: str = "",
     requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
+    browser_skip_scope: str = "",
 ) -> tuple[str, dict[str, str], str | None]:
     query_value = normalize_sku(search_term) or sku
     target_url = _normalize_url(base_url, query_value)
@@ -4310,15 +4406,19 @@ def _scrape_single_sku(
                 except Exception as exc:
                     merged["extract_error"] = str(exc)
 
+                _normalize_xtreme_barcode_payload(best_candidate_url, merged, requested_fields)
                 if _should_attempt_xtreme_browser_detail(
                     product_url=best_candidate_url,
                     payload=merged,
                     requested_fields=requested_fields,
+                    browser_skip_scope=browser_skip_scope,
                 ):
                     browser_payload, browser_error = _fetch_xtreme_detail_payload_via_browser(
                         product_url=best_candidate_url,
                         sku=query_value,
                         scrape_images=scrape_images,
+                        requested_fields=requested_fields,
+                        browser_skip_scope=browser_skip_scope,
                     )
                     if browser_payload:
                         browser_url = _clean_text(browser_payload.get("product_url", "")) or best_candidate_url
@@ -4339,6 +4439,7 @@ def _scrape_single_sku(
                             value = _clean_text(browser_payload.get(key, ""))
                             if value:
                                 merged[key] = value
+                        _normalize_xtreme_barcode_payload(browser_url, merged, requested_fields)
                         if browser_url and browser_url != best_candidate_url:
                             merged["product_url"] = browser_url
                             merged["source_url"] = browser_url
@@ -4755,6 +4856,10 @@ def scrape_vendor_records(
     max_workers = max(1, workers)
     effective_delay = float(delay_seconds or 0.0)
     normalized_requested_fields = _normalize_requested_scrape_fields(requested_fields)
+    browser_skip_scope = ""
+    if _is_xtreme_diesel_url(vendor_search_url) and _is_barcode_only_request(normalized_requested_fields):
+        browser_skip_scope = f"xdp-barcode:{time.time_ns()}"
+        _clear_browser_detail_skip(browser_skip_scope)
     effective_scrape_images = bool(
         scrape_images and (normalized_requested_fields is None or "media_urls" in normalized_requested_fields)
     )
@@ -4799,80 +4904,85 @@ def scrape_vendor_records(
         except Exception:
             output_root = None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                _scrape_single_sku,
-                sku=sku,
-                base_url=vendor_search_url,
-                resolver_profile=resolver_profile,
-                retry_count=retry_count,
-                delay_seconds=effective_delay,
-                scrape_images=effective_scrape_images,
-                image_output_root=output_root,
-                search_term=search_term_lookup.get(sku, sku),
-                requested_fields=normalized_requested_fields,
-            )
-            for sku in ordered_skus
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                sku, payload, error = future.result()
-            except Exception as exc:
-                general_errors.append(str(exc))
-                continue
-            if payload:
-                results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
-            if error:
-                sku_errors[sku] = error
-
-    rate_limited_skus = [
-        sku for sku, error_text in list(sku_errors.items()) if _is_rate_limit_error(error_text)
-    ]
-    if rate_limited_skus:
-        heavy_rate_limit = len(rate_limited_skus) >= 5
-        retry_delay = max(effective_delay, 0.95 if heavy_rate_limit else 0.65)
-        # Keep fallback bounded and fast: do one clean retry pass per SKU.
-        retry_count_adaptive = 0
-        if heavy_rate_limit:
-            # Give aggressive anti-bot systems a brief cool-down window before
-            # retrying sequentially.
-            time.sleep(1.35)
-        fallback_start = time.monotonic()
-        max_fallback_seconds = min(45.0, max(15.0, float(len(rate_limited_skus)) * 2.5))
-        recovered = 0
-        still_rate_limited = 0
-        for sku in rate_limited_skus:
-            if (time.monotonic() - fallback_start) >= max_fallback_seconds:
-                general_errors.append(
-                    f"Stopped rate-limit recovery early after {max_fallback_seconds:.0f}s to keep runtime bounded."
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _scrape_single_sku,
+                    sku=sku,
+                    base_url=vendor_search_url,
+                    resolver_profile=resolver_profile,
+                    retry_count=retry_count,
+                    delay_seconds=effective_delay,
+                    scrape_images=effective_scrape_images,
+                    image_output_root=output_root,
+                    search_term=search_term_lookup.get(sku, sku),
+                    requested_fields=normalized_requested_fields,
+                    browser_skip_scope=browser_skip_scope,
                 )
-                break
-            _, payload, error = _scrape_single_sku(
-                sku=sku,
-                base_url=vendor_search_url,
-                resolver_profile=resolver_profile,
-                retry_count=retry_count_adaptive,
-                delay_seconds=retry_delay,
-                scrape_images=effective_scrape_images,
-                image_output_root=output_root,
-                search_term=search_term_lookup.get(sku, sku),
-                requested_fields=normalized_requested_fields,
-            )
-            if payload:
-                results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
-                sku_errors.pop(sku, None)
-                recovered += 1
-                continue
-            if error:
-                sku_errors[sku] = error
-                if _is_rate_limit_error(error):
-                    still_rate_limited += 1
-        if recovered > 0:
-            general_errors.append(f"Recovered {recovered} SKU(s) after temporary rate limits.")
-        if still_rate_limited > 0:
-            general_errors.append(
-                f"{still_rate_limited} SKU(s) remain rate-limited. Try workers=1 and delay>=1.0 for this vendor."
-            )
+                for sku in ordered_skus
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    sku, payload, error = future.result()
+                except Exception as exc:
+                    general_errors.append(str(exc))
+                    continue
+                if payload:
+                    results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
+                if error:
+                    sku_errors[sku] = error
 
-    return results, sku_errors, general_errors
+        rate_limited_skus = [
+            sku for sku, error_text in list(sku_errors.items()) if _is_rate_limit_error(error_text)
+        ]
+        if rate_limited_skus:
+            heavy_rate_limit = len(rate_limited_skus) >= 5
+            retry_delay = max(effective_delay, 0.95 if heavy_rate_limit else 0.65)
+            # Keep fallback bounded and fast: do one clean retry pass per SKU.
+            retry_count_adaptive = 0
+            if heavy_rate_limit:
+                # Give aggressive anti-bot systems a brief cool-down window before
+                # retrying sequentially.
+                time.sleep(1.35)
+            fallback_start = time.monotonic()
+            max_fallback_seconds = min(45.0, max(15.0, float(len(rate_limited_skus)) * 2.5))
+            recovered = 0
+            still_rate_limited = 0
+            for sku in rate_limited_skus:
+                if (time.monotonic() - fallback_start) >= max_fallback_seconds:
+                    general_errors.append(
+                        f"Stopped rate-limit recovery early after {max_fallback_seconds:.0f}s to keep runtime bounded."
+                    )
+                    break
+                _, payload, error = _scrape_single_sku(
+                    sku=sku,
+                    base_url=vendor_search_url,
+                    resolver_profile=resolver_profile,
+                    retry_count=retry_count_adaptive,
+                    delay_seconds=retry_delay,
+                    scrape_images=effective_scrape_images,
+                    image_output_root=output_root,
+                    search_term=search_term_lookup.get(sku, sku),
+                    requested_fields=normalized_requested_fields,
+                    browser_skip_scope=browser_skip_scope,
+                )
+                if payload:
+                    results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
+                    sku_errors.pop(sku, None)
+                    recovered += 1
+                    continue
+                if error:
+                    sku_errors[sku] = error
+                    if _is_rate_limit_error(error):
+                        still_rate_limited += 1
+            if recovered > 0:
+                general_errors.append(f"Recovered {recovered} SKU(s) after temporary rate limits.")
+            if still_rate_limited > 0:
+                general_errors.append(
+                    f"{still_rate_limited} SKU(s) remain rate-limited. Try workers=1 and delay>=1.0 for this vendor."
+                )
+
+        return results, sku_errors, general_errors
+    finally:
+        _clear_browser_detail_skip(browser_skip_scope)
