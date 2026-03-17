@@ -19,6 +19,7 @@ from validate_runtime_by_family import _build_sample_sets, _clean, _load_csv, _s
 from product_prospector.core.blog_tagging import is_valid_product_tag, load_tag_catalog, suggest_tags_for_product
 from product_prospector.core.normalization import normalize_product
 from product_prospector.core.processing import normalize_sku
+from core.scraper_engine import _apply_search_term_strategy
 from product_prospector.core.scraper_engine import scrape_vendor_records
 from product_prospector.core.session_state import AppSession, MODE_NEW
 from product_prospector.core.shopify_collections import resolve_collection_assignments
@@ -99,6 +100,43 @@ def _write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) ->
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _merge_csv_rows(
+    existing_rows: list[dict[str, str]],
+    replacement_rows: list[dict[str, str]],
+    *,
+    key_fields: tuple[str, ...],
+) -> list[dict[str, str]]:
+    replacement_keys = {
+        tuple(_clean(row.get(field)) for field in key_fields)
+        for row in replacement_rows
+    }
+    merged = [
+        row
+        for row in existing_rows
+        if tuple(_clean(row.get(field)) for field in key_fields) not in replacement_keys
+    ]
+    merged.extend(replacement_rows)
+    return merged
+
+
+def _merge_json_rows(
+    existing_rows: list[dict[str, object]],
+    replacement_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    replacement_vendors = {
+        _clean((row.get("summary") or {}).get("vendor"))
+        for row in replacement_rows
+        if _clean((row.get("summary") or {}).get("vendor"))
+    }
+    merged = [
+        row
+        for row in existing_rows
+        if _clean((row.get("summary") or {}).get("vendor")) not in replacement_vendors
+    ]
+    merged.extend(replacement_rows)
+    return merged
 
 
 def _collection_titles_text_from_targets(targets: list[dict]) -> str:
@@ -290,6 +328,14 @@ def _run_end_to_end_vendor(
     )
     vendor_image_root = runtime_output_root / "images" / re.sub(r"[^A-Za-z0-9._-]+", "_", vendor or display_name or "vendor")
 
+    strategy = _clean(row.get("search_term_strategy"))
+    search_terms_by_sku: dict[str, str] = {}
+    if strategy and strategy != "identity":
+        for sku in session.target_skus:
+            term = _apply_search_term_strategy(sku, strategy)
+            if term and term != sku:
+                search_terms_by_sku[sku] = term
+
     scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
         vendor_search_url=session.scrape_settings.vendor_search_url,
         skus=session.target_skus,
@@ -298,6 +344,7 @@ def _run_end_to_end_vendor(
         delay_seconds=session.scrape_settings.delay_seconds,
         scrape_images=session.scrape_settings.scrape_images,
         image_output_root=vendor_image_root,
+        search_terms_by_sku=search_terms_by_sku if search_terms_by_sku else None,
     )
 
     products, _build_stats = build_products_from_session(
@@ -507,7 +554,17 @@ def main() -> None:
     parser.add_argument("--retry-count", type=int, default=2)
     parser.add_argument("--delay-seconds", type=float, default=0.35)
     parser.add_argument("--family-filter", default="")
+    parser.add_argument(
+        "--vendors",
+        default="",
+        help="Optional pipe/comma/newline-separated vendor names to validate directly.",
+    )
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--merge-existing",
+        action="store_true",
+        help="When set, replace only the targeted vendors inside existing summary/detail/json outputs.",
+    )
     parser.add_argument("--skip-image-downloads", action="store_true")
     args = parser.parse_args()
 
@@ -522,11 +579,25 @@ def main() -> None:
     required_root = DEV_ROOT.parent / "required"
 
     rows = _load_csv(profiles_input)
-    selected_rows = _select_rows_by_family(
-        rows=rows,
-        vendors_per_family=max(1, int(args.vendors_per_family)),
-        family_filter=args.family_filter,
-    )
+    explicit_vendors = {
+        _clean(value).lower()
+        for value in re.split(r"[|,\n;]+", str(args.vendors or ""))
+        if _clean(value)
+    }
+    if explicit_vendors:
+        selected_rows = [
+            row
+            for row in rows
+            if _clean(row.get("vendor")).lower() in explicit_vendors
+            or _clean(row.get("display_name")).lower() in explicit_vendors
+        ]
+        selected_rows = sorted(selected_rows, key=lambda item: _clean(item.get("vendor")).lower())
+    else:
+        selected_rows = _select_rows_by_family(
+            rows=rows,
+            vendors_per_family=max(1, int(args.vendors_per_family)),
+            family_filter=args.family_filter,
+        )
     if args.limit and args.limit > 0:
         selected_rows = selected_rows[: int(args.limit)]
 
@@ -574,6 +645,30 @@ def main() -> None:
     summary_rows.sort(key=lambda item: (_clean(item.get("search_family")), _clean(item.get("vendor")).lower()))
     detail_rows.sort(key=lambda item: (_clean(item.get("search_family")), _clean(item.get("vendor")).lower(), _clean(item.get("sku"))))
     json_rows.sort(key=lambda item: (_clean(item.get("summary", {}).get("search_family")), _clean(item.get("summary", {}).get("vendor")).lower()))
+
+    if args.merge_existing:
+        if summary_output.exists():
+            summary_rows = _merge_csv_rows(
+                _load_csv(summary_output),
+                summary_rows,
+                key_fields=("vendor",),
+            )
+            summary_rows.sort(key=lambda item: (_clean(item.get("search_family")), _clean(item.get("vendor")).lower()))
+        if detail_output.exists():
+            detail_rows = _merge_csv_rows(
+                _load_csv(detail_output),
+                detail_rows,
+                key_fields=("vendor",),
+            )
+            detail_rows.sort(key=lambda item: (_clean(item.get("search_family")), _clean(item.get("vendor")).lower(), _clean(item.get("sku"))))
+        if json_output.exists():
+            try:
+                existing_json_rows = json.loads(json_output.read_text(encoding="utf-8"))
+            except Exception:
+                existing_json_rows = []
+            if isinstance(existing_json_rows, list):
+                json_rows = _merge_json_rows(existing_json_rows, json_rows)
+                json_rows.sort(key=lambda item: (_clean(item.get("summary", {}).get("search_family")), _clean(item.get("summary", {}).get("vendor")).lower()))
 
     _write_csv(summary_output, summary_rows, SUMMARY_FIELDS)
     _write_csv(detail_output, detail_rows, DETAIL_FIELDS)

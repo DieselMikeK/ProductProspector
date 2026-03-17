@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import csv
+from dataclasses import replace
 import http.cookiejar
 import hashlib
 import gzip
@@ -50,8 +51,6 @@ _UNRESOLVED_VENDOR_CACHE_ROWS: list[dict[str, str]] = []
 _BROWSER_DETAIL_CACHE_LOCK = threading.Lock()
 _BROWSER_DETAIL_CACHE: dict[str, dict[str, str]] = {}
 _BROWSER_DETAIL_SEMAPHORE = threading.Semaphore(1)
-_BROWSER_DETAIL_SKIP_LOCK = threading.Lock()
-_BROWSER_DETAIL_SKIP_SCOPES: set[str] = set()
 
 
 def _clean_text(value: object) -> str:
@@ -60,18 +59,22 @@ def _clean_text(value: object) -> str:
     return str(value).strip()
 
 
-def _normalize_numeric_gtin(value: object) -> str:
-    text = _clean_text(value)
-    if not text or not re.fullmatch(r"[0-9][0-9\s-]{6,24}[0-9]", text):
-        return ""
-    digits = re.sub(r"\D+", "", text)
-    if 8 <= len(digits) <= 14:
-        return digits
-    return ""
+def _sanitize_barcode(value: str) -> str:
+    """Return the barcode only if it is a purely numeric string of 11+ digits (UPC/EAN/GTIN)."""
+    digits = re.sub(r"\D", "", str(value).strip())
+    return digits if len(digits) >= 11 else ""
 
 
 def _discovery_mapping_path(filename: str) -> Path:
     return Path(__file__).resolve().parents[2] / "required" / "mappings" / "discovery" / filename
+
+
+def _browser_session_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "config" / "browser_sessions"
+
+
+def _browser_profile_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "config" / "browser_profiles"
 
 
 def _normalize_vendor_match_host(value: object) -> str:
@@ -185,6 +188,83 @@ def _render_profile_template(template: str, **values: str) -> str:
             flags=re.IGNORECASE,
         )
     return rendered
+
+
+def _split_pipe_tokens(value: object) -> list[str]:
+    return [token for token in (_clean_text(part) for part in str(value or "").split("|")) if token]
+
+
+def _apply_search_term_step(term: str, step: str) -> str:
+    value = normalize_sku(term)
+    action = _clean_text(step).lower()
+    if not value or not action or action == "identity":
+        return value
+    if action == "drop_first_dash_token":
+        if "-" in value:
+            return normalize_sku(value.split("-", 1)[1])
+        return value
+    if action == "drop_last_dash_segment":
+        if "-" in value:
+            return normalize_sku(value.rsplit("-", 1)[0])
+        return value
+    if action == "numeric_only":
+        digits = "".join(ch for ch in value if ch.isdigit())
+        return normalize_sku(digits)
+    if action == "trim_last_char":
+        return normalize_sku(value[:-1])
+    if action == "trim_last_2_chars":
+        return normalize_sku(value[:-2])
+    if action == "trim_last_3_chars":
+        return normalize_sku(value[:-3])
+    if action == "drop_restock_suffix":
+        trimmed = re.sub(r"(?i)\s+RESTOCK[-_ ]*[A-Z0-9]+$", "", value).strip()
+        return normalize_sku(trimmed or value)
+    return value
+
+
+def _apply_search_term_strategy(term: str, strategy: str) -> str:
+    value = normalize_sku(term)
+    if not value:
+        return ""
+    steps = [step for step in (_clean_text(part) for part in _clean_text(strategy).split(">")) if step]
+    if not steps:
+        return value
+    for step in steps:
+        value = _apply_search_term_step(value, step)
+        if not value:
+            return ""
+    return value
+
+
+def _query_candidates_for_profile(
+    sku: str,
+    search_term: str,
+    profile: VendorResolverProfile | None,
+) -> list[str]:
+    base_term = normalize_sku(search_term) or normalize_sku(sku)
+    if not base_term:
+        return []
+
+    if profile is None:
+        return [base_term]
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    strategies = [_clean_text(profile.search_term_strategy)] + _split_pipe_tokens(profile.search_term_fallbacks)
+    if not any(strategies):
+        strategies = ["identity"]
+
+    for strategy in strategies:
+        candidate = _apply_search_term_strategy(base_term, strategy or "identity")
+        normalized = normalize_sku(candidate)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    if base_term not in seen:
+        candidates.append(base_term)
+    return candidates
 
 
 def _extract_nested_value(obj: object, dotted_path: str) -> object:
@@ -462,14 +542,14 @@ def _payload_from_alliant_product(
     if vendor:
         output["vendor"] = vendor
 
-    barcode = _extract_spec_value(
+    barcode = _sanitize_barcode(_extract_spec_value(
         merged_product.get("specifications"),
         "Item UPC/EAN Number",
         "UPC",
         "EAN",
         "GTIN",
         "Barcode",
-    )
+    ))
     if barcode:
         output["barcode"] = barcode
 
@@ -629,6 +709,32 @@ def _extract_selector_href_hint(selector: str) -> tuple[str, str]:
     return "", ""
 
 
+def _candidate_url_match_text(url: str) -> str:
+    parsed = urllib.parse.urlparse(_clean_text(url))
+    parts = [parsed.path, parsed.fragment]
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        lower = _clean_text(key).lower()
+        if lower in {
+            "sku",
+            "part",
+            "partno",
+            "part_no",
+            "partnumber",
+            "part_number",
+            "pn",
+            "mpn",
+            "model",
+            "modelno",
+            "item",
+            "itemno",
+            "product_sku",
+            "productsku",
+            "variant_sku",
+        }:
+            parts.extend([key, value])
+    return " ".join(_clean_text(part) for part in parts if _clean_text(part))
+
+
 def _extract_profile_result_candidates(
     html: str,
     page_url: str,
@@ -649,6 +755,7 @@ def _extract_profile_result_candidates(
                 break
 
     scored: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
     anchor_candidates = _extract_anchor_link_candidates(result_html, page_url=page_url)
     for position, (href, anchor_text) in enumerate(anchor_candidates, start=1):
         if not _same_host_family(href, page_url=page_url):
@@ -673,23 +780,8 @@ def _extract_profile_result_candidates(
                     continue
                 score += 130
 
-        if _contains_compact_sku(f"{href} {anchor_text}", sku):
+        if _contains_compact_sku(f"{_candidate_url_match_text(href)} {anchor_text}", sku):
             score += 190
-        # Some result pages render the SKU in the surrounding card, not in the
-        # anchor text itself. Prefer those cards before falling back to position.
-        if "results_page_clickthrough" in resolver_hint or "exact_sku_in_result_block" in match_mode:
-            nearby_sku_match = False
-            if path:
-                for path_match in re.finditer(re.escape(path), result_html, flags=re.IGNORECASE):
-                    context_start = max(0, path_match.start() - 900)
-                    context_end = min(len(result_html), path_match.end() + 900)
-                    context_html = result_html[context_start:context_end]
-                    context_text = _clean_text(unescape(re.sub(r"<[^>]+>", " ", context_html)))
-                    if _contains_compact_sku(context_text, sku):
-                        nearby_sku_match = True
-                        break
-            if nearby_sku_match:
-                score += 260
         if "/i-" in path:
             score += 85
         if "/details" in path or "details?id=" in href.lower():
@@ -703,11 +795,12 @@ def _extract_profile_result_candidates(
 
         if score <= 0:
             continue
+        first_seen.setdefault(href, position)
         existing = scored.get(href, -1)
         if score > existing:
             scored[href] = score
 
-    return sorted(scored.items(), key=lambda item: (-item[1], len(item[0])))
+    return sorted(scored.items(), key=lambda item: (-item[1], first_seen.get(item[0], 10**9), len(item[0])))
 
 
 def _scrape_single_sku_via_json_api_id_detail(
@@ -758,6 +851,437 @@ def _scrape_single_sku_via_json_api_id_detail(
     return sku, merged, None
 
 
+def _default_shopify_suggest_api_template(profile: VendorResolverProfile, base_url: str = "") -> str:
+    base_value = (
+        _clean_text(profile.search_entry_url)
+        or _clean_text(profile.official_website_url)
+        or _clean_text(base_url)
+    )
+    if not base_value:
+        return ""
+    parsed = urllib.parse.urlparse(base_value if "://" in base_value else f"https://{base_value.lstrip('/')}")
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return (
+        f"{origin}/search/suggest.json"
+        "?q={sku}"
+        "&resources[type]=product,page,article,collection"
+        "&resources[limit]=10"
+        "&resources[options][unavailable_products]=hide"
+        "&resources[options][fields]=title,author,body,product_type,tag,variants.sku,variants.title,vendor"
+    )
+
+
+def _fetch_json_url(url: str, timeout: int = 30) -> tuple[object | None, str | None]:
+    body, error = _fetch_html(url, timeout=timeout)
+    if error:
+        return None, error
+    try:
+        return json.loads(_clean_text(body)), None
+    except Exception as exc:
+        return None, f"Invalid JSON response: {exc}"
+
+
+def _shopify_suggest_products_from_payload(payload: object) -> list[dict]:
+    products = _extract_nested_value(payload, "resources.results.products")
+    if isinstance(products, list):
+        return [item for item in products if isinstance(item, dict)]
+    return []
+
+
+def _shopify_match_text_from_url(value: object) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(text)
+        path = _clean_text(parsed.path)
+        if path:
+            return path
+    except Exception:
+        pass
+    return text
+
+
+def _shopify_suggest_product_match_text(product: dict[str, object]) -> str:
+    values: list[str] = []
+
+    for field_name in ["title", "body", "vendor", "type", "handle"]:
+        value = _clean_text(product.get(field_name, ""))
+        if value:
+            values.append(value)
+
+    for field_name in ["url", "product_url", "productUrl", "href", "link", "image"]:
+        value = _shopify_match_text_from_url(product.get(field_name, ""))
+        if value:
+            values.append(value)
+
+    featured_image = product.get("featured_image")
+    if isinstance(featured_image, dict):
+        for field_name in ["url", "alt"]:
+            value = _clean_text(featured_image.get(field_name, ""))
+            if not value:
+                continue
+            if field_name == "url":
+                value = _shopify_match_text_from_url(value)
+            values.append(value)
+
+    for tag in product.get("tags") or []:
+        value = _clean_text(tag)
+        if value:
+            values.append(value)
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for item in variants:
+            if not isinstance(item, dict):
+                continue
+            for field_name in ["sku", "title", "name", "barcode", "id"]:
+                value = _clean_text(item.get(field_name, ""))
+                if value:
+                    values.append(value)
+            for field_name in ["url", "product_url", "productUrl", "href", "link", "featured_image"]:
+                value = _shopify_match_text_from_url(item.get(field_name, ""))
+                if value:
+                    values.append(value)
+    return " ".join(values)
+
+
+def _shopify_suggest_has_match_evidence(product: dict[str, object], *, sku: str, query_value: str) -> bool:
+    match_text = _shopify_suggest_product_match_text(product)
+    if _contains_compact_sku(match_text, sku):
+        return True
+    return bool(query_value and query_value != sku and _contains_compact_sku(match_text, query_value))
+
+
+def _canonicalize_product_url(url: str) -> str:
+    text = _clean_text(url)
+    if not text:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except Exception:
+        return text
+    return urllib.parse.urlunparse(parsed._replace(query="", fragment=""))
+
+
+def _shopify_product_json_url(product_url: str) -> str:
+    canonical_url = _canonicalize_product_url(product_url)
+    if not canonical_url:
+        return ""
+    parsed = urllib.parse.urlparse(canonical_url)
+    path = _clean_text(parsed.path)
+    if not path:
+        return ""
+    if not path.endswith(".js"):
+        path = f"{path.rstrip('/')}.js"
+    return urllib.parse.urlunparse(parsed._replace(path=path, query="", fragment=""))
+
+
+def _build_shopify_product_json_seed_payload(product: object, page_url: str) -> dict[str, str]:
+    if not isinstance(product, dict):
+        return {}
+
+    payload: dict[str, str] = {}
+    for field_name, output_field in [
+        ("title", "title"),
+        ("description", "description_html"),
+        ("vendor", "vendor"),
+        ("type", "type"),
+    ]:
+        value = _clean_text(product.get(field_name, ""))
+        if value:
+            payload[output_field] = value
+
+    for field_name in ["price", "price_min", "price_max"]:
+        value = _clean_text(product.get(field_name, ""))
+        if value:
+            payload["price"] = value
+            break
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for item in variants:
+            if not isinstance(item, dict):
+                continue
+            barcode = _sanitize_barcode(_clean_text(item.get("barcode", "")))
+            if barcode:
+                payload["barcode"] = barcode
+                break
+
+    media_values: list[str] = []
+    for field_name in ["featured_image"]:
+        value = _clean_text(product.get(field_name, ""))
+        if value:
+            media_values.append(value)
+    for value in product.get("images") or []:
+        text = _clean_text(value)
+        if text:
+            media_values.append(text)
+    featured_media = product.get("featured_media")
+    if isinstance(featured_media, dict):
+        preview = featured_media.get("preview_image")
+        if isinstance(preview, dict):
+            value = _clean_text(preview.get("src", ""))
+            if value:
+                media_values.append(value)
+    if media_values:
+        normalized_media = _normalize_media_values(media_values, page_url=page_url)
+        if normalized_media:
+            payload["media_urls"] = " | ".join(normalized_media)
+    return payload
+
+
+def _shopify_product_has_match_evidence(
+    *,
+    canonical_product_url: str,
+    product_html: str,
+    product_json: object,
+    seed_payload: dict[str, str] | None,
+    sku: str,
+    query_value: str,
+) -> bool:
+    evidence_chunks: list[str] = []
+    canonical_path = _shopify_match_text_from_url(canonical_product_url)
+    if canonical_path:
+        evidence_chunks.append(canonical_path)
+    if product_html:
+        evidence_chunks.append(product_html)
+    if product_json is not None:
+        try:
+            evidence_chunks.append(json.dumps(product_json, ensure_ascii=True))
+        except Exception:
+            pass
+    if seed_payload:
+        evidence_chunks.extend(_clean_text(value) for value in seed_payload.values() if _clean_text(value))
+
+    for term in [normalize_sku(sku), normalize_sku(query_value)]:
+        if not term:
+            continue
+        if any(_contains_compact_sku(chunk, term) for chunk in evidence_chunks if chunk):
+            return True
+    return False
+
+
+def _score_shopify_suggest_product(
+    product: dict[str, object],
+    *,
+    sku: str,
+    query_value: str,
+    position: int,
+) -> int:
+    text = _shopify_suggest_product_match_text(product)
+    score = max(0, 48 - min(max(position, 1), 10) * 6)
+
+    if _contains_compact_sku(text, sku):
+        score += 260
+    if query_value and query_value != sku and _contains_compact_sku(text, query_value):
+        score += 180
+
+    title = _clean_text(product.get("title", ""))
+    product_url = _shopify_match_text_from_url(product.get("url", ""))
+    if _contains_compact_sku(title, sku):
+        score += 120
+    if query_value and query_value != sku and _contains_compact_sku(title, query_value):
+        score += 100
+    if _contains_compact_sku(product_url, sku):
+        score += 90
+    if query_value and query_value != sku and _contains_compact_sku(product_url, query_value):
+        score += 90
+
+    if bool(product.get("available")):
+        score += 18
+    if _clean_text(product.get("vendor", "")):
+        score += 8
+    if _clean_text(product.get("image", "")) or isinstance(product.get("featured_image"), dict):
+        score += 8
+    return score
+
+
+def _candidate_url_from_shopify_suggest_product(product: dict[str, object], base_url: str) -> str:
+    for field_name in ["url", "product_url", "productUrl", "href", "link"]:
+        value = _clean_text(product.get(field_name, ""))
+        if not value:
+            continue
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        if base_url:
+            return urllib.parse.urljoin(base_url, value)
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        for item in variants:
+            if not isinstance(item, dict):
+                continue
+            value = _clean_text(item.get("url", ""))
+            if not value:
+                continue
+            if value.startswith("http://") or value.startswith("https://"):
+                return value
+            if base_url:
+                return urllib.parse.urljoin(base_url, value)
+    return ""
+
+
+def _build_shopify_suggest_seed_payload(product: dict[str, object], page_url: str) -> dict[str, str]:
+    payload: dict[str, str] = {"search_provider": "shopify_suggest_json"}
+
+    for key, field_name in [
+        ("title", "title"),
+        ("body", "description_html"),
+        ("vendor", "vendor"),
+        ("type", "type"),
+    ]:
+        value = _clean_text(product.get(key, ""))
+        if value:
+            payload[field_name] = value
+
+    price_value = (
+        _clean_text(product.get("price", ""))
+        or _clean_text(product.get("price_min", ""))
+        or _clean_text(product.get("price_max", ""))
+    )
+    if price_value:
+        payload["price"] = price_value
+
+    media_values: list[str] = []
+    image_value = _clean_text(product.get("image", ""))
+    if image_value:
+        media_values.append(image_value)
+    featured_image = product.get("featured_image")
+    if isinstance(featured_image, dict):
+        featured_value = _clean_text(featured_image.get("url", ""))
+        if featured_value:
+            media_values.append(featured_value)
+    if media_values:
+        normalized_media = _normalize_media_values(media_values, page_url=page_url)
+        if normalized_media:
+            payload["media_urls"] = " | ".join(normalized_media)
+
+    variants = product.get("variants")
+    if isinstance(variants, list):
+        variant_skus = [
+            _clean_text(item.get("sku", ""))
+            for item in variants
+            if isinstance(item, dict) and _clean_text(item.get("sku", ""))
+        ]
+        if variant_skus:
+            payload["variant_skus"] = " ".join(variant_skus)
+
+    return payload
+
+
+def _scrape_single_sku_via_shopify_suggest_json(
+    sku: str,
+    profile: VendorResolverProfile,
+    *,
+    base_url: str,
+    scrape_images: bool,
+    search_term: str = "",
+) -> tuple[str, dict[str, str], str | None]:
+    base_site = (
+        _clean_text(profile.search_entry_url)
+        or _clean_text(profile.official_website_url)
+        or _clean_text(base_url)
+    )
+    api_template = _clean_text(profile.api_request_url_template) or _default_shopify_suggest_api_template(profile, base_url=base_url)
+    query_candidates = _query_candidates_for_profile(sku=sku, search_term=search_term, profile=profile)
+    if not api_template or not base_site or not query_candidates:
+        return sku, {}, "Missing Shopify suggest configuration"
+
+    last_error = "Shopify suggest search returned no results"
+    for query_value in query_candidates:
+        api_url = _render_profile_template(api_template, sku=query_value)
+        if not api_url:
+            continue
+
+        payload, error = _fetch_json_url(api_url)
+        if error:
+            last_error = f"{api_url} ({error})"
+            continue
+
+        products = _shopify_suggest_products_from_payload(payload)
+        if not products:
+            last_error = "Shopify suggest search returned no results"
+            continue
+
+        ordered = sorted(
+            enumerate(products, start=1),
+            key=lambda item: _score_shopify_suggest_product(
+                item[1],
+                sku=sku,
+                query_value=query_value,
+                position=item[0],
+            ),
+            reverse=True,
+        )
+        best_position, best_product = ordered[0]
+        best_score = _score_shopify_suggest_product(
+            best_product,
+            sku=sku,
+            query_value=query_value,
+            position=best_position,
+        )
+        if best_score < 40 and len(products) > 1:
+            last_error = "Shopify suggest search returned no confident product match"
+            continue
+
+        product_url = _candidate_url_from_shopify_suggest_product(best_product, base_site)
+        if not product_url:
+            last_error = "Could not derive product URL from Shopify suggest result"
+            continue
+        product_url = _canonicalize_product_url(product_url)
+
+        seed_payload = _build_shopify_suggest_seed_payload(best_product, page_url=product_url)
+        product_json_payload = None
+        product_json_seed: dict[str, str] = {}
+        product_json_url = _shopify_product_json_url(product_url)
+        if product_json_url:
+            product_json_payload, _ = _fetch_json_url(product_json_url)
+            product_json_seed = _build_shopify_product_json_seed_payload(product_json_payload, page_url=product_url)
+        product_html, product_error = _fetch_html(product_url)
+
+        if not _shopify_product_has_match_evidence(
+            canonical_product_url=product_url,
+            product_html=product_html if not product_error else "",
+            product_json=product_json_payload,
+            seed_payload={**seed_payload, **product_json_seed},
+            sku=sku,
+            query_value=query_value,
+        ):
+            last_error = "Shopify suggest candidate did not verify against canonical product detail"
+            continue
+
+        if product_error:
+            merged_seed = {**product_json_seed, **seed_payload}
+            if merged_seed:
+                merged = {
+                    "search_url": api_url,
+                    "product_url": product_url,
+                    "source_url": product_url,
+                    **merged_seed,
+                }
+                if query_value and query_value != sku:
+                    merged["search_term"] = query_value
+                return sku, merged, None
+            last_error = f"{product_url} ({product_error})"
+            continue
+
+        resolved_payload = _extract_page_payload(product_html, product_url, sku, scrape_images=scrape_images)
+        merged_seed = {**product_json_seed, **seed_payload}
+        merged = _merge_seed_payload(resolved_payload, merged_seed, page_url=product_url)
+        merged["search_url"] = api_url
+        merged["product_url"] = product_url
+        merged["source_url"] = product_url
+        merged["search_provider"] = "shopify_suggest_json"
+        if query_value and query_value != sku:
+            merged["search_term"] = query_value
+        return sku, merged, None
+
+    return sku, {}, last_error
+
+
 def _looks_like_bot_challenge(html: str) -> bool:
     text = _clean_text(html).lower()
     if not text:
@@ -791,7 +1315,7 @@ def _looks_like_bot_challenge(html: str) -> bool:
     return not any(signal in text for signal in product_signals)
 
 
-def _fetch_html_with_curl(url: str, timeout: int = 30) -> tuple[str, str | None]:
+def _fetch_html_with_curl(url: str, timeout: int = 30, insecure: bool = False) -> tuple[str, str | None]:
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return "", "curl unavailable"
@@ -816,6 +1340,8 @@ def _fetch_html_with_curl(url: str, timeout: int = 30) -> tuple[str, str | None]
         "-w",
         f"\n{marker}%{{http_code}}",
     ]
+    if insecure:
+        command.insert(1, "--insecure")
 
     run_kwargs: dict[str, object] = {
         "capture_output": True,
@@ -870,30 +1396,6 @@ def _host_key_from_url(url: str) -> str:
         return _clean_text(urllib.parse.urlparse(url).netloc).lower()
     except Exception:
         return ""
-
-
-def _browser_detail_skip_active(scope_key: str) -> bool:
-    key = _clean_text(scope_key)
-    if not key:
-        return False
-    with _BROWSER_DETAIL_SKIP_LOCK:
-        return key in _BROWSER_DETAIL_SKIP_SCOPES
-
-
-def _mark_browser_detail_skip(scope_key: str) -> None:
-    key = _clean_text(scope_key)
-    if not key:
-        return
-    with _BROWSER_DETAIL_SKIP_LOCK:
-        _BROWSER_DETAIL_SKIP_SCOPES.add(key)
-
-
-def _clear_browser_detail_skip(scope_key: str) -> None:
-    key = _clean_text(scope_key)
-    if not key:
-        return
-    with _BROWSER_DETAIL_SKIP_LOCK:
-        _BROWSER_DETAIL_SKIP_SCOPES.discard(key)
 
 
 def _sleep_for_host_backoff(url: str) -> None:
@@ -961,6 +1463,7 @@ def _get_session_opener_for_host(url: str) -> urllib.request.OpenerDirector | No
         jar = _HTTP_COOKIE_JARS_BY_HOST.get(host)
         if jar is None:
             jar = http.cookiejar.CookieJar()
+            _load_persisted_host_cookies(host, jar)
             _HTTP_COOKIE_JARS_BY_HOST[host] = jar
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         _HTTP_OPENERS_BY_HOST[host] = opener
@@ -1053,6 +1556,10 @@ def _fetch_html(url: str, timeout: int = 30) -> tuple[str, str | None]:
     session_text, session_error = _fetch_html_with_cookie_session(url, timeout=timeout)
     if not session_error and session_text and not _looks_like_bot_challenge(session_text):
         return _success(session_text)
+    if "certificate verify failed" in _clean_text(session_error).lower():
+        curl_text, curl_error = _fetch_html_with_curl(url, timeout=timeout, insecure=True)
+        if not curl_error and curl_text:
+            return _success(curl_text)
 
     request = urllib.request.Request(
         url=url,
@@ -1087,7 +1594,12 @@ def _fetch_html(url: str, timeout: int = 30) -> tuple[str, str | None]:
                     return _success(session_text)
         return _failure(f"HTTP {exc.code}")
     except Exception as exc:
-        return _failure(str(exc))
+        error_text = str(exc)
+        if "certificate verify failed" in error_text.lower():
+            curl_text, curl_error = _fetch_html_with_curl(url, timeout=timeout, insecure=True)
+            if not curl_error and curl_text:
+                return _success(curl_text)
+        return _failure(error_text)
 
     text = body.decode("utf-8", errors="ignore")
     if _looks_like_bot_challenge(text):
@@ -1189,6 +1701,86 @@ def _real_chrome_executable_path() -> str:
     return ""
 
 
+def _browser_session_state_path(host: str) -> Path:
+    safe_host = re.sub(r"[^a-z0-9._-]+", "_", _clean_text(host).lower()) or "default"
+    return _browser_session_dir() / f"{safe_host}.json"
+
+
+def _browser_session_profile_path(host: str) -> Path:
+    safe_host = re.sub(r"[^a-z0-9._-]+", "_", _clean_text(host).lower()) or "default"
+    return _browser_profile_dir() / safe_host
+
+
+def _cookie_matches_host(cookie_domain: str, host: str) -> bool:
+    domain = _clean_text(cookie_domain).lower().lstrip(".")
+    target = _clean_text(host).lower().lstrip(".")
+    if not domain or not target:
+        return False
+    return target == domain or target.endswith(f".{domain}") or domain.endswith(f".{target}")
+
+
+def _cookie_from_storage_state(item: dict[str, object]) -> http.cookiejar.Cookie | None:
+    name = _clean_text(item.get("name", ""))
+    value = _clean_text(item.get("value", ""))
+    domain = _clean_text(item.get("domain", ""))
+    path = _clean_text(item.get("path", "")) or "/"
+    if not name or not domain:
+        return None
+    expires_value = item.get("expires")
+    try:
+        expires = int(float(expires_value)) if expires_value not in ("", None) else None
+    except Exception:
+        expires = None
+    secure = bool(item.get("secure"))
+    http_only = bool(item.get("httpOnly"))
+    domain_initial_dot = domain.startswith(".")
+    normalized_domain = domain if domain_initial_dot else domain.lstrip(".")
+    return http.cookiejar.Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=normalized_domain,
+        domain_specified=True,
+        domain_initial_dot=domain_initial_dot,
+        path=path,
+        path_specified=True,
+        secure=secure,
+        expires=expires,
+        discard=expires is None or expires <= 0,
+        comment=None,
+        comment_url=None,
+        rest={"HttpOnly": http_only},
+        rfc2109=False,
+    )
+
+
+def _load_persisted_host_cookies(host: str, jar: http.cookiejar.CookieJar) -> None:
+    state_path = _browser_session_state_path(host)
+    try:
+        if not state_path.exists():
+            return
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    cookies = payload.get("cookies")
+    if not isinstance(cookies, list):
+        return
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        if not _cookie_matches_host(_clean_text(item.get("domain", "")), host):
+            continue
+        cookie = _cookie_from_storage_state(item)
+        if cookie is None:
+            continue
+        try:
+            jar.set_cookie(cookie)
+        except Exception:
+            continue
+
+
 def _score_browser_json_item(item: dict, sku: str, page_url: str = "") -> int:
     target = _compact_sku(sku)
     if not target:
@@ -1283,8 +1875,8 @@ def _build_browser_json_payload(item: dict, page_url: str) -> dict[str, str]:
             break
 
     for field_name in ["gtin14", "gtin13", "gtin12", "gtin8", "gtin", "upc", "ean", "barcode"]:
-        value = _clean_text(next(iter(_iter_searchspring_field_values(item.get(field_name))), ""))
-        if value and value.lower() not in {"none", "nan", "null"}:
+        value = _sanitize_barcode(_clean_text(next(iter(_iter_searchspring_field_values(item.get(field_name))), "")))
+        if value:
             payload["barcode"] = value
             break
 
@@ -1335,7 +1927,6 @@ def _fetch_html_with_real_chrome(
     url: str,
     timeout_ms: int = 35000,
     settle_ms: int = 4500,
-    browser_skip_scope: str = "",
 ) -> tuple[str, str, list[tuple[str, str]], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -1350,11 +1941,7 @@ def _fetch_html_with_real_chrome(
     last_error = "Browser detail fetch failed"
 
     with _BROWSER_DETAIL_SEMAPHORE:
-        if _browser_detail_skip_active(browser_skip_scope):
-            return url, "", [], None
         for attempt in range(2):
-            if _browser_detail_skip_active(browser_skip_scope):
-                return url, "", [], None
             _sleep_for_host_backoff(url)
             response_refs: list[object] = []
             try:
@@ -1419,43 +2006,18 @@ def _fetch_html_with_real_chrome(
     return url, "", [], last_error
 
 
-def _is_barcode_only_request(requested_fields: set[str] | list[str] | tuple[str, ...] | None) -> bool:
-    requested = _normalize_requested_scrape_fields(requested_fields)
-    return requested == {"barcode"}
-
-
-def _normalize_xtreme_barcode_payload(
-    product_url: str,
-    payload: dict[str, str],
-    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
-) -> None:
-    if not (_is_xtreme_diesel_url(product_url) and _is_barcode_only_request(requested_fields)):
-        return
-    normalized_barcode = _normalize_numeric_gtin(payload.get("barcode", ""))
-    if normalized_barcode:
-        payload["barcode"] = normalized_barcode
-        return
-    payload.pop("barcode", None)
-
-
 def _should_attempt_xtreme_browser_detail(
     product_url: str,
     payload: dict[str, str],
     requested_fields: set[str] | list[str] | tuple[str, ...] | None,
-    browser_skip_scope: str = "",
 ) -> bool:
     if not _is_xtreme_diesel_url(product_url):
         return False
-
-    requested = _normalize_requested_scrape_fields(requested_fields)
-    barcode_only_request = _is_barcode_only_request(requested)
-    if barcode_only_request and _browser_detail_skip_active(browser_skip_scope):
-        return False
-
     title = _clean_text(payload.get("title", "")).lower()
     if title in {"just a moment...", "verifying your connection..."}:
         return True
 
+    requested = _normalize_requested_scrape_fields(requested_fields)
     if requested is None:
         fields_to_check = {"barcode"}
     else:
@@ -1465,8 +2027,6 @@ def _should_attempt_xtreme_browser_detail(
 
     for field_name in fields_to_check:
         value = _clean_text(payload.get(field_name, ""))
-        if barcode_only_request and field_name == "barcode":
-            value = _normalize_numeric_gtin(value)
         if not value or value.lower() in {"none", "nan", "null"}:
             return True
     return False
@@ -1476,21 +2036,14 @@ def _fetch_xtreme_detail_payload_via_browser(
     product_url: str,
     sku: str,
     scrape_images: bool,
-    requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
-    browser_skip_scope: str = "",
 ) -> tuple[dict[str, str], str | None]:
     cache_key = _clean_text(product_url)
     with _BROWSER_DETAIL_CACHE_LOCK:
         cached = _BROWSER_DETAIL_CACHE.get(cache_key)
         if cached:
             return dict(cached), None
-    if _is_barcode_only_request(requested_fields) and _browser_detail_skip_active(browser_skip_scope):
-        return {}, None
 
-    final_url, html, network_bodies, error = _fetch_html_with_real_chrome(
-        product_url,
-        browser_skip_scope=browser_skip_scope,
-    )
+    final_url, html, network_bodies, error = _fetch_html_with_real_chrome(product_url)
     if error:
         return {}, error
 
@@ -1513,11 +2066,6 @@ def _fetch_xtreme_detail_payload_via_browser(
     if final_url and final_url != product_url:
         merged["product_url"] = final_url
         merged["source_url"] = final_url
-
-    _normalize_xtreme_barcode_payload(product_url, merged, requested_fields)
-    if _is_xtreme_diesel_url(product_url) and _is_barcode_only_request(requested_fields):
-        if not _normalize_numeric_gtin(merged.get("barcode", "")):
-            _mark_browser_detail_skip(browser_skip_scope)
 
     if merged:
         with _BROWSER_DETAIL_CACHE_LOCK:
@@ -1627,8 +2175,8 @@ def _from_json_ld(html: str, page_url: str, sku: str) -> dict[str, str]:
                 output["vendor"] = _clean_text(brand)
             if not output.get("barcode"):
                 for field_name in ["gtin14", "gtin13", "gtin12", "gtin8", "gtin", "upc", "ean", "barcode"]:
-                    barcode = _clean_text(node.get(field_name, ""))
-                    if barcode and barcode.lower() not in {"none", "nan", "null"}:
+                    barcode = _sanitize_barcode(_clean_text(node.get(field_name, "")))
+                    if barcode:
                         output["barcode"] = barcode
                         break
             offers = node.get("offers")
@@ -2153,7 +2701,7 @@ def _from_shopify_embedded_product(html: str, page_url: str, sku: str) -> dict[s
             ranked_variants.append((score, variant))
         ranked_variants.sort(key=lambda entry: entry[0], reverse=True)
         for _, variant in ranked_variants:
-            barcode = _clean_text(variant.get("barcode", ""))
+            barcode = _sanitize_barcode(_clean_text(variant.get("barcode", "")))
             if barcode:
                 payload["barcode"] = barcode
                 break
@@ -2209,6 +2757,8 @@ def _normalize_host(value: str) -> str:
 
 _KNOWN_SEARCHSPRING_SITE_IDS_BY_HOST: dict[str, tuple[str, ...]] = {
     "xtremediesel.com": ("k72wrs",),
+    "snowperformance.net": ("k5zzdj",),
+    "nitrousexpress.com": ("k5zzdj",),
 }
 
 
@@ -2367,11 +2917,12 @@ def _score_product_candidate(url: str, sku: str, context_text: str = "") -> int:
     path = parsed.path.lower()
     query = parsed.query.lower()
     full = url.lower()
-    compact_url = re.sub(r"[^a-z0-9]", "", full)
+    decoded_full = urllib.parse.unquote(full)
     compact_sku = _compact_sku(sku).lower()
     score = 0
 
-    if compact_sku and compact_sku in compact_url:
+    compact_match_text = re.sub(r"[^a-z0-9]", "", _candidate_url_match_text(url).lower())
+    if compact_sku and compact_sku in compact_match_text:
         score += 180
 
     if re.search(r"(?i)/(?:product|products|part|parts|item|items)/", path):
@@ -2382,6 +2933,10 @@ def _score_product_candidate(url: str, sku: str, context_text: str = "") -> int:
         score += 95
     if re.search(r"(?i)_c_\d+\.html$", path):
         score -= 55
+    if "/rss.php" in path or "rss.php?action=searchproducts" in decoded_full:
+        score -= 320
+    if any(token in decoded_full for token in ["https://", "http://"]) and "/search.php" in decoded_full:
+        score -= 320
 
     if any(token in path for token in ["/search", "/collections", "/blog", "/blogs", "/news", "/account", "/cart", "/checkout"]):
         score -= 220
@@ -2411,10 +2966,19 @@ def _score_product_candidate(url: str, sku: str, context_text: str = "") -> int:
 
 def _extract_product_page_candidates(html: str, page_url: str, sku: str) -> list[tuple[str, int]]:
     scored: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    sequence = 0
 
-    for href, score in _extract_shopify_state_product_candidates(html=html, page_url=page_url, sku=sku):
+    def record(href: str, score: int) -> None:
+        nonlocal sequence
+        if href not in first_seen:
+            first_seen[href] = sequence
+            sequence += 1
         if href not in scored or score > scored[href]:
             scored[href] = score
+
+    for href, score in _extract_shopify_state_product_candidates(html=html, page_url=page_url, sku=sku):
+        record(href, score)
 
     for href, anchor_text in _extract_anchor_link_candidates(html, page_url=page_url):
         if not _same_host_family(href, page_url=page_url):
@@ -2422,8 +2986,7 @@ def _extract_product_page_candidates(html: str, page_url: str, sku: str) -> list
         score = _score_product_candidate(href, sku=sku, context_text=anchor_text)
         if score <= 30:
             continue
-        if href not in scored or score > scored[href]:
-            scored[href] = score
+        record(href, score)
 
     for href in _extract_script_link_candidates(html, page_url=page_url):
         if not _same_host_family(href, page_url=page_url):
@@ -2431,10 +2994,9 @@ def _extract_product_page_candidates(html: str, page_url: str, sku: str) -> list
         score = _score_product_candidate(href, sku=sku, context_text="")
         if score <= 30:
             continue
-        if href not in scored or score > scored[href]:
-            scored[href] = score
+        record(href, score)
 
-    ordered = sorted(scored.items(), key=lambda item: (-item[1], len(item[0])))
+    ordered = sorted(scored.items(), key=lambda item: (-item[1], first_seen.get(item[0], 10**9), len(item[0])))
     return ordered
 
 
@@ -2828,7 +3390,7 @@ def _build_searchanise_seed_payload(item: dict, page_url: str) -> dict[str, str]
         for variant in variants:
             if not isinstance(variant, dict):
                 continue
-            barcode = _clean_text(variant.get("barcode", ""))
+            barcode = _sanitize_barcode(_clean_text(variant.get("barcode", "")))
             if barcode:
                 payload["barcode"] = barcode
                 break
@@ -3512,11 +4074,11 @@ def _filter_requested_scrape_payload(
     return output
 
 
-def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: bool) -> dict[str, str]:
+def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: bool, gallery_scope_only: bool = False) -> dict[str, str]:
     merged: dict[str, str] = {}
     from_shopify_embed = _from_shopify_embedded_product(html, page_url, sku)
     from_jsonld = _from_json_ld(html, page_url, sku)
-    from_heuristic = _heuristic_extract(html, page_url, sku, scrape_images=scrape_images)
+    from_heuristic = _heuristic_extract(html, page_url, sku, scrape_images=scrape_images, gallery_scope_only=gallery_scope_only)
 
     # Prefer product-scoped embedded media first. Heuristic media is broad and can
     # include recommendation/upsell images on some vendor templates.
@@ -3677,7 +4239,7 @@ def _extract_gallery_scope_blocks(html: str) -> list[str]:
     return blocks
 
 
-def _collect_gallery_image_candidates(html: str) -> list[str]:
+def _collect_gallery_image_candidates(html: str, gallery_scope_only: bool = False) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -3689,7 +4251,10 @@ def _collect_gallery_image_candidates(html: str) -> list[str]:
         candidates.append(url)
 
     scope_blocks = _extract_gallery_scope_blocks(html)
-    source_blocks = scope_blocks if scope_blocks else [html]
+    if gallery_scope_only:
+        source_blocks = scope_blocks  # Never fall back to full HTML for gallery_scope_only vendors.
+    else:
+        source_blocks = scope_blocks if scope_blocks else [html]
 
     # Image and slideshow/gallery attributes used by many ecommerce themes.
     image_attr_patterns = [
@@ -3732,7 +4297,7 @@ def _collect_gallery_image_candidates(html: str) -> list[str]:
             if re.search(r"\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?|$)", href, flags=re.IGNORECASE):
                 add(href)
 
-    if not candidates and not scope_blocks:
+    if not candidates and not scope_blocks and not gallery_scope_only:
         # Last-resort fallback when no gallery containers were found.
         for value in _extract_script_gallery_candidates(html):
             add(value)
@@ -4110,15 +4675,15 @@ def _extract_heuristic_barcode(html: str, context: str) -> str:
     for pattern in [
         r'(?is)<li[^>]+wsm-prod-upccode[^>]*>.*?<label>\s*UPC\s*#?:\s*</label>\s*(?:<span[^>]*>)?([^<]+)',
         r'(?is)<label[^>]*>\s*(?:UPC|GTIN|Barcode|EAN)\s*#?:?\s*</label>\s*(?:<span[^>]*>)?([^<]+)',
-        r'(?i)\b(?:upc|gtin|barcode|ean)\b\s*#?:?\s*([A-Z0-9][A-Z0-9._/-]{3,})',
+        r'(?i)(?:upc|gtin|barcode|ean)\s*#?:?\s*([A-Z0-9][A-Z0-9._/-]{3,})',
     ]:
-        value = _clean_text(unescape(_extract_first(pattern, html, flags=re.IGNORECASE | re.DOTALL)))
-        if value and value.lower() not in {"none", "nan", "null"}:
+        value = _sanitize_barcode(_clean_text(unescape(_extract_first(pattern, html, flags=re.IGNORECASE | re.DOTALL))))
+        if value:
             return value
     return ""
 
 
-def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) -> dict[str, str]:
+def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool, gallery_scope_only: bool = False) -> dict[str, str]:
     context = _find_context_near_sku(html, sku)
     output: dict[str, str] = {}
 
@@ -4142,7 +4707,7 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool) 
         if shopify_media_values:
             normalized_media = _normalize_media_values(shopify_media_values, page_url)
         else:
-            media_values = _collect_gallery_image_candidates(html)
+            media_values = _collect_gallery_image_candidates(html, gallery_scope_only=gallery_scope_only)
             normalized_media = _normalize_media_values(media_values, page_url)
             sku_scoped_media = [value for value in normalized_media if _media_url_matches_target_sku(value, sku)]
             if sku_scoped_media:
@@ -4217,6 +4782,13 @@ def _should_probe_search_candidates(
     title_lower = title.lower()
     if "/search" not in target_path and title and "search results" not in title_lower:
         return False
+    if "/search" in target_path:
+        try:
+            candidates = _extract_product_page_candidates(search_html, page_url=target_url, sku=sku)
+        except Exception:
+            candidates = []
+        if candidates and candidates[0][1] >= 80:
+            return True
 
     evidence_text = " ".join(
         [
@@ -4242,6 +4814,32 @@ def _should_probe_search_candidates(
     return True
 
 
+def _finalize_sku_payload_with_images(
+    result_sku: str,
+    payload: dict[str, str],
+    error: str | None,
+    *,
+    sku: str,
+    scrape_images: bool,
+    image_output_root: "Path | None",
+) -> tuple[str, dict[str, str], str | None]:
+    """Download image files for specialized strategy paths that return URLs but don't write to disk."""
+    if scrape_images and image_output_root is not None and payload:
+        media_values = _split_multi_value(payload.get("media_urls", ""))
+        if media_values:
+            local_files, media_folder, _ = _download_images_for_sku(
+                sku=sku,
+                media_urls=media_values,
+                image_output_root=image_output_root,
+                vendor_hint=_clean_text(payload.get("vendor", "")),
+            )
+            if media_folder:
+                payload["media_folder"] = media_folder
+            if local_files:
+                payload["media_urls"] = " | ".join(local_files)
+    return result_sku, payload, error
+
+
 def _scrape_single_sku(
     sku: str,
     base_url: str,
@@ -4252,28 +4850,73 @@ def _scrape_single_sku(
     image_output_root: Path | None,
     search_term: str = "",
     requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
-    browser_skip_scope: str = "",
 ) -> tuple[str, dict[str, str], str | None]:
-    query_value = normalize_sku(search_term) or sku
+    query_candidates = _query_candidates_for_profile(sku=sku, search_term=search_term, profile=resolver_profile)
+    interaction_strategy = (
+        _clean_text(resolver_profile.interaction_strategy).lower()
+        if resolver_profile is not None
+        else ""
+    )
+    if len(query_candidates) > 1 and interaction_strategy not in {"json_api_id_detail", "shopify_suggest_json"}:
+        last_error: str | None = None
+        for query_value in query_candidates:
+            candidate_profile = resolver_profile
+            if resolver_profile is not None:
+                candidate_profile = replace(
+                    resolver_profile,
+                    search_term_strategy="identity",
+                    search_term_fallbacks="",
+                )
+            result_sku, payload, error = _scrape_single_sku(
+                sku=sku,
+                base_url=base_url,
+                resolver_profile=candidate_profile,
+                retry_count=retry_count,
+                delay_seconds=delay_seconds,
+                scrape_images=scrape_images,
+                image_output_root=image_output_root,
+                search_term=query_value,
+                requested_fields=requested_fields,
+            )
+            if payload:
+                if query_value and query_value != sku:
+                    payload.setdefault("search_term", query_value)
+                return result_sku, payload, None
+            last_error = error
+        return sku, {}, last_error or "Failed to fetch search page"
+
+    query_value = query_candidates[0] if query_candidates else (normalize_sku(search_term) or sku)
     target_url = _normalize_url(base_url, query_value)
     if not target_url:
         return sku, {}, "Missing vendor search URL"
 
     if _is_alliant_parts_search_url(base_url) or _is_alliant_parts_search_url(target_url):
-        return _scrape_single_sku_via_alliant_graph(
+        result_sku, payload, error = _scrape_single_sku_via_alliant_graph(
             sku=sku,
             base_url=base_url,
             scrape_images=scrape_images,
             search_term=query_value,
         )
+        return _finalize_sku_payload_with_images(result_sku, payload, error, sku=sku, scrape_images=scrape_images, image_output_root=image_output_root)
 
     if resolver_profile is not None and _clean_text(resolver_profile.interaction_strategy).lower() == "json_api_id_detail":
-        return _scrape_single_sku_via_json_api_id_detail(
+        result_sku, payload, error = _scrape_single_sku_via_json_api_id_detail(
             sku=sku,
             profile=resolver_profile,
             scrape_images=scrape_images,
             search_term=query_value,
         )
+        return _finalize_sku_payload_with_images(result_sku, payload, error, sku=sku, scrape_images=scrape_images, image_output_root=image_output_root)
+
+    if resolver_profile is not None and _clean_text(resolver_profile.interaction_strategy).lower() == "shopify_suggest_json":
+        result_sku, payload, error = _scrape_single_sku_via_shopify_suggest_json(
+            sku=sku,
+            profile=resolver_profile,
+            base_url=base_url,
+            scrape_images=scrape_images,
+            search_term=query_value,
+        )
+        return _finalize_sku_payload_with_images(result_sku, payload, error, sku=sku, scrape_images=scrape_images, image_output_root=image_output_root)
 
     direct_searchspring_site_ids = _searchspring_site_ids_for_vendor_url(base_url)
     if direct_searchspring_site_ids:
@@ -4295,7 +4938,7 @@ def _scrape_single_sku(
                         candidate_payload = _merge_seed_payload({}, seed_payload, page_url=candidate_url)
                         payload_match_text = " ".join(
                             [
-                                candidate_url,
+                                _candidate_url_match_text(candidate_url),
                                 _clean_text(candidate_payload.get("title", "")),
                                 _clean_text(candidate_payload.get("description_html", "")),
                                 _clean_text(candidate_payload.get("application", "")),
@@ -4330,14 +4973,20 @@ def _scrape_single_sku(
                 candidate_payload = _merge_seed_payload(candidate_payload, seed_payload, page_url=candidate_url)
                 payload_match_text = " ".join(
                     [
-                        candidate_url,
+                        _candidate_url_match_text(candidate_url),
                         _clean_text(candidate_payload.get("title", "")),
                         _clean_text(candidate_payload.get("description_html", "")),
                         _clean_text(candidate_payload.get("application", "")),
                         _clean_text(candidate_payload.get("barcode", "")),
                     ]
                 )
-                raw_html_match = _contains_compact_sku(_find_context_near_sku(product_html, query_value, span=2400), query_value)
+                allow_raw_html_match = not any(
+                    token in candidate_url.lower() for token in ["search_query=", "searchid=", "q="]
+                )
+                raw_html_match = allow_raw_html_match and _contains_compact_sku(
+                    _find_context_near_sku(product_html, query_value, span=2400),
+                    query_value,
+                )
                 matches_sku = _contains_compact_sku(payload_match_text, query_value) or raw_html_match
                 payload_score = 0
                 if _clean_text(candidate_payload.get("title", "")):
@@ -4375,12 +5024,14 @@ def _scrape_single_sku(
 
                 try:
                     resolved_payload = {}
+                    _gallery_scope_only = resolver_profile is not None and _clean_text(resolver_profile.media_strategy).lower() == "gallery_scope_only"
                     if best_candidate_html:
                         resolved_payload = _extract_page_payload(
                             best_candidate_html,
                             best_candidate_url,
                             query_value,
                             scrape_images=scrape_images,
+                            gallery_scope_only=_gallery_scope_only,
                         )
                     resolved_payload = _merge_seed_payload(
                         resolved_payload,
@@ -4406,19 +5057,15 @@ def _scrape_single_sku(
                 except Exception as exc:
                     merged["extract_error"] = str(exc)
 
-                _normalize_xtreme_barcode_payload(best_candidate_url, merged, requested_fields)
                 if _should_attempt_xtreme_browser_detail(
                     product_url=best_candidate_url,
                     payload=merged,
                     requested_fields=requested_fields,
-                    browser_skip_scope=browser_skip_scope,
                 ):
                     browser_payload, browser_error = _fetch_xtreme_detail_payload_via_browser(
                         product_url=best_candidate_url,
                         sku=query_value,
                         scrape_images=scrape_images,
-                        requested_fields=requested_fields,
-                        browser_skip_scope=browser_skip_scope,
                     )
                     if browser_payload:
                         browser_url = _clean_text(browser_payload.get("product_url", "")) or best_candidate_url
@@ -4439,7 +5086,6 @@ def _scrape_single_sku(
                             value = _clean_text(browser_payload.get(key, ""))
                             if value:
                                 merged[key] = value
-                        _normalize_xtreme_barcode_payload(browser_url, merged, requested_fields)
                         if browser_url and browser_url != best_candidate_url:
                             merged["product_url"] = browser_url
                             merged["source_url"] = browser_url
@@ -4488,6 +5134,23 @@ def _scrape_single_sku(
                 jitter = ((sum(ord(ch) for ch in sku) + (rate_limit_hits * 13)) % 21) / 100.0
                 time.sleep(backoff + jitter)
             continue
+
+        # For results_page_clickthrough vendors with browser preference, fall back to
+        # Playwright for the search page when the HTTP response is a bot challenge or
+        # contains no product link candidates (JS-rendered search results).
+        if interaction_strategy == "results_page_clickthrough" and resolver_profile is not None:
+            _rt = _clean_text(resolver_profile.runtime_preference).lower()
+            if _rt in ("browser_first", "http_first_with_browser_fallback"):
+                _needs_browser_search = _looks_like_bot_challenge(search_html) or not any(
+                    tag in search_html.lower()
+                    for tag in ['href="/', "href='/", 'class="product', "class='product", 'data-product', 'product-item', 'productview']
+                )
+                if _needs_browser_search:
+                    _b_url, _b_html, _, _b_err = _fetch_html_with_real_chrome(
+                        target_url, timeout_ms=20000, settle_ms=1800
+                    )
+                    if not _b_err and _b_html:
+                        search_html = _b_html
 
         resolved_url = target_url
         resolved_html = search_html
@@ -4599,7 +5262,7 @@ def _scrape_single_sku(
                         candidate_payload = _merge_seed_payload({}, seed_payload, page_url=candidate_url)
                         payload_match_text = " ".join(
                             [
-                                candidate_url,
+                                _candidate_url_match_text(candidate_url),
                                 _clean_text(candidate_payload.get("title", "")),
                                 _clean_text(candidate_payload.get("description_html", "")),
                                 _clean_text(candidate_payload.get("application", "")),
@@ -4633,14 +5296,20 @@ def _scrape_single_sku(
                 candidate_payload = _merge_seed_payload(candidate_payload, seed_payload, page_url=candidate_url)
                 payload_match_text = " ".join(
                     [
-                        candidate_url,
+                        _candidate_url_match_text(candidate_url),
                         _clean_text(candidate_payload.get("title", "")),
                         _clean_text(candidate_payload.get("description_html", "")),
                         _clean_text(candidate_payload.get("application", "")),
                         _clean_text(candidate_payload.get("barcode", "")),
                     ]
                 )
-                raw_html_match = _contains_compact_sku(_find_context_near_sku(product_html, query_value, span=2400), query_value)
+                allow_raw_html_match = not any(
+                    token in candidate_url.lower() for token in ["search_query=", "searchid=", "q="]
+                )
+                raw_html_match = allow_raw_html_match and _contains_compact_sku(
+                    _find_context_near_sku(product_html, query_value, span=2400),
+                    query_value,
+                )
                 matches_sku = _contains_compact_sku(payload_match_text, query_value) or raw_html_match
                 payload_score = 0
                 if _clean_text(candidate_payload.get("title", "")):
@@ -4691,8 +5360,9 @@ def _scrape_single_sku(
             merged["search_provider"] = provider or "search_seed"
 
         try:
+            _gallery_scope_only = resolver_profile is not None and _clean_text(resolver_profile.media_strategy).lower() == "gallery_scope_only"
             if resolved_html:
-                resolved_payload = _extract_page_payload(resolved_html, resolved_url, query_value, scrape_images=scrape_images)
+                resolved_payload = _extract_page_payload(resolved_html, resolved_url, query_value, scrape_images=scrape_images, gallery_scope_only=_gallery_scope_only)
             else:
                 resolved_payload = {}
             resolved_payload = _merge_seed_payload(resolved_payload, resolved_seed_payload, page_url=resolved_url)
@@ -4755,6 +5425,7 @@ def _scrape_single_sku(
                     canonical_product_url,
                     query_value,
                     scrape_images=scrape_images,
+                    gallery_scope_only=_gallery_scope_only,
                 )
                 for key in [
                     "title",
@@ -4821,6 +5492,7 @@ def scrape_vendor_records(
     image_output_root: str | Path | None = None,
     search_terms_by_sku: dict[str, str] | None = None,
     requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
+    required_root: Path | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
     sku_values = [normalize_sku(sku) for sku in skus if normalize_sku(sku)]
     if not vendor_search_url or not sku_values:
@@ -4831,7 +5503,7 @@ def scrape_vendor_records(
         if normalize_sku(key)
     }
 
-    vendor_search_url, resolver_profile = resolve_canonical_search_url(vendor_search_url)
+    vendor_search_url, resolver_profile = resolve_canonical_search_url(vendor_search_url, required_root=required_root)
 
     unresolved_vendor = _match_unresolved_vendor(vendor_search_url)
     if unresolved_vendor is not None:
@@ -4856,10 +5528,6 @@ def scrape_vendor_records(
     max_workers = max(1, workers)
     effective_delay = float(delay_seconds or 0.0)
     normalized_requested_fields = _normalize_requested_scrape_fields(requested_fields)
-    browser_skip_scope = ""
-    if _is_xtreme_diesel_url(vendor_search_url) and _is_barcode_only_request(normalized_requested_fields):
-        browser_skip_scope = f"xdp-barcode:{time.time_ns()}"
-        _clear_browser_detail_skip(browser_skip_scope)
     effective_scrape_images = bool(
         scrape_images and (normalized_requested_fields is None or "media_urls" in normalized_requested_fields)
     )
@@ -4881,7 +5549,21 @@ def scrape_vendor_records(
     direct_searchspring_site_ids = _searchspring_site_ids_for_vendor_url(vendor_search_url)
     preflight_url = ""
     if preflight_seed and not direct_searchspring_site_ids:
-        preflight_url = _normalize_url(vendor_search_url, preflight_seed)
+        interaction_strategy = _clean_text(resolver_profile.interaction_strategy).lower() if resolver_profile is not None else ""
+        if interaction_strategy == "shopify_suggest_json" and resolver_profile is not None:
+            preflight_candidates = _query_candidates_for_profile(
+                sku=ordered_skus[0],
+                search_term=preflight_seed,
+                profile=resolver_profile,
+            )
+            if preflight_candidates:
+                preflight_template = (
+                    _clean_text(resolver_profile.api_request_url_template)
+                    or _default_shopify_suggest_api_template(resolver_profile, base_url=vendor_search_url)
+                )
+                preflight_url = _render_profile_template(preflight_template, sku=preflight_candidates[0])
+        else:
+            preflight_url = _normalize_url(vendor_search_url, preflight_seed)
     if preflight_url:
         preflight_error = ""
         for attempt in range(2):
@@ -4904,85 +5586,80 @@ def scrape_vendor_records(
         except Exception:
             output_root = None
 
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    _scrape_single_sku,
-                    sku=sku,
-                    base_url=vendor_search_url,
-                    resolver_profile=resolver_profile,
-                    retry_count=retry_count,
-                    delay_seconds=effective_delay,
-                    scrape_images=effective_scrape_images,
-                    image_output_root=output_root,
-                    search_term=search_term_lookup.get(sku, sku),
-                    requested_fields=normalized_requested_fields,
-                    browser_skip_scope=browser_skip_scope,
-                )
-                for sku in ordered_skus
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    sku, payload, error = future.result()
-                except Exception as exc:
-                    general_errors.append(str(exc))
-                    continue
-                if payload:
-                    results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
-                if error:
-                    sku_errors[sku] = error
-
-        rate_limited_skus = [
-            sku for sku, error_text in list(sku_errors.items()) if _is_rate_limit_error(error_text)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _scrape_single_sku,
+                sku=sku,
+                base_url=vendor_search_url,
+                resolver_profile=resolver_profile,
+                retry_count=retry_count,
+                delay_seconds=effective_delay,
+                scrape_images=effective_scrape_images,
+                image_output_root=output_root,
+                search_term=search_term_lookup.get(sku, sku),
+                requested_fields=normalized_requested_fields,
+            )
+            for sku in ordered_skus
         ]
-        if rate_limited_skus:
-            heavy_rate_limit = len(rate_limited_skus) >= 5
-            retry_delay = max(effective_delay, 0.95 if heavy_rate_limit else 0.65)
-            # Keep fallback bounded and fast: do one clean retry pass per SKU.
-            retry_count_adaptive = 0
-            if heavy_rate_limit:
-                # Give aggressive anti-bot systems a brief cool-down window before
-                # retrying sequentially.
-                time.sleep(1.35)
-            fallback_start = time.monotonic()
-            max_fallback_seconds = min(45.0, max(15.0, float(len(rate_limited_skus)) * 2.5))
-            recovered = 0
-            still_rate_limited = 0
-            for sku in rate_limited_skus:
-                if (time.monotonic() - fallback_start) >= max_fallback_seconds:
-                    general_errors.append(
-                        f"Stopped rate-limit recovery early after {max_fallback_seconds:.0f}s to keep runtime bounded."
-                    )
-                    break
-                _, payload, error = _scrape_single_sku(
-                    sku=sku,
-                    base_url=vendor_search_url,
-                    resolver_profile=resolver_profile,
-                    retry_count=retry_count_adaptive,
-                    delay_seconds=retry_delay,
-                    scrape_images=effective_scrape_images,
-                    image_output_root=output_root,
-                    search_term=search_term_lookup.get(sku, sku),
-                    requested_fields=normalized_requested_fields,
-                    browser_skip_scope=browser_skip_scope,
-                )
-                if payload:
-                    results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
-                    sku_errors.pop(sku, None)
-                    recovered += 1
-                    continue
-                if error:
-                    sku_errors[sku] = error
-                    if _is_rate_limit_error(error):
-                        still_rate_limited += 1
-            if recovered > 0:
-                general_errors.append(f"Recovered {recovered} SKU(s) after temporary rate limits.")
-            if still_rate_limited > 0:
-                general_errors.append(
-                    f"{still_rate_limited} SKU(s) remain rate-limited. Try workers=1 and delay>=1.0 for this vendor."
-                )
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                sku, payload, error = future.result()
+            except Exception as exc:
+                general_errors.append(str(exc))
+                continue
+            if payload:
+                results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
+            if error:
+                sku_errors[sku] = error
 
-        return results, sku_errors, general_errors
-    finally:
-        _clear_browser_detail_skip(browser_skip_scope)
+    rate_limited_skus = [
+        sku for sku, error_text in list(sku_errors.items()) if _is_rate_limit_error(error_text)
+    ]
+    if rate_limited_skus:
+        heavy_rate_limit = len(rate_limited_skus) >= 5
+        retry_delay = max(effective_delay, 0.95 if heavy_rate_limit else 0.65)
+        # Keep fallback bounded and fast: do one clean retry pass per SKU.
+        retry_count_adaptive = 0
+        if heavy_rate_limit:
+            # Give aggressive anti-bot systems a brief cool-down window before
+            # retrying sequentially.
+            time.sleep(1.35)
+        fallback_start = time.monotonic()
+        max_fallback_seconds = min(45.0, max(15.0, float(len(rate_limited_skus)) * 2.5))
+        recovered = 0
+        still_rate_limited = 0
+        for sku in rate_limited_skus:
+            if (time.monotonic() - fallback_start) >= max_fallback_seconds:
+                general_errors.append(
+                    f"Stopped rate-limit recovery early after {max_fallback_seconds:.0f}s to keep runtime bounded."
+                )
+                break
+            _, payload, error = _scrape_single_sku(
+                sku=sku,
+                base_url=vendor_search_url,
+                resolver_profile=resolver_profile,
+                retry_count=retry_count_adaptive,
+                delay_seconds=retry_delay,
+                scrape_images=effective_scrape_images,
+                image_output_root=output_root,
+                search_term=search_term_lookup.get(sku, sku),
+                requested_fields=normalized_requested_fields,
+            )
+            if payload:
+                results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)
+                sku_errors.pop(sku, None)
+                recovered += 1
+                continue
+            if error:
+                sku_errors[sku] = error
+                if _is_rate_limit_error(error):
+                    still_rate_limited += 1
+        if recovered > 0:
+            general_errors.append(f"Recovered {recovered} SKU(s) after temporary rate limits.")
+        if still_rate_limited > 0:
+            general_errors.append(
+                f"{still_rate_limited} SKU(s) remain rate-limited. Try workers=1 and delay>=1.0 for this vendor."
+            )
+
+    return results, sku_errors, general_errors

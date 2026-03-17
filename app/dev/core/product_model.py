@@ -124,6 +124,9 @@ class Product:
     scrape_fields_found: str = ""
     scrape_error: str = ""
     scrape_mismatch_error: str = ""
+    search_term_used: str = ""
+    search_adjustment_note: str = ""
+    search_adjustment_severity: str = ""
     media_folder: str = ""
     remove_recommended: bool = False
     remove_marked: bool = False
@@ -163,6 +166,9 @@ class Product:
             "scrape_fields_found": _clean_text(self.scrape_fields_found),
             "scrape_error": _clean_text(self.scrape_error),
             "scrape_mismatch_error": _clean_text(self.scrape_mismatch_error),
+            "search_term_used": _clean_text(self.search_term_used),
+            "search_adjustment_note": _clean_text(self.search_adjustment_note),
+            "search_adjustment_severity": _clean_text(self.search_adjustment_severity),
             "media_folder": _clean_text(self.media_folder),
             "remove_recommended": "yes" if bool(self.remove_recommended) else "",
             "remove_marked": "yes" if bool(self.remove_marked) else "",

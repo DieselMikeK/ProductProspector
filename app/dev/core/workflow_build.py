@@ -23,6 +23,9 @@ from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
 
 
+FIXED_VENDOR_MAPPING_PREFIX = "[Selected Vendor] "
+
+
 def _clean_text(value: object) -> str:
     if value is None:
         return ""
@@ -64,6 +67,8 @@ def _effective_update_fields(session: AppSession) -> set[str]:
 def _row_value(row: pd.Series, column_name: str) -> str:
     if not column_name:
         return ""
+    if str(column_name).startswith(FIXED_VENDOR_MAPPING_PREFIX):
+        return _clean_text(str(column_name)[len(FIXED_VENDOR_MAPPING_PREFIX):])
     if column_name not in row.index:
         return ""
     return _clean_text(row[column_name])
@@ -310,16 +315,38 @@ class BuildStats:
     rows_flagged_gas: int = 0
 
 
-def build_existing_shopify_index(shopify_df: pd.DataFrame | None) -> dict[str, dict[str, str]]:
+def build_existing_shopify_index(
+    shopify_df: pd.DataFrame | None,
+    full_catalog_df: pd.DataFrame | None = None,
+) -> dict[str, dict[str, str]]:
     index: dict[str, dict[str, str]] = {}
     if shopify_df is None or shopify_df.empty:
         return index
+
+    # Determine which product_ids have multiple variants.
+    # Prefer the full catalog when available (targeted fetch may only contain 1 row per product).
+    ref_df = full_catalog_df if (full_catalog_df is not None and not full_catalog_df.empty) else shopify_df
+    multi_variant_pids: set[str] = set()
+    has_variants_col = "parent_has_variants" in shopify_df.columns
+    if not has_variants_col and "product_id" in ref_df.columns:
+        pid_counts = (
+            ref_df[ref_df["product_id"].astype(str).str.strip() != ""]["product_id"]
+            .value_counts()
+        )
+        multi_variant_pids = set(pid_counts[pid_counts > 1].index.astype(str))
+
     for _, row in shopify_df.iterrows():
         sku = normalize_sku(row.get("sku", ""))
         if not sku:
             continue
         if sku in index:
             continue
+        pid = _clean_text(row.get("product_id", ""))
+        vid = _clean_text(row.get("variant_id", ""))
+        if has_variants_col:
+            has_variants = _clean_text(row.get("parent_has_variants", "")).lower() in {"yes", "true", "1"}
+        else:
+            has_variants = pid in multi_variant_pids if pid else False
         index[sku] = {
             "sku": sku,
             "title": _clean_text(row.get("title", "")),
@@ -327,7 +354,20 @@ def build_existing_shopify_index(shopify_df: pd.DataFrame | None) -> dict[str, d
             "application": _clean_text(row.get("fitment", "")),
             "type": _clean_text(row.get("product_type", "")),
             "vendor": _clean_text(row.get("vendor", "")),
+            "tags": _clean_text(row.get("tags", "")),
+            "cost": _clean_text(row.get("cost", "")),
             "barcode": _clean_text(row.get("barcode", "")),
+            "product_id": pid,
+            "variant_id": vid,
+            "parent_has_variants": "yes" if has_variants else "",
+            "google_product_type": _clean_text(row.get("google_product_type", "")),
+            "category_code": _clean_text(row.get("category_code", "")),
+            "product_subtype": _clean_text(row.get("product_subtype", "")),
+            "collections": _clean_text(row.get("collections", "")),
+            "variant_google_mpn": _clean_text(row.get("variant_google_mpn", "")),
+            "variant_weight_value": _clean_text(row.get("variant_weight_value", "")),
+            "variant_weight_unit": _clean_text(row.get("variant_weight_unit", "")) or "POUNDS",
+            "variant_enable_low_stock_message": "true",
         }
     return index
 
@@ -534,6 +574,11 @@ def _set_if_present(product: Product, field_name: str, raw_value: object, source
         product.field_sources["media_urls"] = source
         product.field_status["media_urls"] = "ok" if product.media_urls else "missing"
         return
+    if field_name == "tags":
+        product.tags = [item for item in re.split(r"[|,;\n]+", text) if item.strip()]
+        product.field_sources["tags"] = source
+        product.field_status["tags"] = "ok" if product.tags else "missing"
+        return
     product.set_field(field_name, text, source)
 
 
@@ -690,7 +735,31 @@ def build_products_from_session(
             _set_if_present(product, "application", existing.get("application", ""), "shopify")
             _set_if_present(product, "type", existing.get("type", ""), "shopify")
             _set_if_present(product, "vendor", existing.get("vendor", ""), "shopify")
+            _set_if_present(product, "tags", existing.get("tags", ""), "shopify")
+            _set_if_present(product, "cost", existing.get("cost", ""), "shopify")
             _set_if_present(product, "barcode", existing.get("barcode", ""), "shopify")
+            _set_if_present(product, "google_product_type", existing.get("google_product_type", ""), "shopify")
+            _set_if_present(product, "category_code", existing.get("category_code", ""), "shopify")
+            _set_if_present(product, "product_subtype", existing.get("product_subtype", ""), "shopify")
+            _set_if_present(product, "collections", existing.get("collections", ""), "shopify")
+            if existing.get("variant_google_mpn"):
+                product.variant_google_mpn = existing["variant_google_mpn"]
+            if existing.get("variant_weight_value"):
+                product.weight = existing["variant_weight_value"]
+            if existing.get("variant_weight_unit"):
+                product.variant_weight_unit = existing["variant_weight_unit"]
+            product.variant_enable_low_stock_message = "true"
+            if session.mode == MODE_UPDATE:
+                if existing.get("product_id"):
+                    product.product_id = existing["product_id"]
+                if existing.get("variant_id"):
+                    product.variant_id = existing["variant_id"]
+                if existing.get("parent_has_variants") == "yes":
+                    product.parent_has_variants = True
+                    product.record_type = "Variant"
+            else:
+                if existing.get("product_id"):
+                    product.product_id = existing["product_id"]
 
         row_price, row_map_price, row_msrp_price, row_jobber_price = _infer_price_fields_from_row(
             row,
@@ -822,8 +891,11 @@ def build_products_from_session(
                 if scraped_product_url:
                     _set_if_present(product, "product_url", scraped_product_url, "scraper")
                 for field_name in selected:
-                    existing_value = _clean_text(getattr(product, field_name, ""))
-                    if existing_value:
+                    existing_attr = getattr(product, field_name, None)
+                    if isinstance(existing_attr, list):
+                        if existing_attr:
+                            continue
+                    elif _clean_text(existing_attr):
                         continue
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
 

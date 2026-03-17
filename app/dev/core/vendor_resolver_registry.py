@@ -32,6 +32,8 @@ class VendorResolverProfile:
     resolver_hint: str = ""
     product_fetch_mode: str = ""
     interaction_strategy: str = ""
+    search_term_strategy: str = ""
+    search_term_fallbacks: str = ""
     direct_url_sufficient: str = ""
     search_entry_url: str = ""
     search_container_selector: str = ""
@@ -200,10 +202,13 @@ def _profile_from_dict(row: dict[str, object]) -> VendorResolverProfile:
     return VendorResolverProfile(**{field: _clean_text(row.get(field, "")) for field in VendorResolverProfile.__dataclass_fields__})
 
 
-def load_resolver_profiles() -> list[VendorResolverProfile]:
+def load_resolver_profiles(required_root: Path | None = None) -> list[VendorResolverProfile]:
     global _PROFILE_CACHE_KEY, _PROFILE_CACHE_ROWS
 
-    path = _mapping_path("VendorResolverProfiles.json")
+    if required_root is not None:
+        path = Path(required_root) / "mappings" / "discovery" / "VendorResolverProfiles.json"
+    else:
+        path = _mapping_path("VendorResolverProfiles.json")
     try:
         stat = path.stat()
         cache_key = f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
@@ -229,10 +234,10 @@ def load_resolver_profiles() -> list[VendorResolverProfile]:
         return list(rows)
 
 
-def find_resolver_profile(search_url: str) -> VendorResolverProfile | None:
+def find_resolver_profile(search_url: str, required_root: Path | None = None) -> VendorResolverProfile | None:
     best_profile: VendorResolverProfile | None = None
     best_score = -1
-    for profile in load_resolver_profiles():
+    for profile in load_resolver_profiles(required_root=required_root):
         score = _profile_match_score(profile, search_url)
         if score > best_score:
             best_score = score
@@ -242,8 +247,8 @@ def find_resolver_profile(search_url: str) -> VendorResolverProfile | None:
     return best_profile
 
 
-def resolve_canonical_search_url(search_url: str) -> tuple[str, VendorResolverProfile | None]:
-    profile = find_resolver_profile(search_url)
+def resolve_canonical_search_url(search_url: str, required_root: Path | None = None) -> tuple[str, VendorResolverProfile | None]:
+    profile = find_resolver_profile(search_url, required_root=required_root)
     if profile is None:
         return _clean_text(search_url), None
     canonical = _clean_text(profile.search_url_template) or _clean_text(search_url)
