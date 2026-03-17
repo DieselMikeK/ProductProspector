@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from product_prospector.core.config_store import ShopifyConfig
 from product_prospector.core.processing import normalize_sku
+from product_prospector.core.shopify_fitment_vehicle_metaobjects import resolve_fitment_vehicle_metaobject_gids
 
 
 def _clean_text(value: object) -> str:
@@ -104,6 +105,7 @@ class VariantSnapshot:
     product_vendor: str = ""
     product_application: str = ""
     product_collections: str = ""
+    product_tags: str = ""
     product_google_product_type: str = ""
     product_category_code: str = ""
     product_subtype: str = ""
@@ -124,6 +126,45 @@ class VariantSnapshot:
     inventory_item_cost: str = ""
     variant_weight_value: str = ""
     variant_weight_unit: str = ""
+
+
+def _request_rest_json(
+    config: ShopifyConfig,
+    access_token: str,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+) -> tuple[dict | None, str | None]:
+    url = f"https://{config.shop_domain}/admin/api/{config.api_version}{path}"
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url=url,
+        data=body,
+        method=method.upper(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Shopify-Access-Token": access_token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        return None, f"Shopify HTTP {exc.code}: {detail}"
+    except Exception as exc:
+        return None, str(exc)
+    try:
+        parsed = json.loads(response_body)
+    except Exception:
+        return None, "Invalid JSON response from Shopify."
+    errors = parsed.get("errors")
+    if errors:
+        if isinstance(errors, dict):
+            return None, "; ".join(f"{k}: {v}" for k, v in errors.items())
+        return None, str(errors)
+    return parsed, None
 
 
 def _normalize_weight_unit(value: object) -> str:
@@ -196,6 +237,7 @@ def _parse_variant_snapshot(node: dict, product_node: dict) -> VariantSnapshot:
         product_vendor=_clean_text((product_node or {}).get("vendor", "")),
         product_application=product_app,
         product_collections=_collection_titles_csv((product_node or {}).get("collections") or {}),
+        product_tags=", ".join(str(t).strip() for t in ((product_node or {}).get("tags") or []) if str(t).strip()),
         product_google_product_type=_clean_text(((product_node or {}).get("googleProductTypeMetafield") or {}).get("value", "")),
         product_category_code=_clean_text(((product_node or {}).get("categoryCodesMetafield") or {}).get("value", "")),
         product_subtype=_clean_text(((product_node or {}).get("productSubtypeMetafield") or {}).get("value", "")),
@@ -240,6 +282,7 @@ query ProductsByIds($ids: [ID!]!) {
       productSubtypeMetafield: metafield(namespace: "custom", key: "product_subtype") {
         value
       }
+      tags
       collections(first: 250) {
         nodes {
           title
@@ -345,6 +388,7 @@ query VariantsBySku($cursor: String, $search: String!) {
           productSubtypeMetafield: metafield(namespace: "custom", key: "product_subtype") {
             value
           }
+          tags
           collections(first: 250) {
             nodes {
               title
@@ -766,6 +810,126 @@ def add_tag_to_products(
         if progress_callback is not None:
             try:
                 progress_callback(index, total, product_gid)
+            except Exception:
+                pass
+
+    return summary
+
+
+@dataclass
+class ProductApplicationUpdate:
+    product_id: str  # numeric Shopify product ID
+    product_gid: str
+    application: str
+    original_application: str = ""
+    push_fitment_vehicles: bool = False
+
+
+@dataclass
+class ProductApplicationUpdateSummary:
+    requested: int = 0
+    updated_product_ids: list[str] = field(default_factory=list)
+    failed_by_product_id: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
+def _push_metafield(
+    config: ShopifyConfig,
+    access_token: str,
+    product_numeric_id: str,
+    namespace: str,
+    key: str,
+    value: str,
+    metafield_type: str,
+) -> str | None:
+    if metafield_type.startswith("list."):
+        parts = [v.strip() for v in re.split(r"\s*\|\s*", value) if v.strip()]
+        if not parts:
+            return "empty list value"
+        encoded = json.dumps(parts, ensure_ascii=False)
+    else:
+        encoded = value
+    _, error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="POST",
+        path=f"/products/{product_numeric_id}/metafields.json",
+        payload={
+            "metafield": {
+                "namespace": namespace,
+                "key": key,
+                "type": metafield_type,
+                "value": encoded,
+            }
+        },
+    )
+    return error
+
+
+def push_product_application_bulk(
+    config: ShopifyConfig,
+    access_token: str,
+    updates: list[ProductApplicationUpdate],
+    required_root=None,
+    progress_callback=None,
+) -> ProductApplicationUpdateSummary:
+    summary = ProductApplicationUpdateSummary(requested=len(updates))
+    if not updates:
+        return summary
+
+    total = len(updates)
+    for index, item in enumerate(updates, start=1):
+        product_key = item.product_gid or item.product_id
+        product_numeric_id = _extract_numeric_id(item.product_id or item.product_gid)
+        if not product_numeric_id:
+            summary.failed_by_product_id[product_key] = "Missing product ID."
+            continue
+
+        application_text = _clean_text(item.application)
+        if not application_text:
+            summary.failed_by_product_id[product_key] = "Empty application value."
+            continue
+
+        app_error = _push_metafield(
+            config=config,
+            access_token=access_token,
+            product_numeric_id=product_numeric_id,
+            namespace="custom",
+            key="application",
+            value=application_text,
+            metafield_type="single_line_text_field",
+        )
+        if app_error:
+            summary.failed_by_product_id[product_key] = app_error
+            continue
+
+        summary.updated_product_ids.append(product_key)
+
+        if item.push_fitment_vehicles:
+            fitment_gids, fitment_warnings = resolve_fitment_vehicle_metaobject_gids(
+                application_text=application_text,
+                required_root=required_root,
+            )
+            for w in fitment_warnings:
+                summary.warnings.append(f"{product_key}: {w}")
+            if fitment_gids:
+                fitment_error = _push_metafield(
+                    config=config,
+                    access_token=access_token,
+                    product_numeric_id=product_numeric_id,
+                    namespace="fitment",
+                    key="vehicles",
+                    value=" | ".join(fitment_gids),
+                    metafield_type="list.metaobject_reference",
+                )
+                if fitment_error:
+                    summary.warnings.append(f"{product_key}: fitment.vehicles not set ({fitment_error})")
+                else:
+                    summary.warnings.append(f"{product_key}: fitment.vehicles set ({len(fitment_gids)} vehicle(s))")
+
+        if progress_callback is not None:
+            try:
+                progress_callback(index, total, item.product_gid)
             except Exception:
                 pass
 

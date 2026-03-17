@@ -92,6 +92,7 @@ class Product:
     variant_weight_unit: str = ""
     original_variant_weight_value: str = ""
     original_variant_weight_unit: str = ""
+    original_application: str = ""
     title: str = ""
     description_html: str = ""
     media_urls: list[str] = field(default_factory=list)

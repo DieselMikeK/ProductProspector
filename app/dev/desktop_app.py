@@ -58,11 +58,14 @@ from product_prospector.core.shopify_oauth import exchange_client_credentials_fo
 from product_prospector.core.shopify_push import ShopifyDraftPushSummary, push_new_products_as_drafts
 from product_prospector.core.shopify_sku_cache import get_shopify_sku_cache_path, load_shopify_sku_cache, save_shopify_sku_cache
 from product_prospector.core.shopify_variant_updates import (
+    ProductApplicationUpdate,
+    ProductApplicationUpdateSummary,
     VariantSnapshot,
     VariantWeightUpdate,
     add_tag_to_products,
     fetch_variant_snapshots_by_product_ids,
     fetch_variant_snapshots_by_skus,
+    push_product_application_bulk,
     push_variant_weights_bulk,
 )
 from product_prospector.core.blog_tagging import (
@@ -82,7 +85,7 @@ from product_prospector.core.workflow_build import (
     merge_mode_label,
     products_to_dataframe,
 )
-from product_prospector.core.scraper_engine import scrape_vendor_records
+from product_prospector.core.scraper_engine import scrape_product_page_images, scrape_vendor_records
 
 
 APP_TITLE = "Product Prospector"
@@ -506,9 +509,9 @@ class ProductProspectorDesktopApp:
         self.update_weight = BooleanVar(value=False)
         self.update_barcode = BooleanVar(value=False)
         self.update_application = BooleanVar(value=False)
+        self.push_fitment_vehicles = BooleanVar(value=False)
 
         self.image_capture_url = StringVar(value="")
-        self.image_capture_skus_text: tk.Text | None = None
         self.image_capture_status = StringVar(value="")
         self.image_capture_inflight = False
 
@@ -1238,11 +1241,8 @@ class ProductProspectorDesktopApp:
         # === Image Capture panel (only visible in Image Capture mode) ===
         self.image_capture_wrap = ttk.LabelFrame(self.setup_inner, text="Image Capture", padding=12)
         ic = self.image_capture_wrap
-        ttk.Label(ic, text="Vendor Search URL (with {sku} placeholder or direct product URL):").pack(anchor=W)
-        ttk.Entry(ic, textvariable=self.image_capture_url, width=80).pack(fill=X, pady=(4, 10))
-        ttk.Label(ic, text="SKUs  (one per line, or comma / space separated):").pack(anchor=W)
-        self.image_capture_skus_text = tk.Text(ic, height=6, wrap="word")
-        self.image_capture_skus_text.pack(fill=X, pady=(4, 10))
+        ttk.Label(ic, text="Product page URL:").pack(anchor=W)
+        ttk.Entry(ic, textvariable=self.image_capture_url, width=80).pack(fill=X, pady=(4, 12))
         ic_btn_row = ttk.Frame(ic)
         ic_btn_row.pack(fill=X)
         self.image_capture_run_btn = ttk.Button(ic_btn_row, text="Run Image Capture", command=self._run_image_capture)
@@ -1757,8 +1757,13 @@ class ProductProspectorDesktopApp:
             return ""
         record_type = str(getattr(product, "record_type", "") or "").strip().lower()
         variant_gid = str(getattr(product, "variant_gid", "") or "").strip()
-        if self.session.mode == MODE_UPDATE and record_type == "variant" and variant_gid:
-            return variant_gid
+        if self.session.mode == MODE_UPDATE:
+            if record_type == "variant" and variant_gid:
+                return variant_gid
+            if record_type == "product":
+                product_gid = str(getattr(product, "product_gid", "") or "").strip()
+                if product_gid:
+                    return f"parent:{product_gid}"
         return normalize_sku(getattr(product, "sku", ""))
 
     def _is_push_eligible(self, product) -> bool:
@@ -1768,9 +1773,12 @@ class ProductProspectorDesktopApp:
             return False
         if self.session.mode == MODE_UPDATE:
             record_type = str(getattr(product, "record_type", "") or "").strip().lower()
-            if record_type != "variant":
-                return False
-            return bool(str(getattr(product, "variant_gid", "") or "").strip())
+            if record_type == "variant":
+                return bool(str(getattr(product, "variant_gid", "") or "").strip())
+            if record_type == "product":
+                product_gid = str(getattr(product, "product_gid", "") or "").strip()
+                return bool(product_gid)
+            return False
         return bool(normalize_sku(getattr(product, "sku", "")))
 
     @staticmethod
@@ -2106,6 +2114,12 @@ class ProductProspectorDesktopApp:
         self._review_entry_row(form_grid, "Google MPN", "mpn", 5, 2)
         self._review_entry_row(form_grid, "Brand", "brand", 6, 2)
         self._review_entry_row(form_grid, "Application", "application", 7, 2)
+        self.fitment_vehicles_check = ttk.Checkbutton(
+            form_grid,
+            text="Add Fitment Vehicles",
+            variable=self.push_fitment_vehicles,
+        )
+        self.fitment_vehicles_check.grid_remove()
         self._review_entry_row(form_grid, "Core Charge Code", "core_charge_product_code", 8, 2)
         self._review_collections_row(form_grid, 9, 2)
 
@@ -2873,6 +2887,23 @@ class ProductProspectorDesktopApp:
             values,
             strict_catalog=False,
         )
+        self._sync_review_tags_field()
+        self._render_review_tags_editor(query="", trailing_comma=False)
+        self._hide_review_tags_suggestions()
+        self.review_tags_query.set("")
+
+    def _set_review_tags_raw(self, values: list[str]) -> None:
+        """Set tags exactly as given, bypassing catalog validation (e.g. for Shopify-sourced tags)."""
+        seen: set[str] = set()
+        selected: list[str] = []
+        for raw in values:
+            value = str(raw or "").strip()
+            key = self._tag_key(value)
+            if not value or not key or key in seen:
+                continue
+            seen.add(key)
+            selected.append(value)
+        self.review_tag_selected = selected
         self._sync_review_tags_field()
         self._render_review_tags_editor(query="", trailing_comma=False)
         self._hide_review_tags_suggestions()
@@ -4187,7 +4218,11 @@ class ProductProspectorDesktopApp:
             self.review_loaded_truncated[field_name] = truncated
             var.set(display)
         self._set_review_collections_from_text(self.review_loaded_raw.get("collections", ""))
-        self._set_review_tags_from_values(list(getattr(product, "tags", []) or []))
+        product_tags = list(getattr(product, "tags", []) or [])
+        if str(getattr(product, "product_gid", "") or "").strip():
+            self._set_review_tags_raw(product_tags)
+        else:
+            self._set_review_tags_from_values(product_tags)
         self.review_cost_option_map = {}
         self.review_cost_options = []
         self.review_cost_options_loaded_for_sku = ""
@@ -4260,6 +4295,17 @@ class ProductProspectorDesktopApp:
             self.review_variant_cost_rule_combo.configure(values=())
             self.review_variant_cost_rule_combo.configure(state="disabled")
             self.review_variant_cost_options_loaded_for_sku = ""
+        is_update_parent = (
+            self.session.mode == MODE_UPDATE
+            and record_type.lower() == "product"
+            and bool(str(getattr(product, "product_gid", "") or "").strip())
+        )
+        if hasattr(self, "fitment_vehicles_check"):
+            try:
+                self.fitment_vehicles_check.grid() if is_update_parent else self.fitment_vehicles_check.grid_remove()
+            except Exception:
+                pass
+
         self._highlight_review_table_current_product()
         self._refresh_push_button_state()
 
@@ -6480,6 +6526,16 @@ class ProductProspectorDesktopApp:
             except Exception:
                 pass
 
+            # Keep the fitment checkbox immediately after the application entry
+            if field_name == "application" and hasattr(self, "fitment_vehicles_check"):
+                try:
+                    if self.fitment_vehicles_check.winfo_manager():
+                        fitment_row = next_row_by_column.get(col_offset, target_row + 1)
+                        self.fitment_vehicles_check.grid_configure(row=fitment_row, column=col_offset, columnspan=2)
+                        next_row_by_column[col_offset] = fitment_row + 1
+                except Exception:
+                    pass
+
     def _update_tab_access(self) -> None:
         if not hasattr(self, "notebook"):
             return
@@ -6793,54 +6849,35 @@ class ProductProspectorDesktopApp:
             return
         url = self.image_capture_url.get().strip()
         if not url:
-            messagebox.showwarning(APP_TITLE, "Enter a vendor search URL before running.")
-            return
-        raw_skus = self.image_capture_skus_text.get("1.0", END).strip() if self.image_capture_skus_text else ""
-        skus = [s.strip() for s in re.split(r"[\r\n,;| \t]+", raw_skus) if s.strip()]
-        if not skus:
-            messagebox.showwarning(APP_TITLE, "Enter at least one SKU.")
+            messagebox.showwarning(APP_TITLE, "Enter a product page URL before running.")
             return
 
         self.image_capture_inflight = True
         self.image_capture_run_btn.configure(state="disabled")
-        self.image_capture_status.set(f"Capturing images for {len(skus)} SKU(s)…")
+        self.image_capture_status.set("Fetching page and downloading images…")
         self.image_capture_progress.start(12)
 
         output_root = self.runtime_output_root / "images"
 
         def _worker() -> None:
             try:
-                from product_prospector.core.scraper_engine import scrape_vendor_records
-                results, sku_errors, general_errors = scrape_vendor_records(
-                    vendor_search_url=url,
-                    skus=skus,
-                    workers=1,
-                    retry_count=2,
-                    delay_seconds=0.35,
-                    scrape_images=True,
+                local_files, media_folder, error = scrape_product_page_images(
+                    product_url=url,
                     image_output_root=output_root,
-                    requested_fields={"media_urls"},
-                    required_root=self.required_root,
                 )
-                total_images = 0
-                for sku in skus:
-                    sku_folder = output_root / sku
-                    if sku_folder.exists():
-                        total_images += sum(1 for f in sku_folder.iterdir() if f.is_file())
 
                 def _done() -> None:
                     self.image_capture_progress.stop()
                     self.image_capture_inflight = False
                     self.image_capture_run_btn.configure(state="normal")
-                    if general_errors or sku_errors:
-                        err_summary = "; ".join(list(sku_errors.values())[:3] + general_errors[:2])
-                        self.image_capture_status.set(
-                            f"Done — {total_images} image(s) saved to {output_root}\nWarnings: {err_summary}"
-                        )
+                    count = len(local_files)
+                    if count:
+                        msg = f"Done — {count} image(s) saved to {media_folder}"
+                        if error:
+                            msg += f"\nNote: {error}"
                     else:
-                        self.image_capture_status.set(
-                            f"Done — {total_images} image(s) saved to {output_root}"
-                        )
+                        msg = f"No images saved. {error or 'No images found on page.'}"
+                    self.image_capture_status.set(msg)
                 self.root.after(0, _done)
             except Exception as exc:
                 def _err() -> None:
@@ -6964,21 +7001,52 @@ class ProductProspectorDesktopApp:
 
     def _push_variant_updates_clicked(self) -> None:
         if not self.session.products:
-            messagebox.showwarning(APP_TITLE, "No variant rows available to update.")
+            messagebox.showwarning(APP_TITLE, "No rows available to update.")
             return
 
         self._save_current_review_product()
-        selected_variants = self._selected_update_variant_rows()
-        if not selected_variants:
-            messagebox.showwarning(APP_TITLE, "No variant rows selected for push.")
+        selected_rows = self._selected_update_variant_rows()
+        if not selected_rows:
+            messagebox.showwarning(APP_TITLE, "No rows selected for push.")
             return
 
-        updates: list[VariantWeightUpdate] = []
+        weight_updates: list[VariantWeightUpdate] = []
+        app_updates: list[ProductApplicationUpdate] = []
         skipped_unchanged = 0
         skipped_invalid = 0
-        for row in selected_variants:
-            variant_gid = str(getattr(row, "variant_gid", "") or "").strip()
+
+        for row in selected_rows:
+            record_type = str(getattr(row, "record_type", "") or "").strip().lower()
             product_gid = str(getattr(row, "product_gid", "") or "").strip()
+            product_id = str(getattr(row, "product_id", "") or "").strip()
+
+            if record_type == "product":
+                # Parent row — push application metafield
+                if not product_gid and not product_id:
+                    skipped_invalid += 1
+                    continue
+                application = str(getattr(row, "application", "") or "").strip()
+                if not application:
+                    skipped_invalid += 1
+                    continue
+                original_application = str(getattr(row, "original_application", "") or "").strip()
+                want_fitment = bool(self.push_fitment_vehicles.get())
+                if not want_fitment and original_application and original_application == application:
+                    skipped_unchanged += 1
+                    continue
+                app_updates.append(
+                    ProductApplicationUpdate(
+                        product_id=product_id,
+                        product_gid=product_gid,
+                        application=application,
+                        original_application=original_application,
+                        push_fitment_vehicles=want_fitment,
+                    )
+                )
+                continue
+
+            # Variant row — push weight
+            variant_gid = str(getattr(row, "variant_gid", "") or "").strip()
             if not variant_gid or not product_gid:
                 skipped_invalid += 1
                 continue
@@ -6992,7 +7060,7 @@ class ProductProspectorDesktopApp:
             if original_weight is not None and abs(float(new_weight) - float(original_weight)) < 0.000001 and new_unit == original_unit:
                 skipped_unchanged += 1
                 continue
-            updates.append(
+            weight_updates.append(
                 VariantWeightUpdate(
                     product_gid=product_gid,
                     variant_gid=variant_gid,
@@ -7001,25 +7069,28 @@ class ProductProspectorDesktopApp:
                 )
             )
 
-        if not updates:
+        if not weight_updates and not app_updates:
             details = []
             if skipped_unchanged:
                 details.append(f"unchanged: {skipped_unchanged}")
             if skipped_invalid:
-                details.append(f"invalid weight/id: {skipped_invalid}")
+                details.append(f"invalid/missing fields: {skipped_invalid}")
             suffix = f" ({', '.join(details)})" if details else ""
-            messagebox.showinfo(APP_TITLE, f"No variant weight updates to push{suffix}.")
+            messagebox.showinfo(APP_TITLE, f"No updates to push{suffix}.")
             return
 
+        confirm_lines = []
+        if weight_updates:
+            confirm_lines.append(f"Variant weight updates: {len(weight_updates)}")
+        if app_updates:
+            confirm_lines.append(f"Application metafield updates: {len(app_updates)}")
+        if skipped_unchanged:
+            confirm_lines.append(f"Skipped unchanged: {skipped_unchanged}")
+        if skipped_invalid:
+            confirm_lines.append(f"Skipped invalid: {skipped_invalid}")
         confirmed = messagebox.askyesno(
             APP_TITLE,
-            (
-                f"Update variant weight for {len(updates)} variant(s)?\n\n"
-                f"Selected variants: {len(selected_variants)}\n"
-                f"Skipped unchanged: {skipped_unchanged}\n"
-                f"Skipped invalid: {skipped_invalid}\n\n"
-                "Only changed variant weight values will be sent."
-            ),
+            "\n".join(confirm_lines) + "\n\nPush to Shopify?",
         )
         if not confirmed:
             return
@@ -7037,9 +7108,10 @@ class ProductProspectorDesktopApp:
             return
 
         self._set_shopify_push_busy(True)
-        self.review_busy_text.set(f"Updating variant weights... 0/{len(updates)}")
-        self._show_review_busy_overlay(f"Updating variant weights... 0/{len(updates)}")
-        self.review_status_text.set(f"Pushing {len(updates)} variant weight updates to Shopify...")
+        total_ops = len(weight_updates) + len(app_updates)
+        self.review_busy_text.set(f"Pushing updates... 0/{total_ops}")
+        self._show_review_busy_overlay(f"Pushing updates... 0/{total_ops}")
+        self.review_status_text.set(f"Pushing {total_ops} update(s) to Shopify...")
         operator_tag = _tag_for_owner(self.inventory_owner.get())
 
         worker = threading.Thread(
@@ -7047,7 +7119,9 @@ class ProductProspectorDesktopApp:
             kwargs={
                 "config": config,
                 "access_token": token.access_token,
-                "updates": updates,
+                "updates": weight_updates,
+                "app_updates": app_updates,
+                "required_root": self.required_root,
                 "operator_tag": operator_tag,
             },
             daemon=True,
@@ -7059,39 +7133,64 @@ class ProductProspectorDesktopApp:
         config,
         access_token: str,
         updates: list[VariantWeightUpdate],
+        app_updates: list[ProductApplicationUpdate] | None = None,
+        required_root=None,
         operator_tag: str = "",
     ) -> None:
         summary = None
+        app_summary: ProductApplicationUpdateSummary | None = None
         tag_summary = None
         error_text: str | None = None
         tag_error_text: str | None = None
 
         try:
-            def on_progress(done: int, total: int, variant_gid: str) -> None:
-                short_id = str(variant_gid or "").strip().rsplit("/", 1)[-1]
-                label = f"Updating variant weights... {done}/{total}"
-                if short_id:
-                    label += f" | {short_id}"
-                self._run_on_ui_thread(self.review_busy_text.set, label)
+            if app_updates:
+                def on_app_progress(done: int, total: int, product_gid: str) -> None:
+                    short_id = str(product_gid or "").strip().rsplit("/", 1)[-1]
+                    label = f"Updating application... {done}/{total}"
+                    if short_id:
+                        label += f" | {short_id}"
+                    self._run_on_ui_thread(self.review_busy_text.set, label)
 
-            summary = push_variant_weights_bulk(
-                config=config,
-                access_token=access_token,
-                updates=updates,
-                progress_callback=on_progress,
-            )
+                app_summary = push_product_application_bulk(
+                    config=config,
+                    access_token=access_token,
+                    updates=app_updates,
+                    required_root=required_root,
+                    progress_callback=on_app_progress,
+                )
+
+            if updates:
+                def on_progress(done: int, total: int, variant_gid: str) -> None:
+                    short_id = str(variant_gid or "").strip().rsplit("/", 1)[-1]
+                    label = f"Updating variant weights... {done}/{total}"
+                    if short_id:
+                        label += f" | {short_id}"
+                    self._run_on_ui_thread(self.review_busy_text.set, label)
+
+                summary = push_variant_weights_bulk(
+                    config=config,
+                    access_token=access_token,
+                    updates=updates,
+                    progress_callback=on_progress,
+                )
 
             operator_value = str(operator_tag or "").strip()
-            if summary is not None and operator_value:
-                updated_variant_ids = {str(item or "").strip() for item in summary.updated_variant_ids if str(item or "").strip()}
-                target_product_gids = sorted(
-                    {
-                        str(item.product_gid or "").strip()
-                        for item in updates
-                        if str(item.product_gid or "").strip()
-                        and str(item.variant_gid or "").strip() in updated_variant_ids
-                    }
-                )
+            if operator_value:
+                tag_product_gids: set[str] = set()
+                if app_summary is not None:
+                    for gid in app_summary.updated_product_ids:
+                        clean = str(gid or "").strip()
+                        if clean:
+                            tag_product_gids.add(clean)
+                if summary is not None:
+                    updated_variant_ids = {str(item or "").strip() for item in summary.updated_variant_ids if str(item or "").strip()}
+                    for item in (updates or []):
+                        if str(item.variant_gid or "").strip() in updated_variant_ids:
+                            clean = str(item.product_gid or "").strip()
+                            if clean:
+                                tag_product_gids.add(clean)
+                target_product_gids = sorted(tag_product_gids)
                 if target_product_gids:
                     def on_tag_progress(done: int, total: int, product_gid: str) -> None:
                         short_id = str(product_gid or "").strip().rsplit("/", 1)[-1]
@@ -7108,7 +7207,7 @@ class ProductProspectorDesktopApp:
                         progress_callback=on_tag_progress,
                     )
         except Exception as exc:
-            if summary is None:
+            if summary is None and app_summary is None:
                 error_text = str(exc)
             else:
                 tag_error_text = str(exc)
@@ -7116,62 +7215,66 @@ class ProductProspectorDesktopApp:
         def apply() -> None:
             self._set_shopify_push_busy(False)
             if error_text:
-                self.review_status_text.set(f"Variant update failed: {error_text}")
-                messagebox.showerror(APP_TITLE, f"Variant update failed:\n{error_text}")
-                return
-            if summary is None:
-                self.review_status_text.set("Variant update failed: empty response.")
-                messagebox.showerror(APP_TITLE, "Variant update failed: empty response.")
+                self.review_status_text.set(f"Update failed: {error_text}")
+                messagebox.showerror(APP_TITLE, f"Update failed:\n{error_text}")
                 return
 
-            updated_ids = {str(item or "").strip() for item in summary.updated_variant_ids if str(item or "").strip()}
-            failed_count = int(len(summary.failed_by_variant_id))
-            for row in self.session.products or []:
-                variant_gid = str(getattr(row, "variant_gid", "") or "").strip()
-                if not variant_gid or variant_gid not in updated_ids:
-                    continue
-                row.original_variant_weight_value = str(getattr(row, "weight", "") or "").strip()
-                row.original_variant_weight_unit = str(getattr(row, "variant_weight_unit", "") or "POUNDS").strip().upper() or "POUNDS"
+            details: list[str] = []
 
-            self._schedule_review_table_refresh()
-            updated_count = len(updated_ids)
+            # Application updates
+            if app_summary is not None:
+                app_updated_count = len(app_summary.updated_product_ids)
+                app_failed_count = len(app_summary.failed_by_product_id)
+                updated_app_ids = {str(item or "").strip() for item in app_summary.updated_product_ids if str(item or "").strip()}
+                for row in self.session.products or []:
+                    record_type = str(getattr(row, "record_type", "") or "").strip().lower()
+                    if record_type != "product":
+                        continue
+                    product_gid = str(getattr(row, "product_gid", "") or "").strip()
+                    if product_gid and product_gid in updated_app_ids:
+                        row.original_application = str(getattr(row, "application", "") or "").strip()
+                details.append(f"Application updated: {app_updated_count}, failed: {app_failed_count}")
+                if app_summary.failed_by_product_id:
+                    details.append("Application failures:")
+                    for gid, reason in list(app_summary.failed_by_product_id.items())[:5]:
+                        short_id = str(gid or "").strip().rsplit("/", 1)[-1]
+                        details.append(f"  - {short_id}: {reason}")
+
+            # Weight updates
+            if summary is not None:
+                updated_ids = {str(item or "").strip() for item in summary.updated_variant_ids if str(item or "").strip()}
+                failed_count = int(len(summary.failed_by_variant_id))
+                for row in self.session.products or []:
+                    variant_gid = str(getattr(row, "variant_gid", "") or "").strip()
+                    if not variant_gid or variant_gid not in updated_ids:
+                        continue
+                    row.original_variant_weight_value = str(getattr(row, "weight", "") or "").strip()
+                    row.original_variant_weight_unit = str(getattr(row, "variant_weight_unit", "") or "POUNDS").strip().upper() or "POUNDS"
+                updated_count = len(updated_ids)
+                details.append(f"Variant weight updated: {updated_count}, failed: {failed_count}")
+                if summary.failed_by_variant_id:
+                    details.append("Weight failures:")
+                    for variant_gid, reason in list(summary.failed_by_variant_id.items())[:5]:
+                        short_id = str(variant_gid or "").strip().rsplit("/", 1)[-1]
+                        details.append(f"  - {short_id}: {reason}")
+
+            # Operator tag
             tag_applied_count = len(tag_summary.tagged_product_ids) if tag_summary is not None else 0
             tag_already_count = len(tag_summary.skipped_already_tagged_product_ids) if tag_summary is not None else 0
             tag_failed_count = len(tag_summary.failed_by_product_id) if tag_summary is not None else 0
-            status_text = f"Variant weight push complete: updated {updated_count}, failed {failed_count}."
             if str(operator_tag or "").strip():
-                status_text = (
-                    f"Variant weight push complete: updated {updated_count}, failed {failed_count}, "
-                    f"operator tag applied {tag_applied_count} product(s), already tagged {tag_already_count}."
-                )
-            self.review_status_text.set(status_text)
-
-            details: list[str] = [
-                f"Requested: {summary.requested}",
-                f"Updated: {updated_count}",
-                f"Failed: {failed_count}",
-            ]
-            if str(operator_tag or "").strip():
-                details.append(f"Operator tag: {str(operator_tag or '').strip()}")
-                details.append(f"Tagged parent products: {tag_applied_count}")
-                details.append(f"Already had operator tag: {tag_already_count}")
-                details.append(f"Tag failures: {tag_failed_count}")
+                details.append(f"Operator tag applied: {tag_applied_count}, already tagged: {tag_already_count}, failed: {tag_failed_count}")
             if tag_error_text:
-                details.append("")
                 details.append(f"Tagging warning: {tag_error_text}")
-            if summary.failed_by_variant_id:
-                details.append("")
-                details.append("Failure samples:")
-                for variant_gid, reason in list(summary.failed_by_variant_id.items())[:8]:
-                    short_id = str(variant_gid or "").strip().rsplit("/", 1)[-1]
-                    details.append(f"- {short_id}: {reason}")
             if tag_summary is not None and tag_summary.failed_by_product_id:
-                details.append("")
-                details.append("Tag failure samples:")
-                for product_gid, reason in list(tag_summary.failed_by_product_id.items())[:8]:
+                for product_gid, reason in list(tag_summary.failed_by_product_id.items())[:5]:
                     short_id = str(product_gid or "").strip().rsplit("/", 1)[-1]
-                    details.append(f"- {short_id}: {reason}")
-            messagebox.showinfo(APP_TITLE, "\n".join(details))
+                    details.append(f"  - {short_id}: {reason}")
+
+            self._schedule_review_table_refresh()
+            status_text = " | ".join(details[:2]) if details else "Push complete."
+            self.review_status_text.set(status_text)
+            messagebox.showinfo(APP_TITLE, "\n".join(details) if details else "Push complete.")
 
         self._run_on_ui_thread(apply)
 
@@ -7209,23 +7312,42 @@ class ProductProspectorDesktopApp:
                 str(getattr(lead, "product_collections", "") or "").strip()
             )
 
+            parent_application = str(lead.product_application or "").strip()
+
+            # Pass Shopify tags through as-is; display layer handles raw tags for Shopify-sourced products.
+            parent_tags = [t.strip() for t in str(getattr(lead, "product_tags", "") or "").split(",") if t.strip()]
+
+            # If no locally-supported collections from Shopify, auto-generate from type + application.
+            parent_type = str(lead.product_type or "").strip()
+            if not filtered_parent_collections and (parent_type or parent_application):
+                collection_targets, _ = resolve_collection_assignments(
+                    product_type=parent_type,
+                    application_text=parent_application,
+                    required_root=self.required_root,
+                    title_text=str(lead.product_title or "").strip(),
+                    description_text=str(lead.product_description_html or "").strip(),
+                )
+                auto_collections = self._collection_titles_text_from_targets(collection_targets)
+                if auto_collections:
+                    filtered_parent_collections = auto_collections
+
             parent_row = Product(
                 record_type="Product",
                 parent_has_variants=parent_has_variants,
-                excluded=True,
-                exclusion_reason="Parent row is for reference. Push variant rows.",
                 title=str(lead.product_title or "").strip(),
                 description_html=str(lead.product_description_html or "").strip(),
                 vendor=str(lead.product_vendor or "").strip(),
-                type=str(lead.product_type or "").strip(),
+                type=parent_type,
                 google_product_type=str(getattr(lead, "product_google_product_type", "") or "").strip(),
                 category_code=str(getattr(lead, "product_category_code", "") or "").strip(),
                 product_subtype=str(getattr(lead, "product_subtype", "") or "").strip(),
-                application=str(lead.product_application or "").strip(),
+                application=parent_application,
                 collections=filtered_parent_collections,
+                tags=parent_tags,
                 sku=str(lead.variant_sku or "").strip(),
                 product_gid=str(lead.product_gid or "").strip(),
                 product_id=str(lead.product_id or "").strip(),
+                original_application=parent_application,
             )
             parent_row.finalize_defaults()
             rows.append(parent_row)
