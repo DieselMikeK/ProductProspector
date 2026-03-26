@@ -23,12 +23,35 @@ from product_prospector.core.vendor_normalization import (
 
 
 _HTML_STRIP_RE = re.compile(r"<[^>]+>")
+_FITMENT_YEAR_MIN = 1930.0
+_FITMENT_YEAR_MAX = 2035.0
+_DEFAULT_UPDATE_NORMALIZE_FIELDS = {
+    "title",
+    "price",
+    "cost",
+    "description_html",
+    "media_urls",
+    "vendor",
+    "weight",
+    "barcode",
+    "application",
+    "type",
+    "google_product_type",
+    "category_code",
+    "product_subtype",
+}
 
 
 def _clean_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _is_plausible_fitment_year_value(value: float | None) -> bool:
+    if value is None:
+        return False
+    return _FITMENT_YEAR_MIN <= float(value) <= _FITMENT_YEAR_MAX
 
 
 def _to_float(value: object) -> float | None:
@@ -53,6 +76,89 @@ def _normalize_description_html(text: str) -> str:
     value = re.sub(r"<style[\s\S]*?</style>", "", value, flags=re.IGNORECASE)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     return value.strip()
+
+
+def _split_description_chunks(raw: str) -> list[str]:
+    text = _clean_text(raw)
+    if not text:
+        return []
+    chunks = re.split(r"(?is)</p>|<br\s*/?>|[\r\n]+", text)
+    output: list[str] = []
+    for chunk in chunks:
+        value = _clean_text(chunk)
+        if value:
+            output.append(value)
+    return output
+
+
+def _merge_description_values(primary: str, secondary: str) -> str:
+    primary_text = _clean_text(primary)
+    secondary_text = _clean_text(secondary)
+    if not primary_text:
+        return secondary_text
+    if not secondary_text:
+        return primary_text
+
+    primary_key = re.sub(r"\s+", " ", primary_text).strip().lower()
+    secondary_key = re.sub(r"\s+", " ", secondary_text).strip().lower()
+    if primary_key == secondary_key:
+        return primary_text
+    if primary_key and primary_key in secondary_key:
+        return secondary_text
+    if secondary_key and secondary_key in primary_key:
+        return primary_text
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for chunk in _split_description_chunks(primary_text) + _split_description_chunks(secondary_text):
+        key = re.sub(r"<[^>]+>", " ", chunk)
+        key = re.sub(r"[^a-z0-9]+", " ", key.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(chunk)
+    return "\n".join(merged) if merged else primary_text
+
+
+def _title_quality_score(value: str) -> float:
+    text = _clean_text(value)
+    if not text:
+        return -999.0
+    low = text.lower()
+    score = min(2.0, len(text) / 60.0)
+    if re.search(r"\b\d{2,4}(?:\.5)?\s*[-/]\s*\d{2,4}(?:\.5)?\b", text):
+        score += 2.0
+    if re.search(r"(?i)\b(ford|ram|dodge|chevy|chevrolet|gmc|gm|jeep|nissan|cummins|duramax|powerstroke)\b", text):
+        score += 1.5
+    if "search results" in low:
+        score -= 5.0
+    if re.search(r"(?i)\|#?[a-z0-9._/-]+\|", text):
+        score -= 0.5
+    return score
+
+
+def _merge_title_values(primary: str, secondary: str) -> str:
+    primary_text = _clean_text(primary)
+    secondary_text = _clean_text(secondary)
+    if not primary_text:
+        return secondary_text
+    if not secondary_text:
+        return primary_text
+
+    primary_key = re.sub(r"\s+", " ", primary_text).strip().lower()
+    secondary_key = re.sub(r"\s+", " ", secondary_text).strip().lower()
+    if primary_key == secondary_key:
+        return primary_text
+    if primary_key and primary_key in secondary_key:
+        return secondary_text
+    if secondary_key and secondary_key in primary_key:
+        return primary_text
+
+    primary_score = _title_quality_score(primary_text)
+    secondary_score = _title_quality_score(secondary_text)
+    if secondary_score > primary_score + 0.15:
+        return secondary_text
+    return primary_text
 
 
 def _normalize_vendor_name(vendor: str, required_root: Path | None = None) -> str:
@@ -91,6 +197,36 @@ def _sanitize_text_for_parse(value: str) -> str:
     text = text.replace("\u2013", "-").replace("\u2014", "-")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _looks_like_all_caps_text(value: str) -> bool:
+    text = _clean_text(value)
+    letters = [char for char in text if char.isalpha()]
+    if len(letters) < 4:
+        return False
+    return all(char.isupper() for char in letters)
+
+
+def _smart_title_case_text(value: str) -> str:
+    text = _sanitize_text_for_parse(value)
+    if not _looks_like_all_caps_text(text):
+        return text
+
+    def transform_piece(piece: str) -> str:
+        token = _clean_text(piece)
+        if not token:
+            return piece
+        if re.fullmatch(r"[A-Z0-9]+", token) and (any(char.isdigit() for char in token) or len(token) <= 3):
+            return token
+        if token.isupper():
+            return token[:1] + token[1:].lower()
+        return token[:1].upper() + token[1:]
+
+    output: list[str] = []
+    for token in text.split(" "):
+        parts = re.split(r"([/-])", token)
+        output.append("".join(transform_piece(part) if part not in {"/", "-"} else part for part in parts))
+    return " ".join(output).strip()
 
 
 def _short_year_token(year_text: str) -> str:
@@ -144,6 +280,10 @@ def _extract_year_ranges(text: str) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
     for match in pattern.finditer(source):
+        raw_start_value = _year_token_to_value(match.group(1))
+        raw_end_value = _year_token_to_value(match.group(2))
+        if not _is_plausible_fitment_year_value(raw_start_value) or not _is_plausible_fitment_year_value(raw_end_value):
+            continue
         start = _short_year_token(match.group(1))
         end = _short_year_token(match.group(2))
         if not start or not end:
@@ -154,6 +294,23 @@ def _extract_year_ranges(text: str) -> list[str]:
         seen.add(token)
         output.append(token)
     return output
+
+
+def _extract_open_ended_year_token(text: str) -> str:
+    source = _sanitize_text_for_parse(text)
+    if not source:
+        return ""
+    match = re.search(
+        r"\b(\d{2,4}(?:\.5)?)\s*(?:\+|plus|current)(?=\s|$)",
+        source,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    start = _expand_year_token_to_full(match.group(1))
+    if not start:
+        return ""
+    return f"{start}+"
 
 
 def _expand_short_year_ranges(text: str) -> str:
@@ -177,10 +334,21 @@ def _derive_application_from_title(title_text: str) -> str:
     if not source:
         return ""
     pattern = re.compile(r"\b\d{2,4}(?:\.5)?\s*-\s*\d{2,4}(?:\.5)?\b", flags=re.IGNORECASE)
-    match = pattern.search(source)
+    match = None
+    for candidate in pattern.finditer(source):
+        match = candidate
     if not match:
         return ""
-    fitment = source[match.start() :].strip(" -")
+    fitment_start = match.start()
+    make_matches = list(
+        re.finditer(
+            r"(?i)\b(?:ford|ram|dodge|gmc|chevy|chevrolet|gm|jeep|nissan|toyota)\b",
+            source[: match.start()],
+        )
+    )
+    if make_matches:
+        fitment_start = make_matches[-1].start()
+    fitment = source[fitment_start:].strip(" -")
     fitment = _expand_short_year_ranges(fitment)
     fitment = re.sub(r"\s+", " ", fitment).strip()
     return fitment
@@ -198,6 +366,39 @@ def _looks_like_fitment_text(value: str) -> bool:
         )
     )
     return has_year and has_vehicle
+
+
+def _application_compare_key(value: str) -> str:
+    source = _expand_short_year_ranges(_sanitize_text_for_parse(value))
+    source = re.sub(r"\s+", " ", source).strip().lower()
+    return source
+
+
+def _application_has_verbose_fitment_dump(value: str) -> bool:
+    raw = _clean_text(value)
+    source = _sanitize_text_for_parse(value)
+    if not raw or not source:
+        return False
+    if "|" in raw or "\n" in raw:
+        return True
+    year_ranges = _extract_year_ranges(source)
+    if len(year_ranges) >= 2:
+        return True
+    if source.count("(") >= 1 and _looks_like_fitment_text(source):
+        return True
+    return False
+
+
+def _application_should_collapse_to_canonical(application: str, canonical_application: str) -> bool:
+    raw_key = _application_compare_key(application)
+    canonical_key = _application_compare_key(canonical_application)
+    if not raw_key or not canonical_key or raw_key == canonical_key:
+        return False
+    if _application_has_verbose_fitment_dump(application):
+        return True
+    if _looks_like_fitment_text(application) and len(raw_key) >= int(len(canonical_key) * 1.5):
+        return True
+    return False
 
 
 def _detect_make_label(text: str) -> str:
@@ -599,6 +800,14 @@ def _extract_model_tokens(text: str, make_label: str) -> list[str]:
         if "canyon" in low:
             add("Canyon")
     elif make_label == "Jeep":
+        if re.search(r"\bjl\b", low):
+            add("JL")
+        if re.search(r"\bjlu\b", low):
+            add("JLU")
+        if re.search(r"\bjt\b", low):
+            add("JT")
+        if re.search(r"\bjk\b", low):
+            add("JK")
         if "gladiator" in low:
             add("Gladiator")
         if "wrangler" in low:
@@ -637,6 +846,77 @@ def _format_short_year_range(start: float, end: float) -> str:
     if start_text == end_text:
         return start_text
     return f"{start_text}-{end_text}"
+
+
+def _application_repeats_title(application: str, title: str) -> bool:
+    app_text = _sanitize_text_for_parse(application).lower()
+    title_text = _sanitize_text_for_parse(title).lower()
+    if not app_text or not title_text:
+        return False
+    return app_text == title_text
+
+
+def _title_product_phrase(title_text: str) -> str:
+    source = _sanitize_text_for_parse(title_text)
+    if not source:
+        return ""
+    pattern = re.compile(r"\b\d{2,4}(?:\.5)?\s*-\s*\d{2,4}(?:\.5)?\b", flags=re.IGNORECASE)
+    match = None
+    for candidate in pattern.finditer(source):
+        match = candidate
+    if not match:
+        return source
+    fitment_start = match.start()
+    make_matches = list(
+        re.finditer(
+            r"(?i)\b(?:ford|ram|dodge|gmc|chevy|chevrolet|gm|jeep|nissan|toyota)\b",
+            source[: match.start()],
+        )
+    )
+    if make_matches:
+        fitment_start = make_matches[-1].start()
+    return source[:fitment_start].strip(" -|/")
+
+
+def _application_contains_title_product_phrase(application: str, title: str) -> bool:
+    app_text = _sanitize_text_for_parse(application).lower()
+    product_phrase = _title_product_phrase(title).lower()
+    if not app_text or not product_phrase:
+        return False
+    ignored_tokens = {
+        "and",
+        "the",
+        "for",
+        "with",
+        "complete",
+        "performance",
+        "oem",
+        "kit",
+        "replacement",
+        "direct",
+        "fit",
+    }
+    phrase_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", product_phrase)
+        if len(token) >= 4 and token not in ignored_tokens
+    ]
+    if len(phrase_tokens) < 2:
+        return False
+    matched_tokens = [token for token in phrase_tokens if re.search(rf"\b{re.escape(token)}\b", app_text)]
+    return len(matched_tokens) >= 2
+
+
+def _application_starts_with_vendor(application: str, vendor: str) -> bool:
+    app_text = _sanitize_text_for_parse(application).lower()
+    vendor_text = _sanitize_text_for_parse(vendor).lower()
+    if not app_text or not vendor_text:
+        return False
+    vendor_tokens = [token for token in vendor_text.split() if len(token) >= 3]
+    if not vendor_tokens:
+        return False
+    vendor_phrase = " ".join(vendor_tokens)
+    return app_text == vendor_phrase or app_text.startswith(f"{vendor_phrase} ")
 
 
 def _sort_liter_tokens(tokens: list[str]) -> list[str]:
@@ -899,6 +1179,57 @@ def _build_fitment_suffix_legacy(
     return " ".join([item for item in parts if item]).strip()
 
 
+def _build_open_ended_fitment_suffix(
+    application: str,
+    title: str,
+    description: str,
+    required_root: Path | None = None,
+) -> str:
+    combined = " ".join([application, title, description]).strip()
+    if not combined or _is_universal_fitment(combined):
+        return ""
+
+    year_text = (
+        _extract_open_ended_year_token(application)
+        or _extract_open_ended_year_token(title)
+        or _extract_open_ended_year_token(description)
+    )
+    if not year_text:
+        return ""
+
+    make_label = _detect_make_label(combined)
+    if not make_label:
+        return ""
+
+    family = _detect_engine_family_token(combined) or _detect_drive_family(combined, make_label)
+    liters = _extract_liter_tokens(combined)
+    if not liters:
+        inferred_liter = _infer_engine_liter_from_fitment(
+            years=[year_text.rstrip("+")],
+            make_label=make_label,
+            drive=family,
+            context_text=combined,
+            required_root=required_root,
+        )
+        if inferred_liter:
+            liters = [inferred_liter]
+    models = _extract_model_tokens(combined, make_label)
+    engine_families = {"Cummins", "Duramax", "Powerstroke", "EcoDiesel"}
+    fitment_looks_like_body = bool(models) and not liters and family not in engine_families
+    is_body_part = fitment_looks_like_body or _looks_like_body_part(title=title, description=description)
+
+    parts: list[str] = [year_text, make_label]
+    if is_body_part:
+        if models:
+            parts.append(" / ".join(models))
+    else:
+        if liters:
+            parts.append(" / ".join(liters))
+        if family:
+            parts.append(family)
+    return re.sub(r"\s+", " ", " ".join([item for item in parts if _clean_text(item)])).strip()
+
+
 def _build_fitment_suffix(
     application: str,
     title: str,
@@ -916,6 +1247,14 @@ def _build_fitment_suffix(
         required_root=required_root,
     )
     if not fitment_items:
+        open_ended_fitment = _build_open_ended_fitment_suffix(
+            application=application,
+            title=title,
+            description=description,
+            required_root=required_root,
+        )
+        if open_ended_fitment:
+            return open_ended_fitment
         return _build_fitment_suffix_legacy(
             application=application,
             title=title,
@@ -991,8 +1330,16 @@ def _build_concise_description(
         return ""
 
     source = _strip_vendor_tokens(source, vendor_tokens)
+    source = re.sub(
+        r"\b(?:1500|2500|3500|4500|5500)(?:\s*/\s*(?:1500|2500|3500|4500|5500))+\b",
+        " ",
+        source,
+        flags=re.IGNORECASE,
+    )
+    source = re.sub(r"\b\d{2,4}(?:\.5)?\s*(?:\+|plus|current)(?=\s|$)", " ", source, flags=re.IGNORECASE)
     source = re.sub(r"\b\d{2,4}(?:\.5)?\s*[-/]\s*\d{2,4}(?:\.5)?\b", " ", source)
-    source = re.sub(r"\b(?:ford|gm|gmc|chevy|chevrolet|ram|dodge)\b", " ", source, flags=re.IGNORECASE)
+    source = re.sub(r"\b(?:ford|gm|gmc|chevy|chevrolet|ram|dodge|jeep|nissan|toyota)\b", " ", source, flags=re.IGNORECASE)
+    source = re.sub(r"\b(?:jl|jlu|jt|jk|wrangler|gladiator)\b", " ", source, flags=re.IGNORECASE)
     source = re.sub(r"\b\d\.\d\s*l\b", " ", source, flags=re.IGNORECASE)
     source = re.sub(
         r"\b\d\.\d\s*(?=(?:power\s*stroke|powerstroke|duramax|cummins|eco\s*diesel|ecodiesel)\b)",
@@ -1093,6 +1440,7 @@ def _normalize_title(
         description=description,
         vendor_tokens=[token for token in vendor_tokens if _clean_text(token)],
     )
+    concise = _smart_title_case_text(concise)
     concise = _strip_leading_vendor_phrases(
         concise,
         vendor_tokens=[brand_label] + [token for token in vendor_tokens if _clean_text(token)],
@@ -1222,7 +1570,9 @@ def normalize_product(
     update_fields: set[str] | None = None,
     default_inventory: int | None = None,
 ) -> Product:
-    selected = set(update_fields or [])
+    selected = {str(field_name or "").strip() for field_name in (update_fields or []) if str(field_name or "").strip()}
+    if mode == "update" and not selected:
+        selected = set(_DEFAULT_UPDATE_NORMALIZE_FIELDS)
 
     def should(field_name: str) -> bool:
         if mode != "update":
@@ -1237,6 +1587,26 @@ def normalize_product(
     profile_brand = _clean_text(profile.brand_name) if profile is not None else ""
     profile_sku_prefix = _clean_text(profile.sku_prefix) if profile is not None else ""
 
+    raw_title_before_normalize = _clean_text(product.title)
+    application_title_context = _clean_text(getattr(product, "application_context_title", ""))
+    if application_title_context:
+        application_title_context = _merge_title_values(raw_title_before_normalize or product.title, application_title_context)
+    else:
+        application_title_context = raw_title_before_normalize or _clean_text(product.title)
+    application_description_context = _clean_text(getattr(product, "application_context_description", ""))
+    if application_description_context:
+        application_description_context = _merge_description_values(application_description_context, product.description_html)
+    else:
+        application_description_context = _clean_text(product.description_html)
+    title_only_canonical_application = _expand_short_year_ranges(
+        _build_fitment_suffix(
+            application="",
+            title=application_title_context,
+            description=application_description_context,
+            required_root=required_root,
+        )
+    )
+
     if should("vendor"):
         product.vendor = profile_vendor or normalized_vendor
     if should("application"):
@@ -1244,17 +1614,45 @@ def normalize_product(
     if should("description_html"):
         product.description_html = _normalize_description_html(product.description_html)
     if should("title"):
+        title_application_context = product.application
+        if title_only_canonical_application and _application_has_verbose_fitment_dump(product.application):
+            title_application_context = title_only_canonical_application
         product.title = _normalize_title(
             vendor=product.vendor,
             title=product.title,
-            application=product.application,
+            application=title_application_context,
             description=product.description_html,
             required_root=required_root,
         )
-    if should("application") and mode != "update":
-        derived_application = _derive_application_from_title(product.title)
+    if should("application"):
+        canonical_application = _expand_short_year_ranges(
+            _build_fitment_suffix(
+                application=product.application,
+                title=application_title_context,
+                description=application_description_context,
+                required_root=required_root,
+            )
+        )
+        if title_only_canonical_application and _application_has_verbose_fitment_dump(product.application):
+            if (
+                not canonical_application
+                or _application_should_collapse_to_canonical(canonical_application, title_only_canonical_application)
+            ):
+                canonical_application = title_only_canonical_application
+        derived_application = _derive_application_from_title(application_title_context) or _derive_application_from_title(product.title)
         if derived_application and (not _clean_text(product.application) or not _looks_like_fitment_text(product.application)):
             product.application = derived_application
+        if canonical_application and (
+            not _clean_text(product.application)
+            or not _looks_like_fitment_text(product.application)
+            or _application_should_collapse_to_canonical(product.application, canonical_application)
+            or _application_starts_with_vendor(product.application, product.vendor)
+            or _application_contains_title_product_phrase(product.application, application_title_context)
+            or _application_repeats_title(product.application, application_title_context)
+            or _application_repeats_title(product.application, raw_title_before_normalize)
+            or _application_repeats_title(product.application, product.title)
+        ):
+            product.application = canonical_application
     if should("media_urls"):
         product.media_urls = _normalize_media_urls(product.media_urls)
     if should("price"):

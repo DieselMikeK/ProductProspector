@@ -45,12 +45,16 @@ _HTTP_HOST_LOCKS_BY_HOST: dict[str, threading.Lock] = {}
 _HTTP_HOST_BACKOFF_LOCK = threading.Lock()
 _HTTP_HOST_NEXT_ALLOWED_AT: dict[str, float] = {}
 _HTTP_HOST_BACKOFF_SECONDS: dict[str, float] = {}
+_RUNTIME_INJECTED_COOKIE_KEYS_BY_HOST: dict[str, set[tuple[str, str, str]]] = {}
 _UNRESOLVED_VENDOR_CACHE_LOCK = threading.Lock()
 _UNRESOLVED_VENDOR_CACHE_KEY = ""
 _UNRESOLVED_VENDOR_CACHE_ROWS: list[dict[str, str]] = []
 _BROWSER_DETAIL_CACHE_LOCK = threading.Lock()
 _BROWSER_DETAIL_CACHE: dict[str, dict[str, str]] = {}
 _BROWSER_DETAIL_SEMAPHORE = threading.Semaphore(1)
+_DIRECT_VENDOR_HOST_OVERRIDES = {
+    "bddiesel.com": "BD-Power",
+}
 
 
 def _clean_text(value: object) -> str:
@@ -473,6 +477,68 @@ def _normalize_media_from_alliant(product: dict[str, object], page_url: str) -> 
     return " | ".join(normalized) if normalized else ""
 
 
+def _extract_fitment_lines_from_html_fragment(fragment: str) -> list[str]:
+    value = _clean_text(fragment)
+    if not value:
+        return []
+    fitment_section = re.search(
+        r"(?is)<(?:strong|b|h[1-6])[^>]*>\s*(?:fitment|application)\s*:?\s*</(?:strong|b|h[1-6])>\s*(.*)",
+        value,
+    )
+    if fitment_section is None:
+        fitment_section = re.search(
+            r"(?is)(?:^|<br\s*/?>|\n)\s*(?:fitment|application)\s*:?\s*(.*)",
+            value,
+        )
+    if fitment_section:
+        value = _clean_text(fitment_section.group(1))
+    if not value:
+        return []
+    value = re.sub(r"<script[\s\S]*?</script>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<style[\s\S]*?</style>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<noscript[\s\S]*?</noscript>", " ", value, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "\n", unescape(value))
+
+    fitment_lines: list[str] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = _clean_text(raw)
+        if len(line) < 8 or len(line) > 220:
+            continue
+        if not re.search(r"\b(19|20)\d{2}\b", line):
+            continue
+        if not re.search(r"(?i)(ford|chevy|chevrolet|gmc|gm|ram|dodge|duramax|cummins|powerstroke|diesel|jeep|nissan|toyota)", line):
+            continue
+        key = re.sub(r"[^a-z0-9]+", " ", line.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        fitment_lines.append(line)
+    return fitment_lines[:24]
+
+
+def _is_alliant_graph_url(product_url: str) -> bool:
+    host = _normalize_host(_host_key_from_url(product_url))
+    return host == "parts.alliantpower.com"
+
+
+def _extract_alliant_product_id_from_url(product_url: str) -> str:
+    try:
+        path = _clean_text(urllib.parse.urlparse(product_url).path).strip("/")
+    except Exception:
+        path = ""
+    if not path:
+        return ""
+    slug = path.split("/")[-1]
+    if not slug:
+        return ""
+    candidate = re.split(r"[-_/]+", slug)[-1]
+    candidate = re.sub(r"[^A-Za-z0-9]", "", candidate)
+    if len(candidate) < 4:
+        return ""
+    return candidate.upper()
+
+
 def _score_alliant_search_result(item: object, query_value: str) -> int:
     if not isinstance(item, dict):
         return -1
@@ -533,6 +599,9 @@ def _payload_from_alliant_product(
     description_html = _clean_text(merged_product.get("description", ""))
     if description_html:
         output["description_html"] = description_html
+        fitment_lines = _extract_fitment_lines_from_html_fragment(description_html)
+        if fitment_lines:
+            output["application"] = " | ".join(fitment_lines)
 
     product_type = _extract_category_type(merged_product.get("categoriesPaths"))
     if product_type:
@@ -563,15 +632,20 @@ def _payload_from_alliant_product(
             output["price"] = price
 
     addon_fields = merged_product.get("addonFields")
-    if isinstance(addon_fields, list):
+    if not _clean_text(output.get("application", "")) and isinstance(addon_fields, list):
         for field in addon_fields:
             if not isinstance(field, dict):
                 continue
             caption = _clean_text(field.get("caption", "")).lower()
             name = _clean_text(field.get("name", "")).lower()
             value = _clean_text(field.get("value", ""))
-            if value and ("product description" in caption or "description 2" in name):
-                output.setdefault("application", value)
+            if value and (
+                "fitment" in caption
+                or "application" in caption
+                or "fitment" in name
+                or "application" in name
+            ):
+                output["application"] = value
                 break
 
     if query_value and query_value != normalize_sku(output.get("title", "")):
@@ -696,6 +770,98 @@ def _scrape_single_sku_via_alliant_graph(
     return sku, merged, None
 
 
+def _scrape_direct_alliant_product_record(
+    product_url: str,
+    sku: str,
+    search_term: str = "",
+) -> tuple[dict[str, str], str | None]:
+    target_url = _clean_text(product_url)
+    if not target_url:
+        return {}, "No product URL provided"
+
+    product_id = _extract_alliant_product_id_from_url(target_url)
+    if not product_id:
+        return {}, "Could not infer Alliant product ID from direct URL."
+
+    graph_url = urllib.parse.urljoin(target_url, "/api/graph")
+    graph_headers = {"x-languageid": "1033"}
+
+    detail_payload = {
+        "variables": {
+            "productId": product_id.lower(),
+            "specificationFilter": "FOR_DETAILS",
+            "loadRelatedProductsCategories": True,
+            "loadUom": True,
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": "1",
+                "sha256Hash": "77153c302fff53be51c1f0d1e2f3580f4f0236fbfdcdd9aef0ad7f34474e37c9",
+            }
+        },
+    }
+    detail_response, detail_error = _post_json(
+        graph_url,
+        detail_payload,
+        referer=target_url,
+        extra_headers=graph_headers,
+    )
+    if detail_error:
+        return {}, f"Alliant graph detail failed: {detail_error}"
+
+    detail_page = _extract_nested_value(detail_response, "data.pages.product")
+    detail_product = _extract_nested_value(detail_response, "data.pages.product.product")
+    if not isinstance(detail_product, dict) or not detail_product:
+        return {}, "Alliant graph detail returned no product."
+
+    resolved_product_url = (
+        _clean_text(detail_product.get("url", ""))
+        or _clean_text((detail_page or {}).get("canonicalUrl", "")) if isinstance(detail_page, dict) else ""
+    )
+    if resolved_product_url:
+        resolved_product_url = urllib.parse.urljoin(target_url, resolved_product_url)
+    else:
+        resolved_product_url = target_url
+
+    price_product = None
+    price_payload = {
+        "variables": {
+            "options": {"ids": [product_id], "uomId": None, "page": {"size": 1, "index": 0}}
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": "1",
+                "sha256Hash": "5b553447d968e5f0ed5b59260f318dcf596a8fc2d1e604f2f5d829256f9f3eb6",
+            }
+        },
+    }
+    price_response, price_error = _post_json(
+        graph_url,
+        price_payload,
+        referer=resolved_product_url,
+        extra_headers=graph_headers,
+    )
+    if not price_error:
+        products = _extract_nested_value(price_response, "data.catalog.products.products")
+        if isinstance(products, list) and products:
+            first = products[0]
+            if isinstance(first, dict):
+                price_product = first
+
+    query_value = normalize_sku(search_term) or normalize_sku(sku) or normalize_sku(product_id)
+    merged = _payload_from_alliant_product(
+        {"id": product_id, "url": resolved_product_url},
+        detail_product,
+        detail_page if isinstance(detail_page, dict) else None,
+        price_product if isinstance(price_product, dict) else None,
+        query_value=query_value,
+        target_url=target_url,
+        product_url=resolved_product_url,
+    )
+    merged["search_provider"] = "alliant_graph_direct_url"
+    return merged, None
+
+
 def _extract_selector_href_hint(selector: str) -> tuple[str, str]:
     text = _clean_text(selector)
     if not text:
@@ -735,6 +901,37 @@ def _candidate_url_match_text(url: str) -> str:
     return " ".join(_clean_text(part) for part in parts if _clean_text(part))
 
 
+def _profile_uses_results_page_clickthrough(profile: VendorResolverProfile | None) -> bool:
+    if profile is None:
+        return False
+    resolver_hint = _clean_text(profile.resolver_hint).lower()
+    interaction_strategy = _clean_text(profile.interaction_strategy).lower()
+    return (
+        "results_page_clickthrough" in resolver_hint
+        or interaction_strategy == "results_page_clickthrough"
+    )
+
+
+def _focus_search_results_html(html: str) -> str:
+    low_html = html.lower()
+    for marker in [
+        'class="items-list items-list-products products-search-result"',
+        "items-list items-list-products products-search-result",
+        'class="products-search-result"',
+        "products-search-result",
+        'class="products-grid grid-list"',
+        "products-grid grid-list",
+        'id="itemsblock"',
+        'id="searchresults"',
+        "returned the following results",
+        'class="searchpage"',
+    ]:
+        index = low_html.find(marker)
+        if index >= 0:
+            return html[index:]
+    return html
+
+
 def _extract_profile_result_candidates(
     html: str,
     page_url: str,
@@ -742,17 +939,12 @@ def _extract_profile_result_candidates(
     profile: VendorResolverProfile,
 ) -> list[tuple[str, int]]:
     match_mode = _clean_text(profile.result_match_mode).lower()
-    resolver_hint = _clean_text(profile.resolver_hint).lower()
+    clickthrough_mode = _profile_uses_results_page_clickthrough(profile)
     selector_mode, selector_value = _extract_selector_href_hint(profile.result_link_selector)
 
     result_html = html
-    if not selector_value and "results_page_clickthrough" in resolver_hint:
-        low_html = html.lower()
-        for marker in ['id="itemsblock"', 'id="searchresults"', "returned the following results", 'class="searchpage"']:
-            index = low_html.find(marker)
-            if index >= 0:
-                result_html = html[index:]
-                break
+    if not selector_value and clickthrough_mode:
+        result_html = _focus_search_results_html(html)
 
     scored: dict[str, int] = {}
     first_seen: dict[str, int] = {}
@@ -790,7 +982,7 @@ def _extract_profile_result_candidates(
             score += 95
         if "first_result" in match_mode:
             score += max(0, 30 - min(position, 25))
-        if score == 0 and "results_page_clickthrough" in resolver_hint:
+        if score == 0 and clickthrough_mode:
             score += max(0, 18 - min(position, 18))
 
         if score <= 0:
@@ -799,6 +991,51 @@ def _extract_profile_result_candidates(
         existing = scored.get(href, -1)
         if score > existing:
             scored[href] = score
+
+    return sorted(scored.items(), key=lambda item: (-item[1], first_seen.get(item[0], 10**9), len(item[0])))
+
+
+def _extract_article_product_candidates(
+    html: str,
+    page_url: str,
+    sku: str,
+) -> list[tuple[str, int]]:
+    scored: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    sequence = 0
+
+    for position, match in enumerate(
+        re.finditer(
+            r'(?is)<article[^>]+class=["\'][^"\']*\bproduct\b[^"\']*["\'][^>]*>.*?</article>',
+            html,
+        ),
+        start=1,
+    ):
+        block_html = match.group(0)
+        block_text = _clean_text(unescape(re.sub(r"<[^>]+>", " ", block_html)))
+        block_match_text = f"{block_text} {unescape(block_html)}"
+        block_bonus = 0
+        if _contains_compact_sku(block_match_text, sku):
+            block_bonus += 220
+        if "product-name" in block_html.lower():
+            block_bonus += 18
+        if "product-price" in block_html.lower():
+            block_bonus += 8
+
+        for href, anchor_text in _extract_anchor_link_candidates(block_html, page_url=page_url):
+            if not _same_host_family(href, page_url=page_url):
+                continue
+            score = _score_product_candidate(href, sku=sku, context_text=f"{anchor_text} {block_text}")
+            score += block_bonus
+            score += max(0, 12 - min(position, 12))
+            if score <= 30:
+                continue
+            if href not in first_seen:
+                first_seen[href] = sequence
+                sequence += 1
+            existing = scored.get(href, -1)
+            if score > existing:
+                scored[href] = score
 
     return sorted(scored.items(), key=lambda item: (-item[1], first_seen.get(item[0], 10**9), len(item[0])))
 
@@ -1398,6 +1635,44 @@ def _host_key_from_url(url: str) -> str:
         return ""
 
 
+def _is_likely_product_page(page_url: str) -> bool:
+    try:
+        path = _clean_text(urllib.parse.urlparse(page_url).path).lower()
+    except Exception:
+        return False
+    return bool(re.search(r"/products?/", path))
+
+
+def _html_looks_like_product_page(html: str) -> bool:
+    if not _clean_text(html):
+        return False
+    marker_count = 0
+    markers = [
+        r'(?is)<meta[^>]+property=["\']og:type["\'][^>]+content=["\']product["\']',
+        r'(?is)<div[^>]+class=["\'][^"\']*product-image-gallery[^"\']*["\']',
+        r'(?is)<form[^>]+class=["\'][^"\']*product-details[^"\']*["\']',
+        r'(?is)<div[^>]+class=["\'][^"\']*widget-fingerprint-product-price[^"\']*["\']',
+    ]
+    for pattern in markers:
+        if re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL):
+            marker_count += 1
+            if marker_count >= 2:
+                return True
+    return False
+
+
+def _vendor_override_from_page_url(page_url: str) -> str:
+    host = _host_key_from_url(page_url)
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return ""
+    for suffix, vendor_name in _DIRECT_VENDOR_HOST_OVERRIDES.items():
+        if host == suffix or host.endswith(f".{suffix}"):
+            return vendor_name
+    return ""
+
+
 def _sleep_for_host_backoff(url: str) -> None:
     host = _host_key_from_url(url)
     if not host:
@@ -1756,6 +2031,68 @@ def _cookie_from_storage_state(item: dict[str, object]) -> http.cookiejar.Cookie
     )
 
 
+def _clean_playwright_cookies(cookies: list[dict[str, object]] | None) -> list[dict[str, object]]:
+    if not cookies:
+        return []
+    allowed_keys = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+    cleaned: list[dict[str, object]] = []
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        if not item.get("name") or not item.get("value"):
+            continue
+        cleaned.append({key: value for key, value in item.items() if key in allowed_keys})
+    return cleaned
+
+
+def _seed_runtime_cookies_for_url(url: str, cookies: list[dict[str, object]] | None) -> None:
+    host = _host_key_from_url(url)
+    if not host:
+        return
+
+    host_candidates = {host}
+    if host.startswith("www."):
+        host_candidates.add(host[4:])
+    elif host.count(".") == 1:
+        host_candidates.add(f"www.{host}")
+
+    with _HTTP_SESSION_LOCK:
+        for candidate_host in host_candidates:
+            jar = _HTTP_COOKIE_JARS_BY_HOST.get(candidate_host)
+            if jar is None:
+                jar = http.cookiejar.CookieJar()
+                _load_persisted_host_cookies(candidate_host, jar)
+                _HTTP_COOKIE_JARS_BY_HOST[candidate_host] = jar
+            previous_keys = set(_RUNTIME_INJECTED_COOKIE_KEYS_BY_HOST.get(candidate_host, set()))
+            for name, domain, path in previous_keys:
+                try:
+                    jar.clear(domain=domain, path=path, name=name)
+                except Exception:
+                    continue
+            new_keys: set[tuple[str, str, str]] = set()
+            for item in cookies or []:
+                if not isinstance(item, dict):
+                    continue
+                cookie_item = dict(item)
+                if not _clean_text(cookie_item.get("domain", "")):
+                    cookie_item["domain"] = candidate_host
+                if not _cookie_matches_host(_clean_text(cookie_item.get("domain", "")), candidate_host):
+                    continue
+                cookie = _cookie_from_storage_state(cookie_item)
+                if cookie is None:
+                    continue
+                try:
+                    jar.set_cookie(cookie)
+                    new_keys.add((cookie.name, cookie.domain, cookie.path))
+                except Exception:
+                    continue
+            _RUNTIME_INJECTED_COOKIE_KEYS_BY_HOST[candidate_host] = new_keys
+            if candidate_host not in _HTTP_OPENERS_BY_HOST:
+                _HTTP_OPENERS_BY_HOST[candidate_host] = urllib.request.build_opener(
+                    urllib.request.HTTPCookieProcessor(jar)
+                )
+
+
 def _load_persisted_host_cookies(host: str, jar: http.cookiejar.CookieJar) -> None:
     state_path = _browser_session_state_path(host)
     try:
@@ -1861,12 +2198,20 @@ def _build_browser_json_payload(item: dict, page_url: str) -> dict[str, str]:
         vendor = _clean_text(next(iter(_iter_searchspring_field_values(item.get("manufacturer_name"))), ""))
     if vendor:
         payload["vendor"] = vendor
+    if not payload.get("vendor"):
+        spec_vendor = _extract_spec_value(item.get("specifications"), "Brand", "Manufacturer", "Vendor")
+        if spec_vendor:
+            payload["vendor"] = spec_vendor
 
     for key in ["type", "product_type", "category"]:
         value = _clean_text(next(iter(_iter_searchspring_field_values(item.get(key))), ""))
         if value:
             payload["type"] = value
             break
+    if not payload.get("type"):
+        type_value = _extract_category_type(item.get("categoriesPaths"))
+        if type_value:
+            payload["type"] = type_value
 
     for key in ["price", "salePrice", "listPrice", "msrp"]:
         value = _clean_text(next(iter(_iter_searchspring_field_values(item.get(key))), ""))
@@ -1887,8 +2232,27 @@ def _build_browser_json_payload(item: dict, page_url: str) -> dict[str, str]:
         normalized_application = _format_searchspring_application(application_values)
         if normalized_application:
             payload["application"] = normalized_application
+    if not payload.get("application"):
+        fitment_lines = _extract_fitment_lines_from_html_fragment(payload.get("description_html", ""))
+        if fitment_lines:
+            payload["application"] = " | ".join(fitment_lines)
 
     media_values: list[str] = []
+    image_value = item.get("image")
+    if isinstance(image_value, dict):
+        for key in ["large", "mediumLarge", "medium", "mediumSmall", "small"]:
+            value = _clean_text(image_value.get(key, ""))
+            if value:
+                media_values.append(value)
+    media_value = item.get("media")
+    if isinstance(media_value, list):
+        for media_item in media_value:
+            if not isinstance(media_item, dict):
+                continue
+            for key in ["large", "mediumLarge", "medium", "mediumSmall", "small"]:
+                value = _clean_text(media_item.get(key, ""))
+                if value:
+                    media_values.append(value)
     for key in ["image", "imageUrl", "image_url", "product_image", "thumbnailImageUrl", "images", "media"]:
         media_values.extend(_iter_searchspring_field_values(item.get(key)))
     if media_values:
@@ -1927,6 +2291,7 @@ def _fetch_html_with_real_chrome(
     url: str,
     timeout_ms: int = 35000,
     settle_ms: int = 4500,
+    cookies: "list | None" = None,
 ) -> tuple[str, str, list[tuple[str, str]], str | None]:
     try:
         from playwright.sync_api import sync_playwright
@@ -1951,6 +2316,13 @@ def _fetch_html_with_real_chrome(
                         headless=True,
                     )
                     context = browser.new_context(user_agent=_REAL_BROWSER_USER_AGENT)
+                    if cookies:
+                        try:
+                            clean_cookies = _clean_playwright_cookies(cookies)
+                            if clean_cookies:
+                                context.add_cookies(clean_cookies)
+                        except Exception:
+                            pass
                     page = context.new_page()
 
                     def on_response(response: object) -> None:
@@ -2036,6 +2408,7 @@ def _fetch_xtreme_detail_payload_via_browser(
     product_url: str,
     sku: str,
     scrape_images: bool,
+    cookies: list[dict[str, object]] | None = None,
 ) -> tuple[dict[str, str], str | None]:
     cache_key = _clean_text(product_url)
     with _BROWSER_DETAIL_CACHE_LOCK:
@@ -2043,7 +2416,7 @@ def _fetch_xtreme_detail_payload_via_browser(
         if cached:
             return dict(cached), None
 
-    final_url, html, network_bodies, error = _fetch_html_with_real_chrome(product_url)
+    final_url, html, network_bodies, error = _fetch_html_with_real_chrome(product_url, cookies=cookies)
     if error:
         return {}, error
 
@@ -2094,6 +2467,209 @@ def _extract_meta_content(html: str, name: str) -> str:
     return _extract_first(pattern, html, flags=re.IGNORECASE)
 
 
+def _extract_currency_amount(text: str) -> str:
+    value = _extract_first(r"(?i)\$\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))\s*(?:USD)?", text)
+    if not value:
+        value = _extract_first(r"(?i)\b((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))\s*USD\b", text)
+    return _clean_text(value).replace(",", "")
+
+
+def _extract_primary_product_price(html: str) -> str:
+    patterns = [
+        r'(?is)<div[^>]+class=["\'][^"\']*ppcm-banner-amount[^"\']*["\'][^>]+data-amount=["\']([0-9]{1,7}(?:\.[0-9]{1,2})?)["\']',
+        r'(?is)<li[^>]+class=["\'][^"\']*product-price-base[^"\']*["\'][^>]*>.*?\$\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))',
+        r'(?is)<span[^>]+class=["\'][^"\']*(?:price|product-price)[^"\']*["\'][^>]*>.*?\$\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))',
+    ]
+    for pattern in patterns:
+        value = _extract_first(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+        if value:
+            return _clean_text(value).replace(",", "")
+    return ""
+
+
+def _parse_price_text(value: object) -> float | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", text.replace(",", ""))
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def _extract_primary_heading(html: str) -> str:
+    patterns = [
+        r"(?is)<h1\b[^>]*>(.*?)</h1>",
+        r'(?is)<[^>]+class=["\'][^"\']*(?:product[-_ ]title|page[-_ ]title|product_title|product-name)[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, flags=re.IGNORECASE | re.DOTALL):
+            text = _clean_text(re.sub(r"<[^>]+>", " ", unescape(match.group(1) or "")))
+            if not text:
+                continue
+            if len(text) < 8:
+                continue
+            return re.sub(r"\s+", " ", text).strip()
+    return ""
+
+
+def _is_partstitan_page(page_url: str) -> bool:
+    host = _normalize_host(_host_key_from_url(page_url))
+    return host in {"partstitan.com", "www.partstitan.com"}
+
+
+def _extract_partstitan_info_fields(html: str) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for match in re.finditer(
+        r'(?is)<td[^>]*>\s*<b[^>]*>\s*([A-Z][A-Z0-9 /()&._-]{1,80})\s*:\s*</b>\s*(.*?)</td>',
+        html,
+    ):
+        label = _clean_text(re.sub(r"<[^>]+>", " ", unescape(match.group(1) or ""))).strip(" :")
+        value = _clean_text(re.sub(r"<[^>]+>", " ", unescape(match.group(2) or "")))
+        if not label or not value:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+        if key and key not in output:
+            output[key] = value
+    return output
+
+
+def _pick_preferred_brand_label(value: str) -> str:
+    parts = [_clean_text(part) for part in re.split(r"[|/]", _clean_text(value)) if _clean_text(part)]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+
+    def _score(part: str) -> tuple[int, int, int]:
+        compact = re.sub(r"[^A-Za-z0-9]+", "", part)
+        return (
+            0 if len(compact) <= 3 else 1,
+            len(compact),
+            len(part),
+        )
+
+    return max(parts, key=_score)
+
+
+def _extract_partstitan_fitment_lines(html: str) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    for table_match in re.finditer(r'(?is)<table[^>]+id=["\']myDIV["\'][^>]*>(.*?)</table>', html):
+        block = table_match.group(1) or ""
+        for row_match in re.finditer(r"(?is)<tr[^>]*>(.*?)</tr>", block):
+            cells = [
+                _clean_text(re.sub(r"<[^>]+>", " ", unescape(cell_match.group(1) or "")))
+                for cell_match in re.finditer(r"(?is)<td[^>]*>(.*?)</td>", row_match.group(1) or "")
+            ]
+            cells = [cell for cell in cells if cell]
+            if len(cells) < 3:
+                continue
+            if not re.fullmatch(r"(19|20)\d{2}", cells[0]):
+                continue
+            line = " ".join(cells[:4]).strip()
+            key = re.sub(r"[^a-z0-9]+", " ", line.lower()).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+    return lines[:40]
+
+
+def _format_partstitan_year_span(years: list[int]) -> str:
+    valid = sorted({year for year in years if 1930 <= year <= 2035})
+    if not valid:
+        return ""
+    if len(valid) == 1:
+        return str(valid[0])
+    start = valid[0] % 100
+    end = valid[-1] % 100
+    return f"{start:02d}-{end:02d}"
+
+
+def _summarize_partstitan_fitment(lines: list[str]) -> str:
+    cleaned_lines = [_clean_text(line) for line in lines if _clean_text(line)]
+    if not cleaned_lines:
+        return ""
+
+    years: list[int] = []
+    makes: list[str] = []
+    for line in cleaned_lines:
+        year_match = re.match(r"(?i)^\s*((?:19|20)\d{2})\b", line)
+        if year_match:
+            try:
+                years.append(int(year_match.group(1)))
+            except Exception:
+                pass
+        make_match = re.match(r"(?i)^\s*(?:19|20)\d{2}\s+([A-Za-z]+)\b", line)
+        if make_match:
+            makes.append(_clean_text(make_match.group(1)).title())
+
+    make_values = sorted({value for value in makes if value})
+    if len(make_values) != 1:
+        return ""
+
+    summary_parts: list[str] = []
+    year_span = _format_partstitan_year_span(years)
+    if year_span:
+        summary_parts.append(year_span)
+    summary_parts.append(make_values[0])
+
+    low_lines = [line.lower() for line in cleaned_lines]
+    if all("super duty" in line for line in low_lines):
+        summary_parts.append("Super Duty")
+    elif all("sprinter" in line for line in low_lines):
+        summary_parts.append("Sprinter")
+
+    for token in ["Powerstroke", "Cummins", "Duramax", "EcoDiesel", "Diesel"]:
+        if all(token.lower() in line for line in low_lines):
+            summary_parts.append(token)
+            break
+
+    return re.sub(r"\s+", " ", " ".join(part for part in summary_parts if _clean_text(part))).strip()
+
+
+def _extract_partstitan_payload(html: str, page_url: str) -> dict[str, str]:
+    if not _is_partstitan_page(page_url):
+        return {}
+
+    info_fields = _extract_partstitan_info_fields(html)
+    title_text = _clean_text(
+        _extract_first(
+            r'(?is)<td[^>]+class=["\'][^"\']*text_div[^"\']*["\'][^>]*>\s*<span>\s*(.*?)\s*</span>',
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    ) or _clean_text(info_fields.get("description", ""))
+    brand_text = _pick_preferred_brand_label(info_fields.get("brand", ""))
+    list_price = _extract_currency_amount(info_fields.get("suggested_list_price", ""))
+    core_deposit = _extract_currency_amount(info_fields.get("core_deposit", ""))
+    notes_text = _clean_text(info_fields.get("notes", ""))
+    fitment_lines = _extract_partstitan_fitment_lines(html)
+    fitment_summary = _summarize_partstitan_fitment(fitment_lines)
+    notes_text = re.sub(r"(?is)\bproposition\s*65\s*warning\b.*", "", notes_text)
+    notes_text = re.sub(r"\s+", " ", notes_text).strip(" .|")
+
+    payload: dict[str, str] = {}
+    if title_text:
+        payload["title"] = title_text
+        payload["description_html"] = f"{title_text}. {notes_text}".strip(". ") if notes_text else title_text
+    if brand_text:
+        payload["vendor"] = brand_text
+    if list_price:
+        payload["price"] = list_price
+    if core_deposit:
+        payload["core_charge_product_code"] = core_deposit
+    if fitment_lines:
+        application_values = [value for value in [fitment_summary, *fitment_lines] if _clean_text(value)]
+        payload["application"] = " | ".join(application_values)
+    return payload
+
+
 def _extract_canonical_page_url(html: str, page_url: str = "") -> str:
     canonical = _extract_first(
         r'<link[^>]+rel\s*=\s*["\']canonical["\'][^>]+href\s*=\s*["\']([^"\']+)["\']',
@@ -2116,6 +2692,16 @@ def _extract_canonical_page_url(html: str, page_url: str = "") -> str:
     if page_url:
         canonical = urllib.parse.urljoin(page_url, canonical)
     return _clean_text(canonical)
+
+
+def _extract_product_handle_from_url(page_url: str) -> str:
+    path = urllib.parse.urlparse(_clean_text(page_url)).path
+    if not path:
+        return ""
+    match = re.search(r"/products/([^/?#]+)", path, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _clean_text(match.group(1)).lower().strip("/")
 
 
 def _extract_json_scripts(html: str) -> list[str]:
@@ -2144,6 +2730,7 @@ def _collect_product_nodes(obj: object, nodes: list[dict]) -> None:
 def _from_json_ld(html: str, page_url: str, sku: str) -> dict[str, str]:
     output: dict[str, str] = {}
     media_values: list[str] = []
+    page_handle = _extract_product_handle_from_url(page_url)
     scripts = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
@@ -2161,7 +2748,8 @@ def _from_json_ld(html: str, page_url: str, sku: str) -> dict[str, str]:
         _collect_product_nodes(parsed, nodes)
         for node in nodes:
             node_sku = normalize_sku(node.get("sku", "") or node.get("mpn", ""))
-            if node_sku and node_sku != normalize_sku(sku):
+            node_handle = _extract_product_handle_from_url(_clean_text(node.get("url", "")))
+            if node_sku and node_sku != normalize_sku(sku) and (not page_handle or node_handle != page_handle):
                 continue
 
             if not output.get("title"):
@@ -2183,7 +2771,15 @@ def _from_json_ld(html: str, page_url: str, sku: str) -> dict[str, str]:
             if isinstance(offers, list) and offers:
                 offers = offers[0]
             if isinstance(offers, dict) and not output.get("price"):
-                output["price"] = _clean_text(offers.get("price", ""))
+                offer_prices: list[tuple[float, str]] = []
+                for raw_value in [offers.get("price", ""), offers.get("lowPrice", ""), offers.get("highPrice", "")]:
+                    text = _extract_currency_amount(_clean_text(raw_value)) or _clean_text(raw_value)
+                    amount = _parse_price_text(text)
+                    if amount is None or amount <= 0:
+                        continue
+                    offer_prices.append((amount, f"{amount:.2f}"))
+                if offer_prices:
+                    output["price"] = min(offer_prices, key=lambda item: item[0])[1]
             image = node.get("image")
             if isinstance(image, list):
                 media_values.extend([_clean_text(item) for item in image if _clean_text(item)])
@@ -2264,6 +2860,7 @@ def _upgrade_image_url(url: str) -> str:
         return ""
     parsed = urllib.parse.urlparse(normalized)
     path = _strip_shopify_size_suffix(parsed.path)
+    path = re.sub(r"(?i)^/var/images/product/\d+\.\d+/", "/images/product/", path)
 
     keep_pairs: list[tuple[str, str]] = []
     for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
@@ -2338,6 +2935,7 @@ def _image_quality_score(url: str) -> int:
 def _image_canonical_key(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     path = _strip_shopify_size_suffix(parsed.path)
+    path = re.sub(r"(?i)^/var/images/product/\d+\.\d+/", "/images/product/", path)
     # Normalize common ecommerce image transform tokens so width/quality variants
     # of the same underlying asset collapse to one canonical key.
     path = re.sub(r"(?i)(?:[_-](?:w|width)\d{2,5})", "", path)
@@ -2635,20 +3233,33 @@ def _format_shopify_price(value: object) -> str:
     return f"{amount:.2f}"
 
 
+def _collect_shopify_price_candidates(*values: object) -> list[tuple[float, str]]:
+    candidates: list[tuple[float, str]] = []
+    for raw_value in values:
+        text = _format_shopify_price(raw_value)
+        amount = _parse_price_text(text)
+        if amount is None or amount <= 0:
+            continue
+        candidates.append((amount, text))
+    return candidates
+
+
 def _select_embedded_shopify_product(html: str, page_url: str, sku: str) -> dict | None:
     candidates = _extract_embedded_shopify_products(html)
     if not candidates:
         return None
 
     page_path = urllib.parse.urlparse(page_url).path.lower()
+    page_handle = _extract_product_handle_from_url(page_url)
     best: dict | None = None
     best_rank = -1
     for product in candidates:
+        handle = _clean_text(product.get("handle", "")).lower().strip("/")
+        handle_match = bool(handle and page_handle and handle == page_handle)
         rank = _shopify_match_score_for_sku(product, sku) if _clean_text(sku) else 1
-        if _clean_text(sku) and rank <= 0:
+        if _clean_text(sku) and rank <= 0 and not handle_match:
             continue
 
-        handle = _clean_text(product.get("handle", "")).lower().strip("/")
         if handle and f"/products/{handle}" in page_path:
             rank += 120
         if _clean_text(product.get("description", "")) or _clean_text(product.get("content", "")):
@@ -2683,15 +3294,15 @@ def _from_shopify_embedded_product(html: str, page_url: str, sku: str) -> dict[s
     if product_type:
         payload["type"] = product_type
 
-    price_value = (
-        _format_shopify_price(product.get("price"))
-        or _format_shopify_price(product.get("price_min"))
-        or _format_shopify_price(product.get("compare_at_price"))
-    )
-    if price_value:
-        payload["price"] = price_value
-
     variants = product.get("variants")
+    price_candidates = _collect_shopify_price_candidates(
+        product.get("price"),
+        product.get("price_min"),
+        product.get("price_max"),
+        product.get("compare_at_price"),
+        product.get("compare_at_price_min"),
+        product.get("compare_at_price_max"),
+    )
     if isinstance(variants, list):
         ranked_variants: list[tuple[int, dict]] = []
         for variant in variants:
@@ -2700,11 +3311,23 @@ def _from_shopify_embedded_product(html: str, page_url: str, sku: str) -> dict[s
             score = _shopify_match_score_for_sku({"variants": [variant]}, sku)
             ranked_variants.append((score, variant))
         ranked_variants.sort(key=lambda entry: entry[0], reverse=True)
+        matched_variants = [variant for score, variant in ranked_variants if score > 0]
+        if not matched_variants and len(ranked_variants) == 1:
+            matched_variants = [ranked_variants[0][1]]
+        for variant in matched_variants[:3]:
+            price_candidates.extend(
+                _collect_shopify_price_candidates(
+                    variant.get("price"),
+                    variant.get("compare_at_price"),
+                )
+            )
         for _, variant in ranked_variants:
             barcode = _sanitize_barcode(_clean_text(variant.get("barcode", "")))
             if barcode:
                 payload["barcode"] = barcode
                 break
+    if price_candidates:
+        payload["price"] = min(price_candidates, key=lambda item: item[0])[1]
 
     media_values = _extract_shopify_media_from_product(product)
     if media_values:
@@ -2968,6 +3591,7 @@ def _extract_product_page_candidates(html: str, page_url: str, sku: str) -> list
     scored: dict[str, int] = {}
     first_seen: dict[str, int] = {}
     sequence = 0
+    focused_html = _focus_search_results_html(html)
 
     def record(href: str, score: int) -> None:
         nonlocal sequence
@@ -2976,6 +3600,9 @@ def _extract_product_page_candidates(html: str, page_url: str, sku: str) -> list
             sequence += 1
         if href not in scored or score > scored[href]:
             scored[href] = score
+
+    for href, score in _extract_article_product_candidates(focused_html, page_url=page_url, sku=sku):
+        record(href, score)
 
     for href, score in _extract_shopify_state_product_candidates(html=html, page_url=page_url, sku=sku):
         record(href, score)
@@ -4051,7 +4678,47 @@ def _normalize_requested_scrape_fields(requested_fields: set[str] | list[str] | 
         value = _clean_text(field_name)
         if value:
             normalized.add(value)
+    if "application" in normalized:
+        # Application normalization depends on raw title/body context, even when only
+        # the fitment field is being updated.
+        normalized.update({"title", "description_html"})
     return normalized
+
+
+def _requested_product_data_fields(
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str]:
+    requested = _normalize_requested_scrape_fields(requested_fields)
+    meaningful_fields = {
+        "title",
+        "description_html",
+        "media_urls",
+        "price",
+        "cost",
+        "barcode",
+        "weight",
+        "application",
+        "vendor",
+        "type",
+        "core_charge_product_code",
+    }
+    if requested is None:
+        return meaningful_fields
+    selected = meaningful_fields.intersection(requested)
+    return selected or meaningful_fields
+
+
+def _payload_has_requested_product_data(
+    payload: dict[str, str],
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+) -> bool:
+    if not payload:
+        return False
+    for field_name in _requested_product_data_fields(requested_fields):
+        value = _clean_text((payload or {}).get(field_name, ""))
+        if value and value.lower() not in {"none", "nan", "null"}:
+            return True
+    return False
 
 
 def _filter_requested_scrape_payload(
@@ -4218,6 +4885,23 @@ def _extract_script_gallery_candidates(html: str) -> list[str]:
 
 
 def _extract_gallery_scope_blocks(html: str) -> list[str]:
+    xcart_blocks: list[str] = []
+    xcart_seen: set[str] = set()
+    for match in re.finditer(
+        r'(?is)<div[^>]+class=["\'][^"\']*product-image-gallery[^"\']*["\'][^>]*>.*?</ul>\s*</div>',
+        html,
+    ):
+        block = _clean_text(match.group(0))
+        if not block:
+            continue
+        key = str(hash(block))
+        if key in xcart_seen:
+            continue
+        xcart_seen.add(key)
+        xcart_blocks.append(block)
+    if xcart_blocks:
+        return xcart_blocks
+
     blocks: list[str] = []
     seen: set[str] = set()
     patterns = [
@@ -4255,6 +4939,16 @@ def _collect_gallery_image_candidates(html: str, gallery_scope_only: bool = Fals
         source_blocks = scope_blocks  # Never fall back to full HTML for gallery_scope_only vendors.
     else:
         source_blocks = scope_blocks if scope_blocks else [html]
+
+    for source in source_blocks:
+        for match in re.finditer(
+            r'(?is)<a[^>]+(?:href=["\']([^"\']+)["\'][^>]*rel=["\'][^"\']*(?:lightbox|fancybox|photoswipe)[^"\']*["\']|rel=["\'][^"\']*(?:lightbox|fancybox|photoswipe)[^"\']*["\'][^>]*href=["\']([^"\']+)["\'])',
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            href = _clean_text(match.group(1) or match.group(2))
+            if href:
+                add(href)
 
     # Image and slideshow/gallery attributes used by many ecommerce themes.
     image_attr_patterns = [
@@ -4356,17 +5050,34 @@ def _safe_file_token(value: str, fallback: str) -> str:
 
 
 def _fetch_binary(url: str, timeout: int = 45) -> tuple[bytes, str, str | None]:
-    request = urllib.request.Request(
-        url=url,
-        method="GET",
-        headers={
-            "User-Agent": _REQUEST_USER_AGENT,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": _REQUEST_ACCEPT_LANGUAGE,
-        },
-    )
+    parsed = urllib.parse.urlparse(url)
+    host_root = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else url
+    headers = {
+        "User-Agent": _REQUEST_USER_AGENT,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": _REQUEST_ACCEPT_LANGUAGE,
+        "Referer": host_root,
+    }
+
+    def _build_request() -> urllib.request.Request:
+        return urllib.request.Request(url=url, method="GET", headers=headers)
+
+    opener = _get_session_opener_for_host(url)
+    if opener is not None:
+        host_lock = _get_host_lock_for_url(url)
+        try:
+            with host_lock:
+                with opener.open(_build_request(), timeout=timeout) as response:
+                    body = response.read()
+                    content_type = str(response.headers.get("Content-Type", "")).lower()
+            return body, content_type, None
+        except urllib.error.HTTPError:
+            pass
+        except Exception:
+            pass
+
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(_build_request(), timeout=timeout) as response:
             body = response.read()
             content_type = str(response.headers.get("Content-Type", "")).lower()
     except urllib.error.HTTPError as exc:
@@ -4686,17 +5397,50 @@ def _extract_heuristic_barcode(html: str, context: str) -> str:
 def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool, gallery_scope_only: bool = False) -> dict[str, str]:
     context = _find_context_near_sku(html, sku)
     output: dict[str, str] = {}
+    is_product_page = _is_likely_product_page(page_url) or _html_looks_like_product_page(html)
+    partstitan_payload = _extract_partstitan_payload(html, page_url)
+    if is_product_page and (not _clean_text(sku) or not _contains_compact_sku(context, sku)):
+        # Direct product pages should still scrape cleanly even when the user-entered
+        # identifier is not present in the HTML (for example MPN vs site part number).
+        context = html
 
-    output["title"] = _extract_meta_content(html, "og:title") or _extract_first(r"<title>([^<]+)</title>", html, flags=re.IGNORECASE)
-    output["description_html"] = _extract_meta_content(html, "description") or _extract_meta_content(html, "og:description")
+    heading_title = _extract_primary_heading(html) if is_product_page else ""
+    meta_title = _extract_meta_content(html, "og:title") or _extract_first(r"<title>([^<]+)</title>", html, flags=re.IGNORECASE)
+    output["title"] = _clean_text(partstitan_payload.get("title", "")) or heading_title or meta_title
+    output["description_html"] = (
+        _clean_text(partstitan_payload.get("description_html", ""))
+        or _extract_meta_content(html, "description")
+        or _extract_meta_content(html, "og:description")
+    )
     output["price"] = _extract_first(r'(?i)(?:\"price\"|price|msrp|retail)\D{0,20}([0-9]{1,6}(?:\.[0-9]{1,2})?)', context)
-    output["core_charge_product_code"] = _extract_first(
+    price_value = _parse_price_text(output["price"])
+    if is_product_page and (price_value is None or price_value < 10.0):
+        fallback_prices = [
+            _extract_primary_product_price(context),
+            _extract_primary_product_price(html),
+            _extract_currency_amount(context),
+            _extract_currency_amount(html),
+        ]
+        resolved_price = ""
+        for candidate in fallback_prices:
+            candidate_value = _parse_price_text(candidate)
+            if candidate_value is not None and candidate_value > 10.0:
+                resolved_price = candidate
+                break
+        output["price"] = resolved_price
+    output["price"] = _clean_text(partstitan_payload.get("price", "")) or output["price"]
+    output["core_charge_product_code"] = _clean_text(partstitan_payload.get("core_charge_product_code", "")) or _extract_first(
         r"(?i)(?:core(?:\s*charge)?|corecharge)\D{0,28}(\$?\s*[0-9]{1,5}(?:\.[0-9]{1,2})?)",
         context,
     )
     output["weight"] = _extract_first(r'(?i)(?:weight|wt)\D{0,20}([0-9]{1,3}(?:\.[0-9]{1,3})?)', context)
     output["barcode"] = _extract_heuristic_barcode(html, context)
-    output["vendor"] = _extract_meta_content(html, "og:site_name") or _infer_vendor_from_title(output.get("title", ""))
+    output["vendor"] = (
+        _clean_text(partstitan_payload.get("vendor", ""))
+        or _vendor_override_from_page_url(page_url)
+        or _extract_meta_content(html, "og:site_name")
+        or _infer_vendor_from_title(output.get("title", ""))
+    )
     if not _clean_text(output.get("description_html", "")):
         tab_description = _extract_description_from_tabs(html)
         if tab_description:
@@ -4715,12 +5459,16 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool, 
         output["media_urls"] = " | ".join(normalized_media[:30])
 
     application_lines: list[str] = []
+    application_lines.extend(_split_multi_value(_clean_text(partstitan_payload.get("application", ""))))
     structured_fitment_lines = _extract_structured_fitment_lines(html)
     if structured_fitment_lines:
         application_lines.extend(structured_fitment_lines)
     # Scope fitment heuristics near the matched SKU to avoid unrelated recommendation tiles.
     fitment_context = _find_context_near_sku(html, sku, span=12000)
-    fitment_source = fitment_context if _clean_text(fitment_context) else html
+    if is_product_page and (not _clean_text(sku) or not _contains_compact_sku(fitment_context, sku)):
+        fitment_source = html
+    else:
+        fitment_source = fitment_context if _clean_text(fitment_context) else html
     # Remove script/style blocks before fitment heuristics so JSON/JS blobs do not pollute application text.
     fitment_source = re.sub(r"<script[\s\S]*?</script>", " ", fitment_source, flags=re.IGNORECASE)
     fitment_source = re.sub(r"<style[\s\S]*?</style>", " ", fitment_source, flags=re.IGNORECASE)
@@ -4850,6 +5598,7 @@ def _scrape_single_sku(
     image_output_root: Path | None,
     search_term: str = "",
     requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
+    cookies: list[dict[str, object]] | None = None,
 ) -> tuple[str, dict[str, str], str | None]:
     query_candidates = _query_candidates_for_profile(sku=sku, search_term=search_term, profile=resolver_profile)
     interaction_strategy = (
@@ -4877,6 +5626,7 @@ def _scrape_single_sku(
                 image_output_root=image_output_root,
                 search_term=query_value,
                 requested_fields=requested_fields,
+                cookies=cookies,
             )
             if payload:
                 if query_value and query_value != sku:
@@ -4889,6 +5639,7 @@ def _scrape_single_sku(
     target_url = _normalize_url(base_url, query_value)
     if not target_url:
         return sku, {}, "Missing vendor search URL"
+    _seed_runtime_cookies_for_url(target_url, cookies)
 
     if _is_alliant_parts_search_url(base_url) or _is_alliant_parts_search_url(target_url):
         result_sku, payload, error = _scrape_single_sku_via_alliant_graph(
@@ -5066,6 +5817,7 @@ def _scrape_single_sku(
                         product_url=best_candidate_url,
                         sku=query_value,
                         scrape_images=scrape_images,
+                        cookies=cookies,
                     )
                     if browser_payload:
                         browser_url = _clean_text(browser_payload.get("product_url", "")) or best_candidate_url
@@ -5147,7 +5899,7 @@ def _scrape_single_sku(
                 )
                 if _needs_browser_search:
                     _b_url, _b_html, _, _b_err = _fetch_html_with_real_chrome(
-                        target_url, timeout_ms=20000, settle_ms=1800
+                        target_url, timeout_ms=20000, settle_ms=1800, cookies=cookies
                     )
                     if not _b_err and _b_html:
                         search_html = _b_html
@@ -5482,6 +6234,159 @@ def _scrape_single_sku(
     return sku, {}, last_error or "Failed to fetch search page"
 
 
+def scrape_product_page_images(
+    product_url: str,
+    image_output_root: "Path",
+    cookies: "list | None" = None,
+) -> tuple[list[str], str, str | None]:
+    """Fetch a single product page URL, extract all gallery images, download and
+    resize them to 1500x1500 JPEG.  No SKU required.
+
+    Returns:
+        (local_file_paths, output_folder_path_str, error_or_None)
+    """
+    url = _clean_text(product_url)
+    if not url:
+        return [], "", "No URL provided"
+    _seed_runtime_cookies_for_url(url, cookies)
+
+    html, fetch_error = _fetch_html(url)
+    if not html or _looks_like_bot_challenge(html):
+        _, html, _, browser_error = _fetch_html_with_real_chrome(url, cookies=cookies)
+        if not html:
+            return [], "", browser_error or fetch_error or "Empty response"
+
+    payload = _extract_page_payload(html, url, sku="", scrape_images=True)
+
+    vendor_hint = (
+        _clean_text(payload.get("vendor", ""))
+        or _extract_meta_content(html, "og:site_name")
+        or _infer_vendor_from_title(_clean_text(payload.get("title", "")))
+        or re.sub(r"^www\.", "", _host_key_from_url(url)).split(".")[0]
+    )
+
+    media_values = _split_multi_value(_clean_text(payload.get("media_urls", "")))
+    if not media_values:
+        return [], "", "No images found on page"
+
+    folder_key = _safe_folder_name(vendor_hint) or _safe_folder_name(_host_key_from_url(url)) or "images"
+    local_files, media_folder, download_error = _download_images_for_sku(
+        sku=folder_key,
+        media_urls=media_values,
+        image_output_root=image_output_root,
+        vendor_hint=vendor_hint,
+    )
+    return local_files, media_folder, download_error
+
+
+def scrape_direct_product_record(
+    product_url: str,
+    sku: str,
+    search_term: str = "",
+    *,
+    scrape_images: bool = True,
+    image_output_root: "Path | None" = None,
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
+    cookies: list[dict[str, object]] | None = None,
+) -> tuple[dict[str, str], str | None]:
+    url = _clean_text(product_url)
+    if not url:
+        return {}, "No product URL provided"
+    _seed_runtime_cookies_for_url(url, cookies)
+
+    normalized_requested_fields = _normalize_requested_scrape_fields(requested_fields)
+    effective_scrape_images = bool(
+        scrape_images and (normalized_requested_fields is None or "media_urls" in normalized_requested_fields)
+    )
+    query_value = normalize_sku(search_term) or normalize_sku(sku)
+    if not query_value:
+        query_value = normalize_sku(sku)
+    if not query_value:
+        return {}, "No SKU or search term provided"
+
+    direct_vendor_error: str | None = None
+    final_url = url
+    merged: dict[str, str] = {}
+    if _is_alliant_graph_url(url):
+        direct_payload, direct_vendor_error = _scrape_direct_alliant_product_record(
+            product_url=url,
+            sku=sku,
+            search_term=search_term,
+        )
+        if _payload_has_requested_product_data(direct_payload, normalized_requested_fields):
+            merged = dict(direct_payload)
+            final_url = _clean_text(direct_payload.get("product_url", "")) or final_url
+
+    html, fetch_error = _fetch_html(url)
+    browser_error: str | None = None
+
+    if html and not _looks_like_bot_challenge(html):
+        dom_payload = _extract_page_payload(html, url, query_value, scrape_images=effective_scrape_images)
+        if merged:
+            merged = _merge_seed_payload(merged, dom_payload, page_url=url)
+        else:
+            merged = dom_payload
+
+    if not _payload_has_requested_product_data(merged, normalized_requested_fields):
+        final_url, browser_html, network_bodies, browser_error = _fetch_html_with_real_chrome(url, cookies=cookies)
+        if browser_html:
+            network_payload = _extract_payload_from_browser_json_responses(
+                response_bodies=network_bodies,
+                page_url=final_url,
+                sku=query_value,
+            )
+            dom_payload = _extract_page_payload(browser_html, final_url, query_value, scrape_images=effective_scrape_images)
+            browser_payload = _merge_seed_payload(network_payload, dom_payload, page_url=final_url)
+            if merged:
+                merged = _merge_seed_payload(merged, browser_payload, page_url=final_url)
+            else:
+                merged = browser_payload
+
+    if _should_attempt_xtreme_browser_detail(
+        product_url=final_url,
+        payload=merged,
+        requested_fields=normalized_requested_fields,
+    ):
+        browser_payload, browser_error = _fetch_xtreme_detail_payload_via_browser(
+            product_url=final_url,
+            sku=query_value,
+            scrape_images=effective_scrape_images,
+            cookies=cookies,
+        )
+        if browser_payload:
+            merged = _merge_seed_payload(merged, browser_payload, page_url=final_url)
+            final_url = _clean_text(browser_payload.get("product_url", "")) or final_url
+        elif browser_error:
+            merged["detail_fetch_error"] = browser_error
+
+    merged["product_url"] = final_url
+    merged["source_url"] = final_url
+    if query_value != normalize_sku(sku):
+        merged["search_term"] = query_value
+
+    if effective_scrape_images and image_output_root is not None:
+        media_values = _split_multi_value(merged.get("media_urls", ""))
+        if media_values:
+            local_files, media_folder, image_error = _download_images_for_sku(
+                sku=sku,
+                media_urls=media_values,
+                image_output_root=image_output_root,
+                vendor_hint=_clean_text(merged.get("vendor", "")),
+            )
+            if media_folder:
+                merged["media_folder"] = media_folder
+            if local_files:
+                merged["media_local_files"] = " | ".join(local_files)
+                merged["media_urls"] = " | ".join(local_files)
+            elif image_error:
+                merged["image_download_error"] = image_error
+
+    filtered_payload = _filter_requested_scrape_payload(merged, normalized_requested_fields)
+    if not _payload_has_requested_product_data(filtered_payload, normalized_requested_fields):
+        return {}, direct_vendor_error or browser_error or fetch_error or "No product fields extracted from direct URL."
+    return filtered_payload, None
+
+
 def scrape_vendor_records(
     vendor_search_url: str,
     skus: list[str],
@@ -5493,10 +6398,12 @@ def scrape_vendor_records(
     search_terms_by_sku: dict[str, str] | None = None,
     requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
     required_root: Path | None = None,
+    cookies: list[dict[str, object]] | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
     sku_values = [normalize_sku(sku) for sku in skus if normalize_sku(sku)]
     if not vendor_search_url or not sku_values:
         return {}, {}, []
+    _seed_runtime_cookies_for_url(vendor_search_url, cookies)
     search_term_lookup = {
         normalize_sku(key): normalize_sku(value) or normalize_sku(key)
         for key, value in (search_terms_by_sku or {}).items()
@@ -5599,6 +6506,7 @@ def scrape_vendor_records(
                 image_output_root=output_root,
                 search_term=search_term_lookup.get(sku, sku),
                 requested_fields=normalized_requested_fields,
+                cookies=cookies,
             )
             for sku in ordered_skus
         ]
@@ -5645,6 +6553,7 @@ def scrape_vendor_records(
                 image_output_root=output_root,
                 search_term=search_term_lookup.get(sku, sku),
                 requested_fields=normalized_requested_fields,
+                cookies=cookies,
             )
             if payload:
                 results[sku] = _filter_requested_scrape_payload(payload, normalized_requested_fields)

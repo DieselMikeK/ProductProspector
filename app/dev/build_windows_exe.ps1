@@ -39,6 +39,7 @@ function Test-IsExpectedPyInstallerWarnModule {
     "adbc_driver_manager",
     "botocore",
     "bs4",
+    "certifi",
     "charset_normalizer",
     "collections.abc",
     "dateutil.tz.tzfile",
@@ -166,40 +167,80 @@ if (Test-Path $BundleRulesPath) {
   Write-Host "Bundling rules: $BundleRulesPath"
 }
 
-& $PythonBin -m venv $VenvDir
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $VenvPyInstaller = Join-Path $VenvDir "Scripts\pyinstaller.exe"
 
+if (-not (Test-Path $VenvPython)) {
+  if (Test-Path $VenvDir) {
+    Remove-Item -LiteralPath $VenvDir -Recurse -Force
+  }
+  Write-Host "Creating build virtual environment..."
+  & $PythonBin -m venv $VenvDir
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to create build virtual environment."
+  }
+} else {
+  Write-Host "Reusing existing build virtual environment..."
+}
+
 & $VenvPython -m pip install --upgrade pip setuptools wheel
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to upgrade pip/setuptools/wheel in build virtual environment."
+}
 & $VenvPython -m pip install -r (Join-Path $AppDevDir "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to install build requirements."
+}
 
 Push-Location $AppDevDir
+
+Write-Host "Running syntax checks..."
+& $VenvPython -m py_compile update_utils.py updater_app.py desktop_app.py run_product_prospector.pyw
+if ($LASTEXITCODE -ne 0) {
+  throw "Syntax checks failed."
+}
 
 if (Test-Path "build") { Remove-Item "build" -Recurse -Force }
 if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force }
 
+Write-Host "Building updater helper..."
 & $VenvPyInstaller `
   --noconfirm `
   --clean `
-  --onefile `
-  --windowed `
-  --name "ProductProspector" `
-  --icon "..\icon.ico" `
-  --paths "$AppDevDir" `
-  --hidden-import "product_prospector" `
-  --hidden-import "core" `
-  --exclude-module "pandas.io.formats.style" `
-  --exclude-module "pandas.io.formats.style_render" `
-  --add-data "..\required;app\required" `
-  --add-data "..\config;app\config" `
-  --add-data "..\video;app\video" `
-  --add-data "..\logo.png;app" `
-  --add-data "..\icon.ico;app" `
-  --add-data "..\product_prospector.settings.json;app" `
-  run_product_prospector.pyw
+  ProductProspectorUpdater.spec
+if ($LASTEXITCODE -ne 0) {
+  throw "Updater helper build failed."
+}
+
+Write-Host "Building main application..."
+& $VenvPyInstaller `
+  --noconfirm `
+  --clean `
+  ProductProspector.spec
+if ($LASTEXITCODE -ne 0) {
+  throw "Main application build failed."
+}
 
 Pop-Location
 
+$MainExe = Join-Path $AppDevDir "dist\ProductProspector.exe"
+$UpdaterExe = Join-Path $AppDevDir "dist\ProductProspectorUpdater.exe"
+$RuntimeUpdateDir = Join-Path $ProjectRoot "update"
+$RuntimeUpdaterExe = Join-Path $RuntimeUpdateDir "ProductProspectorUpdater.exe"
+
+if (-not (Test-Path $MainExe)) {
+  throw "Main build did not produce $MainExe"
+}
+if (-not (Test-Path $UpdaterExe)) {
+  throw "Updater build did not produce $UpdaterExe"
+}
+
+New-Item -ItemType Directory -Force -Path $RuntimeUpdateDir | Out-Null
+Copy-Item -Force $MainExe (Join-Path $ProjectRoot "ProductProspector.exe")
+Copy-Item -Force $UpdaterExe $RuntimeUpdaterExe
+
 Write-Host "Build complete:"
-Write-Host "  $AppDevDir\dist\ProductProspector.exe"
+Write-Host "  $MainExe"
+Write-Host "Updater helper:"
+Write-Host "  $RuntimeUpdaterExe"
 Show-PyInstallerWarnSummary -WarnPath (Join-Path $AppDevDir "build\ProductProspector\warn-ProductProspector.txt")

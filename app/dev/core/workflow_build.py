@@ -16,7 +16,7 @@ from product_prospector.core.pricing_priority_rules import (
     classify_price_column_role,
     load_price_priority_rules,
 )
-from product_prospector.core.product_model import Product
+from product_prospector.core.product_model import Product, has_shopify_collective_tag
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.session_state import MODE_NEW, MODE_UPDATE, AppSession
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
@@ -72,6 +72,16 @@ def _row_value(row: pd.Series, column_name: str) -> str:
     if column_name not in row.index:
         return ""
     return _clean_text(row[column_name])
+
+
+def _shopify_gid(resource_type: str, numeric_id: object) -> str:
+    value = _clean_text(numeric_id)
+    if not value:
+        return ""
+    digits = re.sub(r"[^0-9]", "", value)
+    if not digits:
+        return ""
+    return f"gid://shopify/{resource_type}/{digits}"
 
 
 def _to_float(value: object) -> float | None:
@@ -359,6 +369,8 @@ def build_existing_shopify_index(
             "barcode": _clean_text(row.get("barcode", "")),
             "product_id": pid,
             "variant_id": vid,
+            "product_gid": _clean_text(row.get("product_gid", "")) or _shopify_gid("Product", pid),
+            "variant_gid": _clean_text(row.get("variant_gid", "")) or _shopify_gid("ProductVariant", vid),
             "parent_has_variants": "yes" if has_variants else "",
             "google_product_type": _clean_text(row.get("google_product_type", "")),
             "category_code": _clean_text(row.get("category_code", "")),
@@ -706,6 +718,15 @@ def build_products_from_session(
     stats.rows_considered = len(rows)
     existing_index = existing_shopify_index or {}
     scraped_index = scraped_records or {}
+    lookup_vendor_value = _clean_text(getattr(session, "lookup_vendor", ""))
+    lookup_profile = resolve_vendor_profile(lookup_vendor_value, required_root=required_root) if lookup_vendor_value else None
+    canonical_lookup_vendor = (
+        _clean_text(lookup_profile.shopify_vendor_value) if lookup_profile is not None else ""
+    ) or (
+        _clean_text(lookup_profile.canonical_vendor) if lookup_profile is not None else ""
+    ) or (
+        normalize_vendor_from_rules(lookup_vendor_value, required_root=required_root) if lookup_vendor_value else ""
+    ) or lookup_vendor_value
     dealer_columns: list[str] = []
     if session.vendor_df is not None and not session.vendor_df.empty:
         dealer_columns = _dealer_columns_for_sheet(mapping, list(session.vendor_df.columns), price_rules=price_rules)
@@ -736,6 +757,7 @@ def build_products_from_session(
             _set_if_present(product, "type", existing.get("type", ""), "shopify")
             _set_if_present(product, "vendor", existing.get("vendor", ""), "shopify")
             _set_if_present(product, "tags", existing.get("tags", ""), "shopify")
+            product.shopify_collective_locked = has_shopify_collective_tag(existing.get("tags", ""))
             _set_if_present(product, "cost", existing.get("cost", ""), "shopify")
             _set_if_present(product, "barcode", existing.get("barcode", ""), "shopify")
             _set_if_present(product, "google_product_type", existing.get("google_product_type", ""), "shopify")
@@ -752,14 +774,29 @@ def build_products_from_session(
             if session.mode == MODE_UPDATE:
                 if existing.get("product_id"):
                     product.product_id = existing["product_id"]
+                if existing.get("product_gid"):
+                    product.product_gid = existing["product_gid"]
+                elif existing.get("product_id"):
+                    product.product_gid = _shopify_gid("Product", existing["product_id"])
                 if existing.get("variant_id"):
                     product.variant_id = existing["variant_id"]
+                if existing.get("variant_gid"):
+                    product.variant_gid = existing["variant_gid"]
+                elif existing.get("variant_id"):
+                    product.variant_gid = _shopify_gid("ProductVariant", existing["variant_id"])
                 if existing.get("parent_has_variants") == "yes":
                     product.parent_has_variants = True
                     product.record_type = "Variant"
             else:
                 if existing.get("product_id"):
                     product.product_id = existing["product_id"]
+                if existing.get("product_gid"):
+                    product.product_gid = existing["product_gid"]
+                elif existing.get("product_id"):
+                    product.product_gid = _shopify_gid("Product", existing["product_id"])
+
+        if canonical_lookup_vendor and not _clean_text(getattr(product, "vendor", "")):
+            _set_if_present(product, "vendor", canonical_lookup_vendor, "lookup_vendor")
 
         row_price, row_map_price, row_msrp_price, row_jobber_price = _infer_price_fields_from_row(
             row,
@@ -810,6 +847,19 @@ def build_products_from_session(
                 selected.add("dealer_cost")
             if "category_code" in selected or "product_subtype" in selected or "google_product_type" in selected:
                 selected.add("type")
+            if "application" in selected:
+                spreadsheet_title = _clean_text(spreadsheet_values.get("title", ""))
+                if spreadsheet_title:
+                    product.application_context_title = _merge_title_values(
+                        _clean_text(getattr(product, "application_context_title", "")),
+                        spreadsheet_title,
+                    )
+                spreadsheet_description = _clean_text(spreadsheet_values.get("description_html", ""))
+                if spreadsheet_description:
+                    product.application_context_description = _merge_description_values(
+                        _clean_text(getattr(product, "application_context_description", "")),
+                        spreadsheet_description,
+                    )
             for field_name, value in spreadsheet_values.items():
                 if field_name not in selected:
                     continue
@@ -888,6 +938,19 @@ def build_products_from_session(
                     selected.update({"map_price", "msrp_price", "jobber_price"})
                 if "cost" in selected:
                     selected.add("dealer_cost")
+                if "application" in selected:
+                    scraped_title = _clean_text(scraped_values.get("title", ""))
+                    if scraped_title:
+                        product.application_context_title = _merge_title_values(
+                            _clean_text(getattr(product, "application_context_title", "")),
+                            scraped_title,
+                        )
+                    scraped_description = _clean_text(scraped_values.get("description_html", ""))
+                    if scraped_description:
+                        product.application_context_description = _merge_description_values(
+                            _clean_text(getattr(product, "application_context_description", "")),
+                            scraped_description,
+                        )
                 if scraped_product_url:
                     _set_if_present(product, "product_url", scraped_product_url, "scraper")
                 for field_name in selected:

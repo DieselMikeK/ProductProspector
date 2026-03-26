@@ -1,0 +1,176 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - release_request.json
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build release artifacts
+        shell: pwsh
+        run: .\build_release.ps1
+
+      - name: Collect release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
+              throw "VERSION is empty."
+          }
+
+          $tag = "v$version"
+          $mainExe = Join-Path $PWD 'app\dev\dist\ProductProspector.exe'
+          if (-not (Test-Path $mainExe)) {
+              throw "Missing app\dev\dist\ProductProspector.exe after build."
+          }
+          $templatePath = Join-Path $PWD 'app\dev\dist\release-template.json'
+          if (-not (Test-Path $templatePath)) {
+              throw "Missing app\dev\dist\release-template.json after build."
+          }
+
+          $requestNotes = ''
+          $requestPath = Join-Path $PWD 'release_request.json'
+          if (Test-Path $requestPath) {
+              try {
+                  $request = Get-Content -Path $requestPath -Raw | ConvertFrom-Json
+                  $requestNotes = [string]($request.notes)
+              } catch {
+                  throw "release_request.json is not valid JSON."
+              }
+          }
+
+          $notes = $requestNotes.Trim()
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+              $notes = "Product Prospector $version"
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.txt'
+          Set-Content -Path $notesPath -Value $notes -Encoding UTF8
+
+          $template = Get-Content -Path $templatePath -Raw | ConvertFrom-Json
+          $downloadBase = "https://github.com/${{ github.repository }}/releases/download/$tag"
+          $finalFiles = [System.Collections.ArrayList]::new()
+          $primaryFile = $null
+
+          foreach ($file in @($template.files)) {
+              $relativePath = [string]$file.relative_path
+              $assetName = [string]$file.asset_name
+              $fileSha256 = [string]$file.sha256
+              if ([string]::IsNullOrWhiteSpace($relativePath) -or [string]::IsNullOrWhiteSpace($assetName)) {
+                  throw "release-template.json contains a file entry without relative_path or asset_name."
+              }
+
+              $entry = [ordered]@{
+                  relative_path = $relativePath
+                  download_url  = "$downloadBase/$assetName"
+                  sha256        = $fileSha256
+              }
+              $null = $finalFiles.Add($entry)
+
+              if ($relativePath -ieq 'ProductProspector.exe') {
+                  $primaryFile = $entry
+              }
+          }
+
+          if (-not $primaryFile) {
+              throw "release-template.json does not contain the primary ProductProspector.exe entry."
+          }
+
+          $manifest = [ordered]@{
+              version      = $version
+              download_url = $primaryFile.download_url
+              sha256       = $primaryFile.sha256
+              notes        = $notes
+              published_at = ''
+              files        = $finalFiles
+          }
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'release-manifest.json'
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "title=Product Prospector v$version" >> $env:GITHUB_OUTPUT
+          "sha256=$($primaryFile.sha256)" >> $env:GITHUB_OUTPUT
+          "download_url=$($primaryFile.download_url)" >> $env:GITHUB_OUTPUT
+          "manifest_file=$manifestPath" >> $env:GITHUB_OUTPUT
+          "notes_file=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create `
+            "${{ steps.meta.outputs.tag }}" `
+            "app\dev\dist\ProductProspector.exe" `
+            --repo "${{ github.repository }}" `
+            --title "${{ steps.meta.outputs.title }}" `
+            --notes-file "${{ steps.meta.outputs.notes_file }}"
+
+      - name: Read published release info
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $release = gh release view `
+            "${{ steps.meta.outputs.tag }}" `
+            --repo "${{ github.repository }}" `
+            --json publishedAt,url | ConvertFrom-Json
+
+          "published_at=$($release.publishedAt)" >> $env:GITHUB_OUTPUT
+          "release_url=$($release.url)" >> $env:GITHUB_OUTPUT
+
+      - name: Update release manifest
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -Path "${{ steps.meta.outputs.manifest_file }}" -Raw | ConvertFrom-Json
+          $manifest.published_at = "${{ steps.release.outputs.published_at }}"
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path 'app\docs\release.json' -Encoding UTF8
+
+      - name: Commit updated release manifest
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/docs/release.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "app/docs/release.json did not change."
+              exit 0
+          }
+          git commit -m "Publish release manifest for v${{ steps.meta.outputs.version }}"
+          git push
+
+      - name: Release summary
+        shell: pwsh
+        run: |
+          Write-Host "Release published: ${{ steps.release.outputs.release_url }}"
+          Write-Host "Primary asset URL: ${{ steps.meta.outputs.download_url }}"
+          Write-Host "SHA-256: ${{ steps.meta.outputs.sha256 }}"

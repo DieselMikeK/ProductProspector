@@ -5,6 +5,8 @@ import csv
 from collections import defaultdict
 import ctypes
 from datetime import datetime, timezone
+import json
+import os
 import queue
 from pathlib import Path
 import re
@@ -38,7 +40,7 @@ from product_prospector.core.pricing_rules import (
     load_vendor_discounts,
     resolve_discount_candidates,
 )
-from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS, Product
+from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS, Product, has_shopify_collective_tag
 from product_prospector.core.processing import (
     PlanningConfig,
     RUN_MODE_CREATE,
@@ -60,12 +62,15 @@ from product_prospector.core.shopify_sku_cache import get_shopify_sku_cache_path
 from product_prospector.core.shopify_variant_updates import (
     ProductApplicationUpdate,
     ProductApplicationUpdateSummary,
+    ProductCollectionUpdate,
+    ProductCollectionUpdateSummary,
     VariantSnapshot,
     VariantWeightUpdate,
     add_tag_to_products,
     fetch_variant_snapshots_by_product_ids,
     fetch_variant_snapshots_by_skus,
     push_product_application_bulk,
+    push_product_collections_bulk,
     push_variant_weights_bulk,
 )
 from product_prospector.core.blog_tagging import (
@@ -85,7 +90,15 @@ from product_prospector.core.workflow_build import (
     merge_mode_label,
     products_to_dataframe,
 )
-from product_prospector.core.scraper_engine import scrape_product_page_images, scrape_vendor_records
+from product_prospector.core.scraper_engine import scrape_direct_product_record, scrape_product_page_images, scrape_vendor_records
+from update_utils import (
+    MAIN_EXECUTABLE_NAME,
+    fetch_release_manifest,
+    load_app_version,
+    parse_version_tuple,
+    stage_release_manifest,
+    stage_updater_executable,
+)
 
 
 APP_TITLE = "Product Prospector"
@@ -436,6 +449,21 @@ class ProductProspectorDesktopApp:
         self.type_mapper: TypeCategoryMapper | None = None
         self.session = AppSession()
         self.review_index = 0
+        self.app_version = load_app_version()
+        self.available_update: dict[str, object] | None = None
+        self.update_button: tk.Button | None = None
+        self.update_button_glow: tk.Frame | None = None
+        self._update_button_visible = False
+        self._update_flash_job: str | None = None
+        self._update_flash_on = False
+        self._update_state_poll_job: str | None = None
+        self._update_button_bg = "#157347"
+        self._update_button_active_bg = "#198754"
+        self._update_button_disabled_bg = "#4f6f5a"
+        self._update_button_glow_dim = "#2d7a42"
+        self._update_button_glow_bright = "#5dff8a"
+        self._update_button_neutral_bg = ttk.Style().lookup("TFrame", "background") or self.root.cget("bg")
+        self.version_var = StringVar(value=f"v{self.app_version}")
 
         self.vendor_path = StringVar(value="")
         self.mode_help_text = StringVar(value="")
@@ -514,11 +542,19 @@ class ProductProspectorDesktopApp:
         self.image_capture_url = StringVar(value="")
         self.image_capture_status = StringVar(value="")
         self.image_capture_inflight = False
+        self.image_capture_cookie_json: str = ""
 
         self.scrape_search_url = StringVar(value="")
+        self.scrape_product_url = StringVar(value="")
         self._scrape_search_url_auto_value = ""
         self._scrape_search_url_auto_vendor_key = ""
         self._scrape_search_url_inferred_vendor = ""
+        self.scrape_search_url_entry: ttk.Entry | None = None
+        self.scrape_product_url_label: ttk.Label | None = None
+        self.scrape_product_url_entry: ttk.Entry | None = None
+        self.scrape_product_url_note: ttk.Label | None = None
+        self.scrape_cookie_text: tk.Text | None = None
+        self.scrape_workers_combo: ttk.Combobox | None = None
         self.scrape_workers = StringVar(value="3")
         self.scrape_worker_options = tuple(str(value) for value in range(1, 11))
         self.scrape_delay = StringVar(value="0.35")
@@ -599,8 +635,10 @@ class ProductProspectorDesktopApp:
         self.review_loaded_display: dict[str, str] = {}
         self.review_loaded_truncated: dict[str, bool] = {}
         self.review_field_widgets: dict[str, tuple[tk.Widget, tk.Widget]] = {}
+        self.review_variant_field_widgets: dict[str, tk.Widget] = {}
         self.review_field_layouts: dict[str, tuple[int, int]] = {}
         self.review_cost_options_loaded_for_sku: str = ""
+        self.review_collective_note_text = StringVar(value="")
         self.review_busy_spinner_job: str | None = None
         self.review_busy_spinner_angle = 0
         self.review_busy_active = False
@@ -635,6 +673,7 @@ class ProductProspectorDesktopApp:
         self.inventory_owner.trace_add("write", self._on_inventory_owner_changed)
         self.duplicate_check_text.trace_add("write", self._on_setup_status_rows_changed)
         self.setup_status_text.trace_add("write", self._on_setup_status_rows_changed)
+        self.scrape_product_url.trace_add("write", self._on_scrape_product_url_changed)
         self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
         self._load_review_collection_options()
         self._load_review_tag_options()
@@ -649,6 +688,8 @@ class ProductProspectorDesktopApp:
         self._update_tab_access()
         self._schedule_ui_task_pump()
         self._start_background_api_bootstrap()
+        self.root.after(2000, self._check_for_updates_async)
+        self._schedule_update_button_state_poll()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _create_layout(self) -> None:
@@ -688,6 +729,31 @@ class ProductProspectorDesktopApp:
             command=self._redownload_shopify_sku_cache_clicked,
         )
         self.shopify_cache_redownload_button.pack(side=LEFT, padx=(8, 0))
+        version_label = ttk.Label(api_frame, textvariable=self.version_var, foreground="#666666")
+        version_label.pack(side=RIGHT)
+        self.update_button_glow = tk.Frame(
+            api_frame,
+            bg=self._update_button_neutral_bg,
+            bd=0,
+            highlightthickness=0,
+        )
+        self.update_button = tk.Button(
+            self.update_button_glow,
+            text="Update Available",
+            command=self._on_update_clicked,
+            fg="#ffffff",
+            bg=self._update_button_bg,
+            activebackground=self._update_button_active_bg,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            highlightthickness=0,
+        )
+        self.update_button.pack(padx=2, pady=2)
         self.reset_app_button = ttk.Button(root_frame, text="Reset", command=self._reset_application_state)
         self.reset_app_button.place(relx=1.0, x=-15, y=15, anchor="ne")
         self.reset_app_button.lift()
@@ -710,6 +776,228 @@ class ProductProspectorDesktopApp:
         self._build_preview_tab()
         self._build_export_tab()
         self._bind_tab_canvas_mousewheel()
+
+    def _get_update_target_exe_path(self) -> str:
+        """Return the executable path that should be replaced during updates."""
+        if getattr(sys, "frozen", False):
+            return str(Path(sys.executable).resolve())
+
+        source_dir = Path(__file__).resolve().parent
+        candidates = [
+            source_dir / "dist" / MAIN_EXECUTABLE_NAME,
+            source_dir.parents[1] / MAIN_EXECUTABLE_NAME,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return ""
+
+    def _is_update_idle(self) -> bool:
+        return not any(
+            [
+                self.processing_inflight,
+                self.image_capture_inflight,
+                self.shopify_push_inflight,
+                self.shopify_connecting,
+                self._background_connect_running,
+                self.review_busy_active,
+            ]
+        )
+
+    def _check_for_updates_async(self) -> None:
+        """Check the remote release manifest without blocking the UI."""
+        if not self._get_update_target_exe_path():
+            return
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+
+    def _check_for_updates(self) -> None:
+        """Load update metadata and surface the update button when needed."""
+        try:
+            manifest = fetch_release_manifest(self.required_root)
+        except Exception:
+            return
+
+        has_download = bool(str(manifest.get("download_url") or "").strip())
+        current_tuple = parse_version_tuple(self.app_version)
+        latest_tuple = parse_version_tuple(manifest.get("version"))
+        if latest_tuple > current_tuple and has_download:
+            self.root.after(0, lambda: self._set_available_update(manifest))
+            return
+
+        self.root.after(0, lambda: self._set_available_update(None))
+
+    def _set_available_update(self, manifest: dict[str, object] | None) -> None:
+        """Show or hide the update button based on the available release manifest."""
+        self.available_update = manifest
+        if self.update_button is None or self.update_button_glow is None:
+            return
+
+        if manifest:
+            version = str(manifest.get("version") or "").strip()
+            self.update_button.configure(text=f"Update to v{version}" if version else "Update Available")
+            if not self._update_button_visible:
+                self.update_button_glow.pack(side=RIGHT, padx=(0, 8))
+                self._update_button_visible = True
+        elif self._update_button_visible:
+            self._stop_update_button_flash()
+            self.update_button_glow.pack_forget()
+            self._update_button_visible = False
+
+        self._refresh_update_button_state()
+
+    def _stop_update_button_flash(self, glow_color: str | None = None) -> None:
+        """Stop the update pulse and leave the glow in a stable state."""
+        if self._update_flash_job is not None:
+            try:
+                self.root.after_cancel(self._update_flash_job)
+            except Exception:
+                pass
+            self._update_flash_job = None
+        self._update_flash_on = False
+        if self.update_button_glow is not None:
+            self.update_button_glow.configure(bg=glow_color or self._update_button_neutral_bg)
+
+    def _pulse_update_button(self) -> None:
+        """Pulse the update glow while a clickable update is available."""
+        if (
+            self.update_button is None
+            or self.update_button_glow is None
+            or not self.available_update
+            or not self._update_button_visible
+            or str(self.update_button.cget("state")) != tk.NORMAL
+        ):
+            self._stop_update_button_flash()
+            return
+
+        self._update_flash_on = not self._update_flash_on
+        glow_color = self._update_button_glow_bright if self._update_flash_on else self._update_button_glow_dim
+        self.update_button_glow.configure(bg=glow_color)
+        self._update_flash_job = self.root.after(550, self._pulse_update_button)
+
+    def _start_update_button_flash(self) -> None:
+        """Start pulsing the update button if it is not already animating."""
+        if self._update_flash_job is not None:
+            return
+        self._pulse_update_button()
+
+    def _refresh_update_button_state(self) -> None:
+        """Enable the update button only when an update is available and the app is idle."""
+        if self.update_button is None or self.update_button_glow is None:
+            return
+        if not self.available_update or not self._update_button_visible:
+            self._stop_update_button_flash()
+            return
+
+        is_enabled = self._is_update_idle()
+        state = tk.NORMAL if is_enabled else tk.DISABLED
+        self.update_button.configure(state=state)
+        if is_enabled:
+            self.update_button.configure(
+                bg=self._update_button_bg,
+                activebackground=self._update_button_active_bg,
+                cursor="hand2",
+            )
+            self._start_update_button_flash()
+        else:
+            self.update_button.configure(
+                bg=self._update_button_disabled_bg,
+                activebackground=self._update_button_disabled_bg,
+                cursor="arrow",
+            )
+            self._stop_update_button_flash(glow_color=self._update_button_glow_dim)
+
+    def _schedule_update_button_state_poll(self) -> None:
+        if self._shutdown_requested:
+            return
+        self._refresh_update_button_state()
+        self._update_state_poll_job = self.root.after(800, self._schedule_update_button_state_poll)
+
+    def _on_update_clicked(self) -> None:
+        """Confirm and launch the external updater helper."""
+        if not self.available_update:
+            return
+        if not self._is_update_idle():
+            messagebox.showwarning(
+                APP_TITLE,
+                "Finish the current task before running the updater.",
+                parent=self.root,
+            )
+            return
+
+        manifest = self.available_update
+        lines = [
+            f"Install Product Prospector v{manifest['version']} now?",
+            f"Current version: v{self.app_version}",
+        ]
+        notes = str(manifest.get("notes") or "").strip()
+        if notes:
+            lines.extend(["", "Release notes:", notes])
+
+        if not messagebox.askyesno(APP_TITLE, "\n".join(lines), parent=self.root):
+            return
+
+        target_exe = self._get_update_target_exe_path()
+        if not target_exe:
+            messagebox.showerror(
+                APP_TITLE,
+                "Could not determine which ProductProspector.exe should be updated.",
+                parent=self.root,
+            )
+            return
+
+        try:
+            updater_exe = stage_updater_executable(self.app_version)
+            manifest_path = stage_release_manifest(manifest, manifest.get("version"))
+        except Exception as exc:
+            messagebox.showerror(
+                APP_TITLE,
+                f"Could not prepare the updater files.\n\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        primary_download_url = str(manifest.get("download_url") or "").strip()
+        if not primary_download_url:
+            messagebox.showerror(
+                APP_TITLE,
+                "The update manifest is missing a download URL.",
+                parent=self.root,
+            )
+            return
+
+        args = [
+            updater_exe,
+            "--current-exe",
+            target_exe,
+            "--manifest-file",
+            manifest_path,
+            "--download-url",
+            primary_download_url,
+            "--target-version",
+            str(manifest["version"]),
+            "--source-version",
+            self.app_version,
+            "--wait-pid",
+            str(os.getpid()),
+        ]
+        expected_hash = str(manifest.get("sha256") or "").strip()
+        if expected_hash:
+            args.extend(["--sha256", expected_hash])
+
+        try:
+            if self.update_button is not None:
+                self.update_button.configure(state=tk.DISABLED)
+            subprocess.Popen(args, cwd=os.path.dirname(target_exe) or None)
+        except Exception as exc:
+            self._refresh_update_button_state()
+            messagebox.showerror(
+                APP_TITLE,
+                f"Could not launch the updater helper.\n\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        self.root.destroy()
 
     def _fit_window_to_screen(self) -> None:
         match = re.match(r"^\s*(\d+)x(\d+)", APP_GEOMETRY or "")
@@ -1242,7 +1530,10 @@ class ProductProspectorDesktopApp:
         self.image_capture_wrap = ttk.LabelFrame(self.setup_inner, text="Image Capture", padding=12)
         ic = self.image_capture_wrap
         ttk.Label(ic, text="Product page URL:").pack(anchor=W)
-        ttk.Entry(ic, textvariable=self.image_capture_url, width=80).pack(fill=X, pady=(4, 12))
+        ttk.Entry(ic, textvariable=self.image_capture_url, width=80).pack(fill=X, pady=(4, 8))
+        ttk.Label(ic, text="Cookies (optional — paste JSON from EditThisCookie to access login-protected pages):").pack(anchor=W)
+        self.image_capture_cookie_text = tk.Text(ic, height=4, wrap="none", font=("Courier", 9))
+        self.image_capture_cookie_text.pack(fill=X, pady=(4, 12))
         ic_btn_row = ttk.Frame(ic)
         ic_btn_row.pack(fill=X)
         self.image_capture_run_btn = ttk.Button(ic_btn_row, text="Run Image Capture", command=self._run_image_capture)
@@ -1757,13 +2048,20 @@ class ProductProspectorDesktopApp:
             return ""
         record_type = str(getattr(product, "record_type", "") or "").strip().lower()
         variant_gid = str(getattr(product, "variant_gid", "") or "").strip()
+        variant_id = str(getattr(product, "variant_id", "") or "").strip()
         if self.session.mode == MODE_UPDATE:
-            if record_type == "variant" and variant_gid:
-                return variant_gid
+            if record_type == "variant":
+                if variant_gid:
+                    return variant_gid
+                if variant_id:
+                    return f"variant:{variant_id}"
             if record_type == "product":
                 product_gid = str(getattr(product, "product_gid", "") or "").strip()
+                product_id = str(getattr(product, "product_id", "") or "").strip()
                 if product_gid:
                     return f"parent:{product_gid}"
+                if product_id:
+                    return f"parent:{product_id}"
         return normalize_sku(getattr(product, "sku", ""))
 
     def _is_push_eligible(self, product) -> bool:
@@ -1774,10 +2072,15 @@ class ProductProspectorDesktopApp:
         if self.session.mode == MODE_UPDATE:
             record_type = str(getattr(product, "record_type", "") or "").strip().lower()
             if record_type == "variant":
-                return bool(str(getattr(product, "variant_gid", "") or "").strip())
+                return bool(
+                    str(getattr(product, "variant_gid", "") or "").strip()
+                    or str(getattr(product, "variant_id", "") or "").strip()
+                )
             if record_type == "product":
-                product_gid = str(getattr(product, "product_gid", "") or "").strip()
-                return bool(product_gid)
+                return bool(
+                    str(getattr(product, "product_gid", "") or "").strip()
+                    or str(getattr(product, "product_id", "") or "").strip()
+                )
             return False
         return bool(normalize_sku(getattr(product, "sku", "")))
 
@@ -1921,9 +2224,12 @@ class ProductProspectorDesktopApp:
         self.product_id_text_widget.delete("1.0", END)
 
         self.scrape_search_url.set("")
+        self.scrape_product_url.set("")
         self._scrape_search_url_auto_value = ""
         self._scrape_search_url_auto_vendor_key = ""
         self._scrape_search_url_inferred_vendor = ""
+        if self.scrape_cookie_text is not None:
+            self.scrape_cookie_text.delete("1.0", END)
         self.scrape_workers.set("3")
         self.scrape_delay.set("0.35")
         self.scrape_retries.set("2")
@@ -1970,6 +2276,7 @@ class ProductProspectorDesktopApp:
         self._set_duplicate_check_busy(False)
         self._refresh_vendor_sheet_ui()
         self._refresh_input_metrics()
+        self._refresh_scrape_source_inputs()
         self._refresh_sku_action_labels()
         self._refresh_new_mode_check_controls()
         self._refresh_push_button_state()
@@ -2025,20 +2332,45 @@ class ProductProspectorDesktopApp:
         settings_wrap.pack(fill=X, pady=(0, 8))
 
         ttk.Label(settings_wrap, text="Vendor Search URL", width=24).grid(row=0, column=0, sticky=W, padx=(0, 8), pady=3)
-        ttk.Entry(settings_wrap, textvariable=self.scrape_search_url).grid(row=0, column=1, sticky="ew", pady=3)
-        ttk.Label(settings_wrap, text="Workers", width=24).grid(row=1, column=0, sticky=W, padx=(0, 8), pady=3)
-        ttk.Combobox(
+        self.scrape_search_url_entry = ttk.Entry(settings_wrap, textvariable=self.scrape_search_url)
+        self.scrape_search_url_entry.grid(row=0, column=1, sticky="ew", pady=3)
+        self.scrape_product_url_label = ttk.Label(settings_wrap, text="Direct Product URL", width=24)
+        self.scrape_product_url_label.grid(row=1, column=0, sticky=W, padx=(0, 8), pady=3)
+        self.scrape_product_url_entry = ttk.Entry(settings_wrap, textvariable=self.scrape_product_url)
+        self.scrape_product_url_entry.grid(row=1, column=1, sticky="ew", pady=3)
+        self.scrape_product_url_note = ttk.Label(
+            settings_wrap,
+            text="Single-item create/update only. If populated, direct product URL overrides Vendor Search URL.",
+            foreground="#1f4e79",
+        )
+        self.scrape_product_url_note.grid(row=2, column=1, sticky=W, pady=(0, 3))
+        ttk.Label(
+            settings_wrap,
+            text="Cookies (optional)",
+            width=24,
+        ).grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=3)
+        self.scrape_cookie_text = tk.Text(settings_wrap, height=4, wrap="none", font=("Courier", 9))
+        self.scrape_cookie_text.grid(row=3, column=1, sticky="ew", pady=3)
+        ttk.Label(
+            settings_wrap,
+            text="Paste JSON from EditThisCookie to access login-protected pages.",
+            foreground="#1f4e79",
+        ).grid(row=4, column=1, sticky=W, pady=(0, 3))
+        ttk.Label(settings_wrap, text="Workers", width=24).grid(row=5, column=0, sticky=W, padx=(0, 8), pady=3)
+        self.scrape_workers_combo = ttk.Combobox(
             settings_wrap,
             textvariable=self.scrape_workers,
             state="readonly",
             values=self.scrape_worker_options,
             width=10,
-        ).grid(row=1, column=1, sticky=W, pady=3)
-        ttk.Label(settings_wrap, text="Delay Between Requests", width=24).grid(row=2, column=0, sticky=W, padx=(0, 8), pady=3)
-        ttk.Entry(settings_wrap, textvariable=self.scrape_delay, width=12).grid(row=2, column=1, sticky=W, pady=3)
-        ttk.Label(settings_wrap, text="Retry Count", width=24).grid(row=3, column=0, sticky=W, padx=(0, 8), pady=3)
-        ttk.Entry(settings_wrap, textvariable=self.scrape_retries, width=12).grid(row=3, column=1, sticky=W, pady=3)
+        )
+        self.scrape_workers_combo.grid(row=5, column=1, sticky=W, pady=3)
+        ttk.Label(settings_wrap, text="Delay Between Requests", width=24).grid(row=6, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Entry(settings_wrap, textvariable=self.scrape_delay, width=12).grid(row=6, column=1, sticky=W, pady=3)
+        ttk.Label(settings_wrap, text="Retry Count", width=24).grid(row=7, column=0, sticky=W, padx=(0, 8), pady=3)
+        ttk.Entry(settings_wrap, textvariable=self.scrape_retries, width=12).grid(row=7, column=1, sticky=W, pady=3)
         settings_wrap.columnconfigure(1, weight=1)
+        self._refresh_scrape_source_inputs()
 
         action_row = ttk.Frame(self.preview_inner)
         action_row.pack(fill=X, pady=(0, 8))
@@ -2188,6 +2520,14 @@ class ProductProspectorDesktopApp:
 
         self.export_status = ttk.Label(self.export_inner, textvariable=self.review_status_text, foreground="#1f4e79")
         self.export_status.pack(anchor=W, pady=(6, 0))
+        self.review_collective_note_label = ttk.Label(
+            self.export_inner,
+            textvariable=self.review_collective_note_text,
+            foreground="#92400E",
+            wraplength=1180,
+            justify=LEFT,
+        )
+        self.review_collective_note_label.pack(anchor=W, pady=(2, 0))
 
         export_row = ttk.Frame(self.export_inner)
         export_row.pack(fill=X, pady=(8, 0))
@@ -2283,13 +2623,15 @@ class ProductProspectorDesktopApp:
 
     def _review_variant_entry_row(self, parent, label: str, field_name: str, row: int, col_offset: int) -> None:
         ttk.Label(parent, text=label, width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
-        ttk.Entry(parent, textvariable=self.review_variant_fields[field_name]).grid(
+        entry_widget = ttk.Entry(parent, textvariable=self.review_variant_fields[field_name])
+        entry_widget.grid(
             row=row,
             column=col_offset + 1,
             sticky="ew",
             padx=(0, 12),
             pady=2,
         )
+        self.review_variant_field_widgets[field_name] = entry_widget
 
     def _review_variant_weight_row(self, parent, row: int, col_offset: int) -> None:
         ttk.Label(parent, text="Variant Weight", width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
@@ -2298,21 +2640,23 @@ class ProductProspectorDesktopApp:
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=0)
         frame.columnconfigure(2, weight=0)
-        ttk.Entry(frame, textvariable=self.review_variant_fields["variant_weight"]).grid(row=0, column=0, sticky="ew")
-        unit_combo = ttk.Combobox(
+        self.review_variant_weight_entry = ttk.Entry(frame, textvariable=self.review_variant_fields["variant_weight"])
+        self.review_variant_weight_entry.grid(row=0, column=0, sticky="ew")
+        self.review_variant_weight_unit_combo = ttk.Combobox(
             frame,
             textvariable=self.review_variant_fields["variant_weight_unit"],
             state="readonly",
             values=["POUNDS", "KILOGRAMS", "GRAMS", "OUNCES"],
             width=11,
         )
-        unit_combo.grid(row=0, column=1, sticky=W, padx=(6, 0))
-        ttk.Button(
+        self.review_variant_weight_unit_combo.grid(row=0, column=1, sticky=W, padx=(6, 0))
+        self.review_variant_weight_apply_all_btn = ttk.Button(
             frame,
             text="v",
             width=2,
             command=self._apply_variant_weight_to_all_variants,
-        ).grid(row=0, column=2, sticky=W, padx=(6, 0))
+        )
+        self.review_variant_weight_apply_all_btn.grid(row=0, column=2, sticky=W, padx=(6, 0))
 
     def _set_variant_form_visible(self, visible: bool) -> None:
         if not hasattr(self, "variant_form_wrap"):
@@ -2327,6 +2671,79 @@ class ProductProspectorDesktopApp:
             return
         if self.variant_form_wrap.winfo_manager():
             self.variant_form_wrap.pack_forget()
+
+    @staticmethod
+    def _configure_widget_state(widget: tk.Widget | None, state: str) -> None:
+        if widget is None:
+            return
+        try:
+            widget.configure(state=state)
+        except Exception:
+            pass
+
+    def _product_is_shopify_collective_locked(self, product) -> bool:
+        if self.session.mode != MODE_UPDATE:
+            return False
+        if bool(getattr(product, "shopify_collective_locked", False)):
+            return True
+        if not str(getattr(product, "product_gid", "") or "").strip():
+            return False
+        return has_shopify_collective_tag(getattr(product, "tags", []))
+
+    @staticmethod
+    def _shopify_collective_update_note() -> str:
+        return "Shopify Collective: price, cost, inventory, SKU, barcode, vendor, and brand are locked in Update mode."
+
+    def _set_review_collective_note(self, product) -> None:
+        if self._product_is_shopify_collective_locked(product):
+            self.review_collective_note_text.set(self._shopify_collective_update_note())
+            return
+        self.review_collective_note_text.set("")
+
+    def _set_review_field_state(self, field_name: str, state: str) -> None:
+        widget = self.review_field_widgets.get(field_name, (None, None))[1]
+        self._configure_widget_state(widget, state)
+
+    def _apply_shopify_collective_review_locks(
+        self,
+        product,
+        *,
+        has_variant_data: bool,
+        disable_variant_only: bool,
+    ) -> None:
+        collective_locked = self._product_is_shopify_collective_locked(product)
+        self._set_review_collective_note(product)
+
+        parent_field_states = {
+            "sku": "disabled" if disable_variant_only or collective_locked else "normal",
+            "barcode": "disabled" if disable_variant_only or collective_locked else "normal",
+            "price": "disabled" if disable_variant_only or collective_locked else "normal",
+            "map_price": "disabled" if disable_variant_only or collective_locked else "normal",
+            "msrp_price": "disabled" if disable_variant_only or collective_locked else "normal",
+            "jobber_price": "disabled" if disable_variant_only or collective_locked else "normal",
+            "dealer_cost": "disabled" if disable_variant_only or collective_locked else "normal",
+            "inventory": "disabled" if disable_variant_only or collective_locked else "normal",
+            "vendor": "disabled" if collective_locked else "normal",
+            "brand": "disabled" if collective_locked else "normal",
+        }
+        for field_name, state in parent_field_states.items():
+            self._set_review_field_state(field_name, state)
+
+        cost_entry_state = "disabled" if disable_variant_only or collective_locked else "normal"
+        self._configure_widget_state(getattr(self, "review_cost_entry", None), cost_entry_state)
+        if collective_locked:
+            self._configure_widget_state(getattr(self, "review_cost_rule_combo", None), "disabled")
+            self._configure_widget_state(getattr(self, "review_cost_apply_all_btn", None), "disabled")
+
+        if not has_variant_data:
+            return
+
+        variant_field_state = "disabled" if collective_locked else "normal"
+        for field_name in ("variant_sku", "variant_barcode", "variant_inventory", "variant_price"):
+            self._configure_widget_state(self.review_variant_field_widgets.get(field_name), variant_field_state)
+        self._configure_widget_state(getattr(self, "review_variant_cost_entry", None), variant_field_state)
+        if collective_locked:
+            self._configure_widget_state(getattr(self, "review_variant_cost_rule_combo", None), "disabled")
 
     @staticmethod
     def _collection_title_key(value: str) -> str:
@@ -3137,7 +3554,8 @@ class ProductProspectorDesktopApp:
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
         frame.columnconfigure(1, weight=1)
-        ttk.Entry(frame, textvariable=self.review_variant_fields["variant_cost"], width=16).grid(row=0, column=0, sticky=W, padx=(0, 6))
+        self.review_variant_cost_entry = ttk.Entry(frame, textvariable=self.review_variant_fields["variant_cost"], width=16)
+        self.review_variant_cost_entry.grid(row=0, column=0, sticky=W, padx=(0, 6))
         self.review_variant_cost_rule_combo = ttk.Combobox(
             frame,
             textvariable=self.review_variant_cost_rule_text,
@@ -3517,7 +3935,23 @@ class ProductProspectorDesktopApp:
             messagebox.showerror(APP_TITLE, "Invalid scraper settings. Use numeric values for workers/delay/retries.")
             return False
 
-        self.session.scrape_settings.vendor_search_url = self.scrape_search_url.get().strip()
+        direct_product_url_raw = self.scrape_product_url.get().strip()
+        direct_product_url = self._effective_scrape_product_url()
+        if direct_product_url_raw and not direct_product_url:
+            messagebox.showerror(APP_TITLE, "Direct Product URL must start with http://, https://, or www.")
+            return False
+        if direct_product_url:
+            workers = 1
+            self.scrape_workers.set("1")
+        scrape_cookies, cookie_error = self._parse_edit_this_cookie_json(
+            self.scrape_cookie_text.get("1.0", "end") if self.scrape_cookie_text is not None else ""
+        )
+        if cookie_error:
+            messagebox.showwarning(APP_TITLE, cookie_error)
+            return False
+        self.session.scrape_settings.product_url = direct_product_url
+        self.session.scrape_settings.vendor_search_url = "" if direct_product_url else self.scrape_search_url.get().strip()
+        self.session.scrape_settings.cookies = list(scrape_cookies or [])
         self.session.scrape_settings.chrome_workers = workers
         self.session.scrape_settings.delay_seconds = delay
         self.session.scrape_settings.retry_count = retries
@@ -3535,15 +3969,22 @@ class ProductProspectorDesktopApp:
         if not target_skus:
             messagebox.showwarning(APP_TITLE, "No valid SKUs found in the current scope.")
             return False
+        if direct_product_url and (self.session.mode not in {MODE_NEW, MODE_UPDATE} or len(target_skus) != 1):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Direct Product URL only works for single-item Create/Update runs with exactly one scoped item.",
+            )
+            return False
 
         if (
             self.session.missing_fields
             and not self.session.scrape_settings.vendor_search_url
+            and not self.session.scrape_settings.product_url
             and not allow_missing_without_scrape
         ):
             messagebox.showwarning(
                 APP_TITLE,
-                "Missing fields require scraping. Set Vendor Search URL in Processing or complete mappings in Setup.",
+                "Missing fields require scraping. Set Vendor Search URL or Direct Product URL in Processing, or complete mappings in Setup.",
             )
             return False
 
@@ -3552,7 +3993,7 @@ class ProductProspectorDesktopApp:
         self._auto_open_review_after_processing = bool(auto_open_review)
         self.review_tab_unlocked = False
         self._update_tab_access()
-        if self.session.scrape_settings.vendor_search_url:
+        if self.session.scrape_settings.vendor_search_url or self.session.scrape_settings.product_url:
             self._play_header_logo_animation()
         self._set_processing_busy(True)
         self.processing_status_text.set(f"Processing {len(target_skus)} SKU(s) in background...")
@@ -3663,24 +4104,44 @@ class ProductProspectorDesktopApp:
             scrape_records: dict[str, dict[str, str]] = {}
             scrape_sku_errors: dict[str, str] = {}
             scrape_general_errors: list[str] = []
-            can_scrape = bool(self.session.scrape_settings.vendor_search_url and target_skus)
+            can_scrape = bool((self.session.scrape_settings.vendor_search_url or self.session.scrape_settings.product_url) and target_skus)
             requested_scrape_fields = self._requested_scrape_fields()
             should_scrape = False
             if not skip_scrape:
                 should_scrape = can_scrape and bool(requested_scrape_fields)
             if should_scrape:
-                scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
-                    vendor_search_url=self.session.scrape_settings.vendor_search_url,
-                    skus=target_skus,
-                    workers=self.session.scrape_settings.chrome_workers,
-                    retry_count=self.session.scrape_settings.retry_count,
-                    delay_seconds=self.session.scrape_settings.delay_seconds,
-                    scrape_images=self.session.scrape_settings.scrape_images,
-                    image_output_root=self.runtime_output_root / "images",
-                    search_terms_by_sku=dict(self.session.search_terms_by_sku or {}),
-                    requested_fields=requested_scrape_fields,
-                    required_root=self.required_root,
-                )
+                if self.session.scrape_settings.product_url:
+                    if len(target_skus) != 1:
+                        raise RuntimeError("Direct Product URL requires exactly one scoped SKU.")
+                    direct_sku = normalize_sku(target_skus[0])
+                    direct_search_term = normalize_sku((self.session.search_terms_by_sku or {}).get(direct_sku, direct_sku)) or direct_sku
+                    direct_payload, direct_error = scrape_direct_product_record(
+                        product_url=self.session.scrape_settings.product_url,
+                        sku=direct_sku,
+                        search_term=direct_search_term,
+                        scrape_images=self.session.scrape_settings.scrape_images,
+                        image_output_root=self.runtime_output_root / "images",
+                        requested_fields=requested_scrape_fields,
+                        cookies=self.session.scrape_settings.cookies,
+                    )
+                    if direct_payload:
+                        scrape_records[direct_sku] = direct_payload
+                    if direct_error:
+                        scrape_sku_errors[direct_sku] = direct_error
+                else:
+                    scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
+                        vendor_search_url=self.session.scrape_settings.vendor_search_url,
+                        skus=target_skus,
+                        workers=self.session.scrape_settings.chrome_workers,
+                        retry_count=self.session.scrape_settings.retry_count,
+                        delay_seconds=self.session.scrape_settings.delay_seconds,
+                        scrape_images=self.session.scrape_settings.scrape_images,
+                        image_output_root=self.runtime_output_root / "images",
+                        search_terms_by_sku=dict(self.session.search_terms_by_sku or {}),
+                        requested_fields=requested_scrape_fields,
+                        required_root=self.required_root,
+                        cookies=self.session.scrape_settings.cookies,
+                    )
 
             products, build_stats = build_products_from_session(
                 session=self.session,
@@ -3693,7 +4154,7 @@ class ProductProspectorDesktopApp:
             if mapper is None:
                 mapper = TypeCategoryMapper.from_required_root(self.required_root)
 
-            update_scope = set(self.session.update_fields or [])
+            update_scope = self._effective_update_processing_fields()
             allow_category_overwrite = self.session.mode == MODE_NEW or bool(
                 {"type", "google_product_type", "category_code", "product_subtype"}.intersection(update_scope)
             )
@@ -3710,14 +4171,30 @@ class ProductProspectorDesktopApp:
                     update_fields=update_scope,
                     default_inventory=default_inventory,
                 )
-                if self.session.mode == MODE_NEW or allow_category_overwrite:
+                has_type_seed = bool(str(getattr(normalized, "type", "") or "").strip())
+                needs_category_backfill = has_type_seed and any(
+                    not str(getattr(normalized, field_name, "") or "").strip()
+                    for field_name in ("google_product_type", "category_code", "product_subtype")
+                )
+                if self.session.mode == MODE_NEW or allow_category_overwrite or needs_category_backfill:
                     normalized = mapper.apply(
                         product=normalized,
                         allow_category_overwrite=allow_category_overwrite,
                     )
                 # Recalculate default collections after final type/application mapping so review loads pre-populated.
                 existing_collections = str(getattr(normalized, "collections", "") or "").strip()
-                if self.session.mode == MODE_NEW and not existing_collections:
+                has_local_supported_collections = False
+                if self.session.mode == MODE_UPDATE:
+                    local_supported_collections = self._filter_collections_to_local_supported(existing_collections)
+                    if local_supported_collections:
+                        normalized.collections = local_supported_collections
+                        existing_collections = local_supported_collections
+                        has_local_supported_collections = True
+                should_auto_assign_collections = (
+                    (self.session.mode == MODE_NEW and not existing_collections)
+                    or (self.session.mode == MODE_UPDATE and not has_local_supported_collections)
+                )
+                if should_auto_assign_collections:
                     collection_targets, _collection_warnings = resolve_collection_assignments(
                         product_type=str(getattr(normalized, "type", "") or ""),
                         application_text=str(getattr(normalized, "application", "") or ""),
@@ -3728,6 +4205,8 @@ class ProductProspectorDesktopApp:
                     auto_collections = self._collection_titles_text_from_targets(collection_targets)
                     if auto_collections:
                         normalized.collections = auto_collections
+                        normalized.field_sources["collections"] = "collection_rules"
+                        normalized.field_sources.pop("collections_warning", None)
                 normalized.finalize_defaults()
                 if self.session.mode == MODE_NEW:
                     base_tags: list[str] = []
@@ -4193,6 +4672,7 @@ class ProductProspectorDesktopApp:
             self.review_loaded_display = {}
             self.review_loaded_truncated = {}
             self.review_cost_options_loaded_for_sku = ""
+            self.review_collective_note_text.set("")
             self.review_status_text.set("No products available yet. Run Processing first.")
             return
         self.review_index = max(0, min(self.review_index, total - 1))
@@ -4295,6 +4775,11 @@ class ProductProspectorDesktopApp:
             self.review_variant_cost_rule_combo.configure(values=())
             self.review_variant_cost_rule_combo.configure(state="disabled")
             self.review_variant_cost_options_loaded_for_sku = ""
+        self._apply_shopify_collective_review_locks(
+            product,
+            has_variant_data=has_variant_data,
+            disable_variant_only=_disable_variant_only,
+        )
         is_update_parent = (
             self.session.mode == MODE_UPDATE
             and record_type.lower() == "product"
@@ -4315,32 +4800,36 @@ class ProductProspectorDesktopApp:
         product = self.session.products[self.review_index]
         _record_type_lower = str(getattr(product, "record_type", "") or "").strip().lower()
         _is_parent_with_variants = bool(getattr(product, "parent_has_variants", False)) or _record_type_lower == "variant"
+        _collective_locked = self._product_is_shopify_collective_locked(product)
         product.title = self._read_review_field("title")
         product.description_html = self._read_review_field("description_html")
         media_text = self._read_review_field("media_urls")
         product.media_urls = [part.strip() for part in re.split(r"[|,\n]+", media_text) if part.strip()]
         if not _is_parent_with_variants:
-            product.price = self._read_review_field("price")
-            product.map_price = self._read_review_field("map_price")
-            product.msrp_price = self._read_review_field("msrp_price")
-            product.jobber_price = self._read_review_field("jobber_price")
-            product.cost = self._read_review_field("cost")
-            product.dealer_cost = self._read_review_field("dealer_cost")
-            default_inventory = int(self.session.inventory_default or 3000000)
-            try:
-                product.inventory = int(float(self._read_review_field("inventory") or str(default_inventory)))
-            except Exception:
-                product.inventory = default_inventory
-            product.sku = self._read_review_field("sku").upper()
-            product.barcode = self._read_review_field("barcode")
+            if not _collective_locked:
+                product.price = self._read_review_field("price")
+                product.map_price = self._read_review_field("map_price")
+                product.msrp_price = self._read_review_field("msrp_price")
+                product.jobber_price = self._read_review_field("jobber_price")
+                product.cost = self._read_review_field("cost")
+                product.dealer_cost = self._read_review_field("dealer_cost")
+                default_inventory = int(self.session.inventory_default or 3000000)
+                try:
+                    product.inventory = int(float(self._read_review_field("inventory") or str(default_inventory)))
+                except Exception:
+                    product.inventory = default_inventory
+                product.sku = self._read_review_field("sku").upper()
+                product.barcode = self._read_review_field("barcode")
             product.weight = self._read_review_field("weight")
             product.mpn = self._read_review_field("mpn")
-        product.vendor = self._read_review_field("vendor")
+        if not _collective_locked:
+            product.vendor = self._read_review_field("vendor")
         product.type = self._read_review_field("type")
         product.google_product_type = self._read_review_field("google_product_type")
         product.category_code = self._read_review_field("category_code")
         product.product_subtype = self._read_review_field("product_subtype")
-        product.brand = self._read_review_field("brand")
+        if not _collective_locked:
+            product.brand = self._read_review_field("brand")
         product.application = self._read_review_field("application")
         product.collections = self._read_review_field("collections")
         product.tags = [
@@ -4351,19 +4840,22 @@ class ProductProspectorDesktopApp:
         product.core_charge_product_code = self._read_review_field("core_charge_product_code")
         _has_variant_form = str(getattr(product, "record_type", "") or "").strip().lower() == "variant"
         if _has_variant_form:
-            product.sku = self.review_variant_fields["variant_sku"].get().strip().upper()
-            product.barcode = self.review_variant_fields["variant_barcode"].get().strip()
+            if not _collective_locked:
+                product.sku = self.review_variant_fields["variant_sku"].get().strip().upper()
+                product.barcode = self.review_variant_fields["variant_barcode"].get().strip()
             product.weight = self.review_variant_fields["variant_weight"].get().strip()
             product.variant_weight_unit = self.review_variant_fields["variant_weight_unit"].get().strip().upper() or "POUNDS"
-            product.price = self.review_variant_fields["variant_price"].get().strip()
-            product.cost = self.review_variant_fields["variant_cost"].get().strip()
+            if not _collective_locked:
+                product.price = self.review_variant_fields["variant_price"].get().strip()
+                product.cost = self.review_variant_fields["variant_cost"].get().strip()
             product.variant_google_mpn = self.review_variant_fields["variant_google_mpn"].get().strip()
             product.variant_enable_low_stock_message = self.review_variant_fields["variant_enable_low_stock_message"].get().strip()
             product.variant_option_summary = self.review_variant_fields["variant_option_summary"].get().strip()
-            try:
-                product.inventory = int(float(self.review_variant_fields["variant_inventory"].get().strip() or str(product.inventory)))
-            except Exception:
-                pass
+            if not _collective_locked:
+                try:
+                    product.inventory = int(float(self.review_variant_fields["variant_inventory"].get().strip() or str(product.inventory)))
+                except Exception:
+                    pass
         product.finalize_defaults()
         self.review_status_text.set(f"Saved row {self.review_index + 1}.")
 
@@ -5653,6 +6145,60 @@ class ProductProspectorDesktopApp:
             host = host[4:]
         return host
 
+    def _single_direct_scrape_scope_input_count(self) -> int:
+        if self.session.mode not in {MODE_NEW, MODE_UPDATE}:
+            return 0
+        if self.session.mode == MODE_UPDATE and self.session.setup_complete and self.session.target_skus:
+            return len([sku for sku in self.session.target_skus if normalize_sku(sku)])
+        if self.session.mode == MODE_NEW and self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty:
+            return 0
+
+        scope_count = (
+            len(self._parse_sku_text(self.sku_text_widget.get("1.0", END)))
+            + len(self._pasted_scope_mpns())
+        )
+        if self.session.mode == MODE_UPDATE:
+            scope_count += len(self._parse_product_id_text(self.product_id_text_widget.get("1.0", END)))
+        return scope_count
+
+    def _should_show_scrape_product_url_input(self) -> bool:
+        return self._single_direct_scrape_scope_input_count() == 1
+
+    def _effective_scrape_product_url(self) -> str:
+        if not self._should_show_scrape_product_url_input():
+            return ""
+        return _normalize_url_for_open(self.scrape_product_url.get().strip())
+
+    def _on_scrape_product_url_changed(self, *_args) -> None:
+        self._refresh_scrape_source_inputs()
+
+    def _refresh_scrape_source_inputs(self) -> None:
+        show_product_url = self._should_show_scrape_product_url_input()
+        for widget in [self.scrape_product_url_label, self.scrape_product_url_entry, self.scrape_product_url_note]:
+            if widget is None:
+                continue
+            try:
+                if show_product_url:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            except Exception:
+                continue
+
+        direct_product_url_active = bool(show_product_url and self.scrape_product_url.get().strip())
+        if self.scrape_search_url_entry is not None:
+            try:
+                self.scrape_search_url_entry.configure(state="disabled" if direct_product_url_active else "normal")
+            except Exception:
+                pass
+        if self.scrape_workers_combo is not None:
+            try:
+                if direct_product_url_active:
+                    self.scrape_workers.set("1")
+                self.scrape_workers_combo.configure(state="disabled" if direct_product_url_active else "readonly")
+            except Exception:
+                pass
+
     def _known_scrape_search_url_for_vendor(self, vendor_name: str) -> str:
         vendor_value = str(vendor_name or "").strip()
         if not vendor_value:
@@ -5709,6 +6255,7 @@ class ProductProspectorDesktopApp:
         self.scrape_search_url.set(known_url)
         self._scrape_search_url_auto_value = known_url
         self._scrape_search_url_auto_vendor_key = vendor_key if known_url else ""
+        self._refresh_scrape_source_inputs()
         self._scrape_search_url_inferred_vendor = vendor
 
     def _try_infer_search_url_from_skus(self, skus: list[str]) -> None:
@@ -6420,6 +6967,28 @@ class ProductProspectorDesktopApp:
                 requested.add(mapped)
         return requested
 
+    def _effective_update_processing_fields(self) -> set[str]:
+        if self.session.mode != MODE_UPDATE:
+            return set()
+        selected = {str(field or "").strip() for field in (self.session.update_fields or []) if str(field or "").strip()}
+        if selected:
+            return selected
+        return {
+            "title",
+            "price",
+            "cost",
+            "description_html",
+            "media_urls",
+            "vendor",
+            "weight",
+            "barcode",
+            "application",
+            "type",
+            "google_product_type",
+            "category_code",
+            "product_subtype",
+        }
+
     def _effective_update_review_fields(self) -> set[str] | None:
         if self.session.mode != MODE_UPDATE:
             return None
@@ -6567,6 +7136,7 @@ class ProductProspectorDesktopApp:
         bypass_sheet_for_skip = bool(skip_to_review and self.session.mode == MODE_UPDATE)
         self._enforce_unique_vendor_mappings()
         lookup_vendor_name = self.update_lookup_vendor.get().strip()
+        self.session.lookup_vendor = lookup_vendor_name
         if self.session.mode == MODE_NEW and has_sheet:
             self._apply_create_vendor_mapping_override(force=True)
         resolved_update_skus: list[str] = []
@@ -6793,6 +7363,7 @@ class ProductProspectorDesktopApp:
 
         self.session.missing_fields = detect_missing_required_fields(self.session, required_root=self.required_root)
         self._sync_scrape_search_url_from_vendor()
+        self._refresh_scrape_source_inputs()
         self.session.setup_complete = True
         if not preserve_review_state:
             self.session.processing_complete = False
@@ -6844,12 +7415,30 @@ class ProductProspectorDesktopApp:
         self.notebook.select(1)
         self._start_processing_clicked(auto_open_review=True)
 
+    @staticmethod
+    def _parse_edit_this_cookie_json(cookie_raw: str) -> tuple[list[dict[str, object]] | None, str | None]:
+        text = str(cookie_raw or "").strip()
+        if not text:
+            return [], None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None, "Could not parse cookie JSON. Paste the full output from EditThisCookie."
+        if not isinstance(payload, list):
+            return None, "Cookie JSON must be a list (array). Paste the full output from EditThisCookie."
+        return [item for item in payload if isinstance(item, dict)], None
+
     def _run_image_capture(self) -> None:
         if self.image_capture_inflight:
             return
         url = self.image_capture_url.get().strip()
         if not url:
             messagebox.showwarning(APP_TITLE, "Enter a product page URL before running.")
+            return
+
+        cookies, cookie_error = self._parse_edit_this_cookie_json(self.image_capture_cookie_text.get("1.0", "end"))
+        if cookie_error:
+            messagebox.showwarning(APP_TITLE, cookie_error)
             return
 
         self.image_capture_inflight = True
@@ -6864,6 +7453,7 @@ class ProductProspectorDesktopApp:
                 local_files, media_folder, error = scrape_product_page_images(
                     product_url=url,
                     image_output_root=output_root,
+                    cookies=cookies,
                 )
 
                 def _done() -> None:
@@ -7012,6 +7602,7 @@ class ProductProspectorDesktopApp:
 
         weight_updates: list[VariantWeightUpdate] = []
         app_updates: list[ProductApplicationUpdate] = []
+        collection_updates: list[ProductCollectionUpdate] = []
         skipped_unchanged = 0
         skipped_invalid = 0
 
@@ -7021,31 +7612,45 @@ class ProductProspectorDesktopApp:
             product_id = str(getattr(row, "product_id", "") or "").strip()
 
             if record_type == "product":
-                # Parent row — push application metafield
+                # Parent row - push product-level updates.
                 if not product_gid and not product_id:
                     skipped_invalid += 1
                     continue
+                queued_any = False
                 application = str(getattr(row, "application", "") or "").strip()
-                if not application:
-                    skipped_invalid += 1
-                    continue
                 original_application = str(getattr(row, "original_application", "") or "").strip()
                 want_fitment = bool(self.push_fitment_vehicles.get())
-                if not want_fitment and original_application and original_application == application:
-                    skipped_unchanged += 1
-                    continue
-                app_updates.append(
-                    ProductApplicationUpdate(
-                        product_id=product_id,
-                        product_gid=product_gid,
-                        application=application,
-                        original_application=original_application,
-                        push_fitment_vehicles=want_fitment,
+                if application and (want_fitment or not original_application or original_application != application):
+                    app_updates.append(
+                        ProductApplicationUpdate(
+                            product_id=product_id,
+                            product_gid=product_gid,
+                            application=application,
+                            original_application=original_application,
+                            push_fitment_vehicles=want_fitment,
+                        )
                     )
-                )
+                    queued_any = True
+
+                collections_text = str(getattr(row, "collections", "") or "").strip()
+                if collections_text:
+                    collection_updates.append(
+                        ProductCollectionUpdate(
+                            product_id=product_id,
+                            product_gid=product_gid,
+                            collections_text=collections_text,
+                        )
+                    )
+                    queued_any = True
+
+                if not queued_any:
+                    if application:
+                        skipped_unchanged += 1
+                    else:
+                        skipped_invalid += 1
                 continue
 
-            # Variant row — push weight
+            # Variant row - push weight.
             variant_gid = str(getattr(row, "variant_gid", "") or "").strip()
             if not variant_gid or not product_gid:
                 skipped_invalid += 1
@@ -7069,7 +7674,7 @@ class ProductProspectorDesktopApp:
                 )
             )
 
-        if not weight_updates and not app_updates:
+        if not weight_updates and not app_updates and not collection_updates:
             details = []
             if skipped_unchanged:
                 details.append(f"unchanged: {skipped_unchanged}")
@@ -7084,6 +7689,8 @@ class ProductProspectorDesktopApp:
             confirm_lines.append(f"Variant weight updates: {len(weight_updates)}")
         if app_updates:
             confirm_lines.append(f"Application metafield updates: {len(app_updates)}")
+        if collection_updates:
+            confirm_lines.append(f"Collection updates: {len(collection_updates)}")
         if skipped_unchanged:
             confirm_lines.append(f"Skipped unchanged: {skipped_unchanged}")
         if skipped_invalid:
@@ -7108,7 +7715,7 @@ class ProductProspectorDesktopApp:
             return
 
         self._set_shopify_push_busy(True)
-        total_ops = len(weight_updates) + len(app_updates)
+        total_ops = len(weight_updates) + len(app_updates) + len(collection_updates)
         self.review_busy_text.set(f"Pushing updates... 0/{total_ops}")
         self._show_review_busy_overlay(f"Pushing updates... 0/{total_ops}")
         self.review_status_text.set(f"Pushing {total_ops} update(s) to Shopify...")
@@ -7121,6 +7728,7 @@ class ProductProspectorDesktopApp:
                 "access_token": token.access_token,
                 "updates": weight_updates,
                 "app_updates": app_updates,
+                "collection_updates": collection_updates,
                 "required_root": self.required_root,
                 "operator_tag": operator_tag,
             },
@@ -7134,11 +7742,13 @@ class ProductProspectorDesktopApp:
         access_token: str,
         updates: list[VariantWeightUpdate],
         app_updates: list[ProductApplicationUpdate] | None = None,
+        collection_updates: list[ProductCollectionUpdate] | None = None,
         required_root=None,
         operator_tag: str = "",
     ) -> None:
         summary = None
         app_summary: ProductApplicationUpdateSummary | None = None
+        collection_summary: ProductCollectionUpdateSummary | None = None
         tag_summary = None
         error_text: str | None = None
         tag_error_text: str | None = None
@@ -7158,6 +7768,22 @@ class ProductProspectorDesktopApp:
                     updates=app_updates,
                     required_root=required_root,
                     progress_callback=on_app_progress,
+                )
+
+            if collection_updates:
+                def on_collection_progress(done: int, total: int, product_gid: str) -> None:
+                    short_id = str(product_gid or "").strip().rsplit("/", 1)[-1]
+                    label = f"Updating collections... {done}/{total}"
+                    if short_id:
+                        label += f" | {short_id}"
+                    self._run_on_ui_thread(self.review_busy_text.set, label)
+
+                collection_summary = push_product_collections_bulk(
+                    config=config,
+                    access_token=access_token,
+                    updates=collection_updates,
+                    required_root=required_root,
+                    progress_callback=on_collection_progress,
                 )
 
             if updates:
@@ -7180,6 +7806,11 @@ class ProductProspectorDesktopApp:
                 tag_product_gids: set[str] = set()
                 if app_summary is not None:
                     for gid in app_summary.updated_product_ids:
+                        clean = str(gid or "").strip()
+                        if clean:
+                            tag_product_gids.add(clean)
+                if collection_summary is not None:
+                    for gid in collection_summary.updated_product_ids:
                         clean = str(gid or "").strip()
                         if clean:
                             tag_product_gids.add(clean)
@@ -7207,7 +7838,7 @@ class ProductProspectorDesktopApp:
                         progress_callback=on_tag_progress,
                     )
         except Exception as exc:
-            if summary is None and app_summary is None:
+            if summary is None and app_summary is None and collection_summary is None:
                 error_text = str(exc)
             else:
                 tag_error_text = str(exc)
@@ -7239,6 +7870,25 @@ class ProductProspectorDesktopApp:
                     for gid, reason in list(app_summary.failed_by_product_id.items())[:5]:
                         short_id = str(gid or "").strip().rsplit("/", 1)[-1]
                         details.append(f"  - {short_id}: {reason}")
+                if app_summary.warnings:
+                    details.append("Application warnings:")
+                    for warning in app_summary.warnings[:5]:
+                        details.append(f"  - {warning}")
+
+            # Collection updates
+            if collection_summary is not None:
+                collection_updated_ids = {str(item or "").strip() for item in collection_summary.updated_product_ids if str(item or "").strip()}
+                collection_failed_count = len(collection_summary.failed_by_product_id)
+                details.append(f"Collections updated: {len(collection_updated_ids)}, failed: {collection_failed_count}")
+                if collection_summary.failed_by_product_id:
+                    details.append("Collection failures:")
+                    for gid, reason in list(collection_summary.failed_by_product_id.items())[:5]:
+                        short_id = str(gid or "").strip().rsplit("/", 1)[-1]
+                        details.append(f"  - {short_id}: {reason}")
+                if collection_summary.warnings:
+                    details.append("Collection warnings:")
+                    for warning in collection_summary.warnings[:5]:
+                        details.append(f"  - {warning}")
 
             # Weight updates
             if summary is not None:
@@ -7316,6 +7966,7 @@ class ProductProspectorDesktopApp:
 
             # Pass Shopify tags through as-is; display layer handles raw tags for Shopify-sourced products.
             parent_tags = [t.strip() for t in str(getattr(lead, "product_tags", "") or "").split(",") if t.strip()]
+            collective_locked = has_shopify_collective_tag(parent_tags)
 
             # If no locally-supported collections from Shopify, auto-generate from type + application.
             parent_type = str(lead.product_type or "").strip()
@@ -7348,6 +7999,7 @@ class ProductProspectorDesktopApp:
                 product_gid=str(lead.product_gid or "").strip(),
                 product_id=str(lead.product_id or "").strip(),
                 original_application=parent_application,
+                shopify_collective_locked=collective_locked,
             )
             parent_row.finalize_defaults()
             rows.append(parent_row)
@@ -7384,6 +8036,7 @@ class ProductProspectorDesktopApp:
                     product_subtype=str(getattr(snapshot, "product_subtype", "") or "").strip(),
                     application=str(snapshot.product_application or "").strip(),
                     collections=filtered_variant_collections,
+                    tags=parent_tags,
                     mpn=str(snapshot.variant_google_mpn or "").strip(),
                     product_gid=str(snapshot.product_gid or "").strip(),
                     product_id=str(snapshot.product_id or "").strip(),
@@ -7397,6 +8050,7 @@ class ProductProspectorDesktopApp:
                     variant_weight_unit=str(snapshot.variant_weight_unit or "POUNDS").strip().upper() or "POUNDS",
                     original_variant_weight_value=str(snapshot.variant_weight_value or "").strip(),
                     original_variant_weight_unit=str(snapshot.variant_weight_unit or "POUNDS").strip().upper() or "POUNDS",
+                    shopify_collective_locked=collective_locked,
                 )
                 variant_row.finalize_defaults()
                 rows.append(variant_row)
@@ -7907,6 +8561,7 @@ class ProductProspectorDesktopApp:
             f"Vendor SKUs: {vendor_skus} | Scoped SKUs: {scoped_skus} | Scoped MPNs: {scoped_mpns} | Scoped Product IDs: {scoped_product_ids} | Shopify Catalog SKUs: {shopify_rows}"
         )
         self._refresh_shopify_cache_inline_text()
+        self._refresh_scrape_source_inputs()
 
     def _vendor_mapping_var_pairs(self) -> list[tuple[str, StringVar]]:
         return [
@@ -8435,6 +9090,13 @@ class ProductProspectorDesktopApp:
     def _on_close(self) -> None:
         self._shutdown_requested = True
         self._cancel_header_logo_animation()
+        self._stop_update_button_flash()
+        if self._update_state_poll_job is not None:
+            try:
+                self.root.after_cancel(self._update_state_poll_job)
+            except Exception:
+                pass
+            self._update_state_poll_job = None
         if self._ui_task_pump_job is not None:
             try:
                 self.root.after_cancel(self._ui_task_pump_job)

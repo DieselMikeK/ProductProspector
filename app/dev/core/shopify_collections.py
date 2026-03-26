@@ -44,6 +44,35 @@ def _normalize_type_key(value: object) -> str:
     return text
 
 
+def _singularize_type_token(token: str) -> str:
+    text = _clean_text(token).lower()
+    if len(text) <= 3:
+        return text
+    if text.endswith("ies"):
+        return f"{text[:-3]}y"
+    if text.endswith("sses") or text.endswith("us"):
+        return text
+    if text.endswith("s"):
+        return text[:-1]
+    return text
+
+
+def _reduced_type_key(value: object) -> tuple[str, ...]:
+    key = _normalize_type_key(value)
+    if not key:
+        return tuple()
+    ignored_tokens = {"and", "accessory", "accessories", "component", "components", "kit", "kits"}
+    reduced: list[str] = []
+    seen: set[str] = set()
+    for raw_token in key.split():
+        token = _singularize_type_token(raw_token)
+        if not token or token in ignored_tokens or token in seen:
+            continue
+        seen.add(token)
+        reduced.append(token)
+    return tuple(reduced)
+
+
 def _normalize_token_list(value: object) -> list[str]:
     text = _clean_text(value)
     if not text:
@@ -477,6 +506,41 @@ def load_collection_records(required_root: Path | None) -> list[dict]:
     return [dict(item) for item in records]
 
 
+def _compatible_type_key_priorities(type_key: str, records: list[dict]) -> dict[str, int]:
+    cleaned_type_key = _clean_text(type_key)
+    if not cleaned_type_key:
+        return {}
+
+    priorities: dict[str, int] = {cleaned_type_key: 0}
+
+    reduced_target = _reduced_type_key(cleaned_type_key)
+    if not reduced_target:
+        return priorities
+
+    for record in records:
+        record_type_key = _clean_text(record.get("type_key", ""))
+        if not record_type_key or record_type_key == cleaned_type_key:
+            continue
+        record_reduced = _reduced_type_key(record_type_key)
+        if not record_reduced:
+            continue
+        priority: int | None = None
+        if record_reduced == reduced_target:
+            priority = 1
+        elif len(record_reduced) > len(reduced_target) and tuple(record_reduced[: len(reduced_target)]) == reduced_target:
+            priority = 2 + max(0, len(record_reduced) - len(reduced_target))
+        elif record_reduced[0] == reduced_target[0]:
+            priority = 10 + max(0, len(record_reduced) - 1)
+        elif all(token in record_reduced for token in reduced_target):
+            priority = 20 + max(0, len(record_reduced) - len(reduced_target))
+        if priority is None:
+            continue
+        existing_priority = priorities.get(record_type_key)
+        if existing_priority is None or priority < existing_priority:
+            priorities[record_type_key] = priority
+    return priorities
+
+
 def _year_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
     return not (a_end < b_start or b_end < a_start)
 
@@ -538,7 +602,8 @@ def resolve_collection_assignments(
     type_key = _normalize_type_key(product_type)
     if not type_key:
         return [], ["Product type is blank; could not resolve collections."]
-    type_records = [record for record in records if _clean_text(record.get("type_key", "")) == type_key]
+    candidate_type_priorities = _compatible_type_key_priorities(type_key=type_key, records=records)
+    type_records = [record for record in records if _clean_text(record.get("type_key", "")) in candidate_type_priorities]
     if not type_records:
         return [], [f"No collection mappings found for type '{_clean_text(product_type)}'."]
 
@@ -569,6 +634,7 @@ def resolve_collection_assignments(
     targets: list[dict] = []
     seen_ids: set[str] = set()
     seen_titles: set[str] = set()
+    best_priority: int | None = None
     for record in type_records:
         matched = any(
             _record_matches_segment(
@@ -580,6 +646,15 @@ def resolve_collection_assignments(
             for segment in segments
         )
         if not matched:
+            continue
+        record_type_key = _clean_text(record.get("type_key", ""))
+        priority = candidate_type_priorities.get(record_type_key, 999)
+        if best_priority is None or priority < best_priority:
+            best_priority = priority
+            targets = []
+            seen_ids.clear()
+            seen_titles.clear()
+        elif priority > best_priority:
             continue
         collection_id = _clean_text(record.get("collection_id", ""))
         title = _clean_text(record.get("collection_title", ""))

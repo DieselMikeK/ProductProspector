@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from product_prospector.core.config_store import ShopifyConfig
 from product_prospector.core.processing import normalize_sku
+from product_prospector.core.shopify_collections import resolve_collection_assignments_from_titles
 from product_prospector.core.shopify_fitment_vehicle_metaobjects import resolve_fitment_vehicle_metaobject_gids
 
 
@@ -165,6 +166,37 @@ def _request_rest_json(
             return None, "; ".join(f"{k}: {v}" for k, v in errors.items())
         return None, str(errors)
     return parsed, None
+
+
+def _add_product_to_collection(
+    config: ShopifyConfig,
+    access_token: str,
+    product_id: object,
+    collection_id: object,
+) -> str | None:
+    product_numeric_id = _extract_numeric_id(product_id)
+    collection_numeric_id = _extract_numeric_id(collection_id)
+    if not product_numeric_id or not collection_numeric_id:
+        return "Missing product or collection ID."
+
+    payload = {
+        "collect": {
+            "product_id": int(product_numeric_id),
+            "collection_id": int(collection_numeric_id),
+        }
+    }
+    _, error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="POST",
+        path="/collects.json",
+        payload=payload,
+    )
+    if not error:
+        return None
+    if "already exists" in error.lower():
+        return None
+    return error
 
 
 def _normalize_weight_unit(value: object) -> str:
@@ -833,6 +865,21 @@ class ProductApplicationUpdateSummary:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ProductCollectionUpdate:
+    product_id: str  # numeric Shopify product ID
+    product_gid: str
+    collections_text: str
+
+
+@dataclass
+class ProductCollectionUpdateSummary:
+    requested: int = 0
+    updated_product_ids: list[str] = field(default_factory=list)
+    failed_by_product_id: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
 def _push_metafield(
     config: ShopifyConfig,
     access_token: str,
@@ -930,6 +977,76 @@ def push_product_application_bulk(
         if progress_callback is not None:
             try:
                 progress_callback(index, total, item.product_gid)
+            except Exception:
+                pass
+
+    return summary
+
+
+def push_product_collections_bulk(
+    config: ShopifyConfig,
+    access_token: str,
+    updates: list[ProductCollectionUpdate],
+    required_root=None,
+    progress_callback=None,
+) -> ProductCollectionUpdateSummary:
+    summary = ProductCollectionUpdateSummary(requested=len(updates))
+    if not updates:
+        return summary
+
+    total = len(updates)
+    for index, item in enumerate(updates, start=1):
+        product_numeric_id = _extract_numeric_id(item.product_id or item.product_gid)
+        product_gid = _clean_text(item.product_gid) or _to_gid("Product", product_numeric_id)
+        product_key = product_gid or _clean_text(item.product_id) or "<missing_product_id>"
+        collections_text = _clean_text(item.collections_text)
+
+        if not product_numeric_id:
+            summary.failed_by_product_id[product_key] = "Missing product ID."
+        elif not collections_text:
+            summary.failed_by_product_id[product_key] = "Empty collections value."
+        else:
+            targets, warnings = resolve_collection_assignments_from_titles(
+                collections_text=collections_text,
+                required_root=required_root,
+            )
+            for warning in warnings:
+                summary.warnings.append(f"{product_key}: {warning}")
+
+            if not targets:
+                summary.failed_by_product_id[product_key] = "; ".join(warnings) or "No valid collections resolved."
+            else:
+                assignment_errors: list[str] = []
+                updated_any = False
+                for target in targets:
+                    collection_id = _extract_numeric_id((target or {}).get("collection_id", ""))
+                    collection_title = _clean_text((target or {}).get("collection_title", "")) or collection_id
+                    if not collection_id:
+                        assignment_errors.append(f"{collection_title}: missing collection ID")
+                        continue
+                    assign_error = _add_product_to_collection(
+                        config=config,
+                        access_token=access_token,
+                        product_id=product_numeric_id,
+                        collection_id=collection_id,
+                    )
+                    if assign_error:
+                        assignment_errors.append(f"{collection_title}: {assign_error}")
+                        continue
+                    updated_any = True
+
+                if updated_any:
+                    summary.updated_product_ids.append(product_key)
+                if assignment_errors:
+                    message = "; ".join(assignment_errors)
+                    if updated_any:
+                        summary.warnings.append(f"{product_key}: {message}")
+                    else:
+                        summary.failed_by_product_id[product_key] = message
+
+        if progress_callback is not None:
+            try:
+                progress_callback(index, total, product_gid or product_key)
             except Exception:
                 pass
 

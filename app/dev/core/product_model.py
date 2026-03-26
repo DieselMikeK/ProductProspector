@@ -34,11 +34,25 @@ PRODUCT_EXPORT_COLUMNS = [
     "metafields",
 ]
 
+SHOPIFY_COLLECTIVE_TAG = "Shopify Collective"
+
 
 def _clean_text(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def has_shopify_collective_tag(tags: object) -> bool:
+    values: list[str] = []
+    if isinstance(tags, (list, tuple, set)):
+        values = [_clean_text(item) for item in tags]
+    else:
+        text = _clean_text(tags)
+        if text:
+            values = [item.strip() for item in re.split(r"[|,;\n]+", text) if item and item.strip()]
+    collective_key = SHOPIFY_COLLECTIVE_TAG.strip().lower()
+    return any(_clean_text(item).lower() == collective_key for item in values if _clean_text(item))
 
 
 def _flatten_list_like_text(value: object) -> str:
@@ -116,6 +130,8 @@ class Product:
     mpn: str = ""
     brand: str = ""
     application: str = ""
+    application_context_title: str = ""
+    application_context_description: str = ""
     collections: str = ""
     tags: list[str] = field(default_factory=list)
     metafields: dict[str, str] = field(default_factory=dict)
@@ -134,6 +150,7 @@ class Product:
     remove_reason: str = ""
     excluded: bool = False
     exclusion_reason: str = ""
+    shopify_collective_locked: bool = False
 
     def set_field(self, name: str, value: object, source: str) -> None:
         text = _clean_text(value)

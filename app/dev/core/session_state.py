@@ -33,6 +33,8 @@ class SourceMapping:
 @dataclass
 class ScrapeSettings:
     vendor_search_url: str = ""
+    product_url: str = ""
+    cookies: list[dict[str, object]] = field(default_factory=list)
     chrome_workers: int = 3
     headless: bool = True
     delay_seconds: float = 0.35
@@ -44,6 +46,7 @@ class ScrapeSettings:
 @dataclass
 class AppSession:
     mode: str = ""
+    lookup_vendor: str = ""
     vendor_df: pd.DataFrame | None = None
     source_mapping: SourceMapping = field(default_factory=SourceMapping)
     pasted_skus: list[str] = field(default_factory=list)
@@ -59,6 +62,7 @@ class AppSession:
     processing_complete: bool = False
 
     def reset_for_new_run(self) -> None:
+        self.lookup_vendor = ""
         self.vendor_df = None
         self.source_mapping = SourceMapping()
         self.pasted_skus = []
