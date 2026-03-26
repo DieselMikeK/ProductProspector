@@ -32,6 +32,8 @@ except Exception:  # pragma: no cover - Windows-only best effort
 DOWNLOAD_CHUNK_SIZE = 1024 * 256
 PROCESS_WAIT_TIMEOUT_SECONDS = 45
 FILE_UNLOCK_TIMEOUT_SECONDS = 45
+LAUNCH_VERIFY_TIMEOUT_SECONDS = 10
+LAUNCH_VERIFY_POLL_INTERVAL_SECONDS = 0.25
 
 
 def parse_args(argv: list[str] | None = None):
@@ -75,6 +77,7 @@ class UpdaterWindow:
         self.target_dir = self.install_root
         self.staging_dir = tempfile.mkdtemp(prefix="ProductProspectorUpdate-")
         self.release_files = self._load_release_files()
+        self.applied_files: list[tuple[dict[str, str | bool], bool]] = []
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} Updater")
@@ -359,27 +362,61 @@ class UpdaterWindow:
             for entry, had_existing_file in reversed(applied_files):
                 self._restore_file(entry, had_existing_file)
             raise
-        finally:
-            for entry, _had_existing_file in applied_files:
-                backup_path = str(entry["backup_path"])
-                if os.path.exists(backup_path):
-                    try:
-                        os.remove(backup_path)
-                    except OSError:
-                        pass
 
+        self.applied_files = applied_files
         self._cleanup_partial_files()
         self.set_progress(100)
+
+    def _cleanup_backups(self) -> None:
+        for entry, _had_existing_file in self.applied_files:
+            backup_path = str(entry["backup_path"])
+            if os.path.exists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+        self.applied_files = []
+
+    def _rollback_update(self) -> None:
+        for entry, had_existing_file in reversed(self.applied_files):
+            self._restore_file(entry, had_existing_file)
+        self.applied_files = []
 
     def _finish_success(self) -> None:
         self.set_status("Update installed. Reopening app...")
         time.sleep(1.0)
         try:
-            subprocess.Popen([self.target_exe], cwd=self.target_dir)
+            launched_process = subprocess.Popen([self.target_exe], cwd=self.target_dir)
         except Exception:
             self.set_status("Update installed. Please reopen Product Prospector manually.")
+            self._cleanup_backups()
             self.allow_close()
             return
+
+        launch_deadline = time.time() + LAUNCH_VERIFY_TIMEOUT_SECONDS
+        while time.time() < launch_deadline:
+            exit_code = launched_process.poll()
+            if exit_code is None:
+                time.sleep(LAUNCH_VERIFY_POLL_INTERVAL_SECONDS)
+                continue
+            if exit_code != 0:
+                self.set_status("Updated app failed to start. Restoring previous version...")
+                self._rollback_update()
+                time.sleep(1.0)
+                try:
+                    subprocess.Popen([self.target_exe], cwd=self.target_dir)
+                except Exception:
+                    self.set_status(
+                        "Updated app failed to start. Previous version was restored. "
+                        "Please reopen Product Prospector manually."
+                    )
+                else:
+                    self.set_status("Updated app failed to start. Previous version restored.")
+                self.allow_close()
+                return
+            break
+
+        self._cleanup_backups()
         self.can_close = True
         self.root.after(0, self.root.destroy)
 

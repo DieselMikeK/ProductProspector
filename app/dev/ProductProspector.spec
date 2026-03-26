@@ -2,6 +2,8 @@
 
 import os
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 updater_asset = os.path.join('dist', 'ProductProspectorUpdater.exe')
 if not os.path.exists(updater_asset):
@@ -14,7 +16,7 @@ if not os.path.exists(updater_asset):
 
 a = Analysis(
     ['run_product_prospector.pyw'],
-    pathex=['C:\\Users\\Mike\\Desktop\\ProductProspector\\app\\dev'],
+    pathex=[os.path.abspath('.')],
     binaries=[],
     datas=[
         ('..\\required', 'app\\required'),
@@ -26,7 +28,11 @@ a = Analysis(
         ('..\\..\\VERSION', '.'),
         (updater_asset, 'update'),
     ],
-    hiddenimports=['product_prospector', 'core'],
+    hiddenimports=[
+        'product_prospector',
+        'product_prospector.core',
+        'core',
+    ] + collect_submodules('product_prospector') + collect_submodules('core'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
