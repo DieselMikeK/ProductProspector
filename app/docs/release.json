@@ -1,14 +1,14 @@
 {
-  "version": "1.0.0",
-  "download_url": "",
-  "sha256": "",
-  "notes": "",
-  "published_at": "",
+  "version": "1.0.1",
+  "download_url": "https://github.com/DieselMikeK/ProductProspector/releases/download/v1.0.1/ProductProspector.exe",
+  "sha256": "abc1f1eb0d70b4cc1638ec83336f465393f97ce3b46596029cbc9a3879d602b4",
+  "notes": "Ship updater flow and latest scraper improvements",
+  "published_at": "03/26/2026 18:19:38",
   "files": [
     {
       "relative_path": "ProductProspector.exe",
-      "download_url": "",
-      "sha256": ""
+      "download_url": "https://github.com/DieselMikeK/ProductProspector/releases/download/v1.0.1/ProductProspector.exe",
+      "sha256": "abc1f1eb0d70b4cc1638ec83336f465393f97ce3b46596029cbc9a3879d602b4"
     }
   ]
 }
