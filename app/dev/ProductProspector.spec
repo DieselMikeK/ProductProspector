@@ -25,8 +25,8 @@ a = Analysis(
         ('..\\logo.png', 'app'),
         ('..\\icon.ico', 'app'),
         ('..\\product_prospector.settings.json', 'app'),
-        ('..\\..\\VERSION', '.'),
-        (updater_asset, 'update'),
+        ('..\\update\\VERSION', 'app\\update'),
+        (updater_asset, 'app\\update'),
     ],
     hiddenimports=[
         'product_prospector',

@@ -302,10 +302,15 @@ def _rows_from_session(session: AppSession) -> list[pd.Series]:
         rows.extend([row for _, row in session.vendor_df.iterrows()])
     scope_skus = session.target_skus or session.pasted_skus
     if scope_skus:
-        existing = {
-            normalize_sku(_row_value(row, session.source_mapping.sku or "sku"))
-            for row in rows
-        }
+        existing: set[str] = set()
+        for row in rows:
+            row_sku = normalize_sku(_row_value(row, session.source_mapping.sku or "sku"))
+            if not row_sku:
+                continue
+            existing.add(row_sku)
+            scoped_row_sku = _resolve_session_scoped_sku(session, row_sku)
+            if scoped_row_sku:
+                existing.add(scoped_row_sku)
         for sku in scope_skus:
             sku_norm = normalize_sku(sku)
             if not sku_norm or sku_norm in existing:
@@ -313,6 +318,28 @@ def _rows_from_session(session: AppSession) -> list[pd.Series]:
             rows.append(pd.Series({session.source_mapping.sku or "sku": sku_norm}))
             existing.add(sku_norm)
     return rows
+
+
+def _resolve_session_scoped_sku(session: AppSession, row_sku: str) -> str:
+    sku = normalize_sku(row_sku)
+    if not sku:
+        return ""
+
+    scope_set = {
+        normalize_sku(value)
+        for value in (session.target_skus or session.pasted_skus or [])
+        if normalize_sku(value)
+    }
+    if not scope_set or sku in scope_set:
+        return sku
+
+    for scoped_sku, search_term in (session.search_terms_by_sku or {}).items():
+        scoped_norm = normalize_sku(scoped_sku)
+        if not scoped_norm or scoped_norm not in scope_set:
+            continue
+        if normalize_sku(search_term) == sku:
+            return scoped_norm
+    return sku
 
 
 @dataclass
@@ -498,6 +525,9 @@ def detect_missing_required_fields(session: AppSession, required_root: Path | No
         if not sku_value:
             continue
         rows_by_sku.setdefault(sku_value, []).append(row)
+        scoped_sku_value = _resolve_session_scoped_sku(session, sku_value)
+        if scoped_sku_value and scoped_sku_value != sku_value:
+            rows_by_sku.setdefault(scoped_sku_value, []).append(row)
 
     discounts_df = pd.DataFrame()
     if "cost" in required and required_root is not None:
@@ -732,7 +762,8 @@ def build_products_from_session(
         dealer_columns = _dealer_columns_for_sheet(mapping, list(session.vendor_df.columns), price_rules=price_rules)
 
     for row in rows:
-        sku = normalize_sku(_row_value(row, mapping.sku))
+        row_sku = normalize_sku(_row_value(row, mapping.sku))
+        sku = _resolve_session_scoped_sku(session, row_sku)
         if not sku:
             stats.rows_skipped_missing_sku += 1
             continue
@@ -866,7 +897,7 @@ def build_products_from_session(
                 _set_if_present(product, field_name, value, "spreadsheet")
             product.field_sources["update_scope"] = ",".join(sorted(selected)) if session.update_fields else "all"
 
-        scraped_values = dict(scraped_index.get(sku, {}) or {})
+        scraped_values = dict(scraped_index.get(sku, {}) or scraped_index.get(row_sku, {}) or {})
         scraped_product_url = (
             _clean_text(scraped_values.get("product_url", ""))
             or _clean_text(scraped_values.get("source_url", ""))
@@ -928,8 +959,11 @@ def build_products_from_session(
                             product.set_field("application", merged_application, source)
                         continue
 
-                    existing_value = _clean_text(getattr(product, field_name, ""))
-                    if existing_value:
+                    existing_attr = getattr(product, field_name, None)
+                    if isinstance(existing_attr, list):
+                        if existing_attr:
+                            continue
+                    elif _clean_text(existing_attr):
                         continue
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
             elif session.mode == MODE_UPDATE:

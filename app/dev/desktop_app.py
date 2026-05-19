@@ -7,6 +7,7 @@ import ctypes
 from datetime import datetime, timezone
 import json
 import os
+import platform
 import queue
 from pathlib import Path
 import re
@@ -19,6 +20,12 @@ import tkinter.font as tkfont
 import urllib.parse
 import webbrowser
 from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
+
+# Avoid Python 3.14's Windows WMI path during startup. Pandas calls
+# platform.machine() at import time, and WMI can hang on this machine.
+if sys.platform == "win32":
+    _machine_value = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or "AMD64"
+    platform.machine = lambda: _machine_value
 
 import pandas as pd
 
@@ -112,7 +119,7 @@ PROSPECTOR_COMBO_PAD_X_PX = 7
 PROSPECTOR_COMBO_PAD_Y_PX = 3
 HEADER_LOGO_VERTICAL_CROP_TOP_PX = 80
 HEADER_LOGO_VERTICAL_CROP_BOTTOM_PX = 40
-HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 25
+HEADER_LOGO_VERTICAL_TOP_PADDING_PX = 5
 HEADER_LOGO_VERTICAL_BOTTOM_PADDING_PX = 0
 _SINGLE_INSTANCE_MUTEX = "Global\\ProductProspectorDesktopApp"
 _ERROR_ALREADY_EXISTS = 183
@@ -426,7 +433,7 @@ class ProductProspectorDesktopApp:
         self._window_icon_image: tk.PhotoImage | None = None
         self._header_logo_image: tk.PhotoImage | None = None
         self._header_logo_label: ttk.Label | None = None
-        self._header_logo_target_width = 550
+        self._header_logo_target_width = 430
         self._header_logo_target_height: int | None = None
         self._header_logo_frame_paths: list[Path] = []
         self._header_logo_frames: list[tk.PhotoImage] = []
@@ -566,7 +573,7 @@ class ProductProspectorDesktopApp:
         self.review_fields: dict[str, StringVar] = {
             "title": StringVar(value=""),
             "description_html": StringVar(value=""),
-            "media_urls": StringVar(value=""),
+            "description_2": StringVar(value=""),
             "price": StringVar(value=""),
             "map_price": StringVar(value=""),
             "msrp_price": StringVar(value=""),
@@ -585,6 +592,7 @@ class ProductProspectorDesktopApp:
             "mpn": StringVar(value=""),
             "brand": StringVar(value=""),
             "application": StringVar(value=""),
+            "ad_words_spend": StringVar(value=""),
             "collections": StringVar(value=""),
             "tags": StringVar(value=""),
             "core_charge_product_code": StringVar(value=""),
@@ -605,7 +613,10 @@ class ProductProspectorDesktopApp:
         self.review_collection_option_by_key: dict[str, str] = {}
         self.review_collection_selected: list[str] = []
         self.review_collections_query = StringVar(value="")
+        self.review_collections_tokens_label: ttk.Label | None = None
         self.review_collections_tokens_wrap: tk.Frame | None = None
+        self.review_collections_tokens_canvas: tk.Canvas | None = None
+        self.review_collections_tokens_inner: tk.Frame | None = None
         self.review_collections_entry: ttk.Entry | None = None
         self.review_collections_suggestions_frame: ttk.Frame | None = None
         self.review_collections_suggestions: tk.Listbox | None = None
@@ -626,6 +637,10 @@ class ProductProspectorDesktopApp:
         self.review_variant_cost_options: list[DiscountMatch] = []
         self.review_variant_cost_option_map: dict[str, DiscountMatch] = {}
         self.review_variant_cost_options_loaded_for_sku: str = ""
+        self.remap_fields_expanded = BooleanVar(value=False)
+        self.remap_toggle_button: ttk.Button | None = None
+        self.remap_grid: ttk.Frame | None = None
+        self.remap_action: ttk.Frame | None = None
         self.vendor_discounts_df: pd.DataFrame | None = None
         self.review_refresh_pending = False
         self.review_refresh_inflight = False
@@ -2429,14 +2444,15 @@ class ProductProspectorDesktopApp:
 
         self._review_entry_row(form_grid, "Title", "title", 0, 0)
         self._review_entry_row(form_grid, "Description", "description_html", 1, 0)
-        self._review_entry_row(form_grid, "Media URLs", "media_urls", 2, 0)
+        self._review_entry_row(form_grid, "Description 2", "description_2", 2, 0)
         self._review_entry_row(form_grid, "Price", "price", 3, 0)
         self._review_cost_row(form_grid, 4, 0)
-        self._review_entry_row(form_grid, "Inventory", "inventory", 5, 0)
-        self._review_entry_row(form_grid, "SKU", "sku", 6, 0)
-        self._review_entry_row(form_grid, "Barcode", "barcode", 7, 0)
-        self._review_entry_row(form_grid, "Weight", "weight", 8, 0)
-        self._review_tags_row(form_grid, 9, 0)
+        self._review_entry_row(form_grid, "Ad Words Spend", "ad_words_spend", 5, 0)
+        self._review_entry_row(form_grid, "Inventory", "inventory", 6, 0)
+        self._review_entry_row(form_grid, "SKU", "sku", 7, 0)
+        self._review_entry_row(form_grid, "Barcode", "barcode", 8, 0)
+        self._review_entry_row(form_grid, "Weight", "weight", 9, 0)
+        self._review_collections_row(form_grid, 10, 0)
 
         self._review_entry_row(form_grid, "Vendor", "vendor", 0, 2)
         self._review_entry_row(form_grid, "Type", "type", 1, 2)
@@ -2453,7 +2469,7 @@ class ProductProspectorDesktopApp:
         )
         self.fitment_vehicles_check.grid_remove()
         self._review_entry_row(form_grid, "Core Charge Code", "core_charge_product_code", 8, 2)
-        self._review_collections_row(form_grid, 9, 2)
+        self._review_tags_row(form_grid, 9, 2)
 
         self.variant_form_wrap = ttk.LabelFrame(self.export_inner, text="Variant Review", padding=8)
         self.variant_form_wrap.pack(fill=X, pady=(0, 8))
@@ -2492,8 +2508,13 @@ class ProductProspectorDesktopApp:
 
         remap_wrap = ttk.LabelFrame(self.export_inner, text="Remap Fields (Optional)", padding=8)
         remap_wrap.pack(fill=X, pady=(8, 0))
+        remap_header = ttk.Frame(remap_wrap)
+        remap_header.pack(fill=X)
+        self.remap_toggle_button = ttk.Button(remap_header, text="Open", command=self._toggle_remap_fields)
+        self.remap_toggle_button.pack(side=LEFT)
         remap_grid = ttk.Frame(remap_wrap)
         remap_grid.pack(fill=X)
+        self.remap_grid = remap_grid
         remap_grid.columnconfigure(0, weight=1)
         remap_grid.columnconfigure(1, weight=1)
 
@@ -2516,7 +2537,9 @@ class ProductProspectorDesktopApp:
         )
         remap_action = ttk.Frame(remap_wrap)
         remap_action.pack(fill=X, pady=(6, 0))
+        self.remap_action = remap_action
         ttk.Button(remap_action, text="Apply Remap & Reprocess", command=self._reprocess_from_review).pack(side=LEFT)
+        self._sync_remap_fields_visibility()
 
         self.export_status = ttk.Label(self.export_inner, textvariable=self.review_status_text, foreground="#1f4e79")
         self.export_status.pack(anchor=W, pady=(6, 0))
@@ -2585,6 +2608,28 @@ class ProductProspectorDesktopApp:
         combo = ttk.Combobox(frame, textvariable=variable, state="readonly", width=44)
         combo.pack(side=LEFT, fill=X, expand=True)
         return combo
+
+    def _toggle_remap_fields(self) -> None:
+        self.remap_fields_expanded.set(not bool(self.remap_fields_expanded.get()))
+        self._sync_remap_fields_visibility()
+
+    def _sync_remap_fields_visibility(self) -> None:
+        expanded = bool(self.remap_fields_expanded.get())
+        if self.remap_toggle_button is not None:
+            try:
+                self.remap_toggle_button.configure(text="Close" if expanded else "Open")
+            except Exception:
+                pass
+        for widget in (self.remap_grid, self.remap_action):
+            if widget is None:
+                continue
+            try:
+                if expanded:
+                    widget.pack(fill=X, pady=(6, 0) if widget is self.remap_action else 0)
+                else:
+                    widget.pack_forget()
+            except Exception:
+                pass
 
     def _create_tree(
         self,
@@ -2836,12 +2881,37 @@ class ProductProspectorDesktopApp:
         frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
         frame.columnconfigure(0, weight=1)
 
-        tokens_wrap = tk.Frame(frame, bg="#F8FAFC", highlightthickness=1, highlightbackground="#CBD5E1", bd=0)
-        tokens_wrap.grid(row=0, column=0, sticky="ew")
+        tokens_label = ttk.Label(parent, text="Existing Collections", width=18)
+        tokens_label.grid(row=row, column=col_offset + 2, sticky=W, padx=(0, 6), pady=2)
+        self.review_collections_tokens_label = tokens_label
+
+        tokens_wrap = tk.Frame(parent, bg="#F8FAFC", highlightthickness=1, highlightbackground="#CBD5E1", bd=0, height=76)
+        tokens_wrap.grid(row=row, column=col_offset + 3, sticky="ew", padx=(0, 12), pady=2)
+        tokens_wrap.grid_propagate(False)
+        tokens_wrap.columnconfigure(0, weight=1)
+        tokens_wrap.rowconfigure(0, weight=1)
         self.review_collections_tokens_wrap = tokens_wrap
 
+        tokens_canvas = tk.Canvas(tokens_wrap, height=72, bg="#F8FAFC", highlightthickness=0, bd=0)
+        tokens_canvas.grid(row=0, column=0, sticky="nsew")
+        tokens_scroll = ttk.Scrollbar(tokens_wrap, orient=VERTICAL, command=tokens_canvas.yview)
+        tokens_scroll.grid(row=0, column=1, sticky="ns")
+        tokens_canvas.configure(yscrollcommand=tokens_scroll.set)
+        tokens_inner = tk.Frame(tokens_canvas, bg="#F8FAFC")
+        tokens_window = tokens_canvas.create_window((0, 0), window=tokens_inner, anchor="nw")
+        tokens_inner.bind(
+            "<Configure>",
+            lambda _event: tokens_canvas.configure(scrollregion=tokens_canvas.bbox("all")),
+        )
+        tokens_canvas.bind(
+            "<Configure>",
+            lambda event: tokens_canvas.itemconfigure(tokens_window, width=event.width),
+        )
+        self.review_collections_tokens_canvas = tokens_canvas
+        self.review_collections_tokens_inner = tokens_inner
+
         entry = ttk.Entry(frame, textvariable=self.review_collections_query)
-        entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        entry.grid(row=0, column=0, sticky="ew")
         entry.bind("<KeyRelease>", self._on_review_collections_entry_keyrelease, add="+")
         entry.bind("<Return>", self._on_review_collections_entry_return, add="+")
         entry.bind("<Down>", self._on_review_collections_entry_down, add="+")
@@ -2850,9 +2920,9 @@ class ProductProspectorDesktopApp:
         self.review_collections_entry = entry
 
         suggestions_frame = ttk.Frame(frame)
-        suggestions_frame.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        suggestions_frame.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         suggestions_frame.columnconfigure(0, weight=1)
-        suggestions = tk.Listbox(suggestions_frame, height=6, activestyle="none", exportselection=False)
+        suggestions = tk.Listbox(suggestions_frame, height=4, activestyle="none", exportselection=False)
         suggestions.grid(row=0, column=0, sticky="ew")
         suggestions_scroll = ttk.Scrollbar(suggestions_frame, orient=VERTICAL, command=suggestions.yview)
         suggestions_scroll.grid(row=0, column=1, sticky="ns")
@@ -2862,7 +2932,6 @@ class ProductProspectorDesktopApp:
         suggestions.bind("<Return>", self._on_review_collections_suggestion_activate, add="+")
         suggestions.bind("<Escape>", self._on_review_collections_entry_escape, add="+")
         suggestions.bind("<FocusOut>", self._on_review_collections_entry_focus_out, add="+")
-        suggestions_frame.grid_remove()
         self.review_collections_suggestions_frame = suggestions_frame
         self.review_collections_suggestions = suggestions
         self.review_collections_suggestion_values = []
@@ -2923,7 +2992,7 @@ class ProductProspectorDesktopApp:
         self._hide_review_collections_suggestions()
 
     def _refresh_review_collection_chips(self) -> None:
-        wrap = self.review_collections_tokens_wrap
+        wrap = self.review_collections_tokens_inner
         if wrap is None:
             return
         for child in list(wrap.winfo_children()):
@@ -2935,7 +3004,7 @@ class ProductProspectorDesktopApp:
         if not self.review_collection_selected:
             hint = tk.Label(
                 wrap,
-                text="Start typing to search collections...",
+                text="No collections selected.",
                 bg="#F8FAFC",
                 fg="#64748B",
                 anchor="w",
@@ -2968,6 +3037,11 @@ class ProductProspectorDesktopApp:
                 cursor="hand2",
             )
             remove.pack(side=RIGHT, padx=(0, 6), pady=2)
+        if self.review_collections_tokens_canvas is not None:
+            try:
+                self.review_collections_tokens_canvas.yview_moveto(0)
+            except Exception:
+                pass
 
     def _review_collection_matches(self, query: str) -> list[str]:
         text = str(query or "").strip().lower()
@@ -2992,11 +3066,19 @@ class ProductProspectorDesktopApp:
         listbox = self.review_collections_suggestions
         if frame is None or listbox is None:
             return
+        try:
+            listbox.configure(state="normal")
+        except Exception:
+            pass
         listbox.delete(0, END)
         for value in values:
             listbox.insert(END, value)
         self.review_collections_suggestion_values = list(values)
         if values:
+            try:
+                listbox.configure(state="normal")
+            except Exception:
+                pass
             frame.grid()
             try:
                 listbox.selection_clear(0, END)
@@ -3005,7 +3087,7 @@ class ProductProspectorDesktopApp:
             except Exception:
                 pass
         else:
-            frame.grid_remove()
+            self._hide_review_collections_suggestions()
 
     def _hide_review_collections_suggestions(self) -> None:
         if self._review_collections_suggestion_hide_job is not None:
@@ -3015,7 +3097,14 @@ class ProductProspectorDesktopApp:
                 pass
             self._review_collections_suggestion_hide_job = None
         if self.review_collections_suggestions_frame is not None:
-            self.review_collections_suggestions_frame.grid_remove()
+            self.review_collections_suggestions_frame.grid()
+        if self.review_collections_suggestions is not None:
+            try:
+                self.review_collections_suggestions.configure(state="normal")
+                self.review_collections_suggestions.delete(0, END)
+                self.review_collections_suggestions.configure(state="disabled")
+            except Exception:
+                pass
         self.review_collections_suggestion_values = []
 
     def _refresh_review_collections_suggestions(self) -> None:
@@ -3804,11 +3893,16 @@ class ProductProspectorDesktopApp:
                 product.field_sources["cost"] = "review_discount_apply_all"
             if isinstance(getattr(product, "field_status", None), dict):
                 product.field_status["cost"] = "ok"
+            try:
+                product.finalize_defaults()
+            except Exception:
+                pass
             updated += 1
 
         if 0 <= self.review_index < len(self.session.products):
             current_product = self.session.products[self.review_index]
             self.review_fields["cost"].set(str(getattr(current_product, "cost", "") or ""))
+            self.review_fields["ad_words_spend"].set(str(getattr(current_product, "ad_words_spend", "") or ""))
 
         self._schedule_review_table_refresh()
         if updated <= 0:
@@ -3894,7 +3988,7 @@ class ProductProspectorDesktopApp:
     def _display_field_value(self, field_name: str, raw_value: str) -> tuple[str, bool]:
         limits = {
             "description_html": 4000,
-            "media_urls": 2500,
+            "description_2": 4000,
             "application": 2000,
             "collections": 2000,
         }
@@ -4034,27 +4128,60 @@ class ProductProspectorDesktopApp:
         if config is None:
             return None, "Invalid config/shopify.json. Cannot sync Shopify catalog."
 
-        token = load_shopify_token()
-        if token is None:
-            self._connect_shopify_worker(allow_handshake=False)
-            token = load_shopify_token()
-        if token is None:
-            return None, "Shopify is not connected. Connect Shopify first and retry."
+        access_token, token_error = self._load_valid_shopify_access_token(config=config, allow_handshake=False)
+        if not access_token:
+            return None, token_error or "Shopify is not connected. Connect Shopify first and retry."
 
         use_targeted = bool(target_skus)
         if use_targeted:
             df, error = fetch_shopify_catalog_for_skus(
                 config=config,
-                access_token=token.access_token,
+                access_token=access_token,
                 skus=target_skus,
             )
             if not error and (df is None or df.empty):
-                df, error = fetch_shopify_catalog_dataframe(config=config, access_token=token.access_token)
+                df, error = fetch_shopify_catalog_dataframe(config=config, access_token=access_token)
         else:
-            df, error = fetch_shopify_catalog_dataframe(config=config, access_token=token.access_token)
+            df, error = fetch_shopify_catalog_dataframe(config=config, access_token=access_token)
         if error:
             return None, error
         return df if df is not None else pd.DataFrame(), None
+
+    def _load_valid_shopify_access_token(self, config=None, allow_handshake: bool = False) -> tuple[str | None, str | None]:
+        config = config or load_shopify_config()
+        if config is None:
+            return None, "Invalid config/shopify.json."
+
+        if config.admin_api_access_token:
+            valid, reason = validate_access_token(config=config, access_token=config.admin_api_access_token)
+            if valid:
+                save_shopify_token(access_token=config.admin_api_access_token, scope="admin_api_access_token")
+                self._set_shopify_status(connected=True)
+                return config.admin_api_access_token, None
+            return None, f"Configured admin_api_access_token is invalid ({reason})."
+
+        existing_token = load_shopify_token()
+        if existing_token is not None:
+            valid, reason = validate_access_token(config=config, access_token=existing_token.access_token)
+            if valid:
+                self._set_shopify_status(connected=True)
+                return existing_token.access_token, None
+            reconnect_reason = reason
+        else:
+            reconnect_reason = "No saved Shopify token."
+
+        connected = self._connect_shopify_worker(allow_handshake=allow_handshake)
+        if connected:
+            refreshed_token = load_shopify_token()
+            if refreshed_token is not None:
+                valid, reason = validate_access_token(config=config, access_token=refreshed_token.access_token)
+                if valid:
+                    self._set_shopify_status(connected=True)
+                    return refreshed_token.access_token, None
+                reconnect_reason = reason
+
+        self._set_shopify_status(connected=False)
+        return None, f"Shopify token is not valid ({reconnect_reason}). Reconnect Shopify and retry."
 
     def _scope_missing_media_for_scrape(self, target_skus: list[str]) -> bool:
         if not target_skus:
@@ -4803,8 +4930,7 @@ class ProductProspectorDesktopApp:
         _collective_locked = self._product_is_shopify_collective_locked(product)
         product.title = self._read_review_field("title")
         product.description_html = self._read_review_field("description_html")
-        media_text = self._read_review_field("media_urls")
-        product.media_urls = [part.strip() for part in re.split(r"[|,\n]+", media_text) if part.strip()]
+        product.description_2 = self._read_review_field("description_2")
         if not _is_parent_with_variants:
             if not _collective_locked:
                 product.price = self._read_review_field("price")
@@ -4831,6 +4957,7 @@ class ProductProspectorDesktopApp:
         if not _collective_locked:
             product.brand = self._read_review_field("brand")
         product.application = self._read_review_field("application")
+        product.ad_words_spend = self._read_review_field("ad_words_spend").lower()
         product.collections = self._read_review_field("collections")
         product.tags = [
             item
@@ -4956,12 +5083,9 @@ class ProductProspectorDesktopApp:
         if config is None:
             messagebox.showerror(APP_TITLE, "Invalid config/shopify.json. Cannot push to Shopify.")
             return
-        token = load_shopify_token()
-        if token is None:
-            self._connect_shopify_worker(allow_handshake=False)
-            token = load_shopify_token()
-        if token is None:
-            messagebox.showerror(APP_TITLE, "Shopify is not connected. Connect first and retry.")
+        access_token, token_error = self._load_valid_shopify_access_token(config=config, allow_handshake=False)
+        if not access_token:
+            messagebox.showerror(APP_TITLE, token_error or "Shopify is not connected. Connect first and retry.")
             return
 
         image_mode_text = "with images" if include_images else "without images"
@@ -4975,7 +5099,7 @@ class ProductProspectorDesktopApp:
             target=self._run_shopify_push_worker,
             kwargs={
                 "config": config,
-                "access_token": token.access_token,
+                "access_token": access_token,
                 "products": products,
                 "include_images": include_images,
                 "operator_tag": operator_tag,
@@ -6995,7 +7119,18 @@ class ProductProspectorDesktopApp:
         selected = {field for field in (self.session.update_fields or []) if str(field or "").strip()}
         if not selected:
             return None
-        always_visible = {"vendor", "sku", "mpn", "type", "google_product_type", "category_code", "product_subtype", "collections"}
+        always_visible = {
+            "vendor",
+            "sku",
+            "mpn",
+            "type",
+            "google_product_type",
+            "category_code",
+            "product_subtype",
+            "description_2",
+            "ad_words_spend",
+            "collections",
+        }
         return always_visible | selected
 
     def _apply_update_scope_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -7027,7 +7162,7 @@ class ProductProspectorDesktopApp:
             "mpn",
             "title",
             "description_html",
-            "media_urls",
+            "description_2",
             "price",
             "cost",
             "barcode",
@@ -7037,6 +7172,7 @@ class ProductProspectorDesktopApp:
             "category_code",
             "product_subtype",
             "application",
+            "ad_words_spend",
             "inventory",
             "brand",
             "core_charge_product_code",
@@ -7078,6 +7214,15 @@ class ProductProspectorDesktopApp:
                         value_widget.grid_remove()
                 except Exception:
                     pass
+                if field_name == "collections":
+                    for widget in (self.review_collections_tokens_label, self.review_collections_tokens_wrap):
+                        if widget is None:
+                            continue
+                        try:
+                            if widget.winfo_manager():
+                                widget.grid_remove()
+                        except Exception:
+                            pass
                 continue
 
             target_row = next_row_by_column.get(col_offset, original_row)
@@ -7094,6 +7239,23 @@ class ProductProspectorDesktopApp:
                 value_widget.grid_configure(row=target_row, column=col_offset + 1)
             except Exception:
                 pass
+
+            if field_name == "collections":
+                try:
+                    if self.review_collections_tokens_label is not None:
+                        if not self.review_collections_tokens_label.winfo_manager():
+                            self.review_collections_tokens_label.grid()
+                        self.review_collections_tokens_label.grid_configure(row=target_row, column=2)
+                except Exception:
+                    pass
+                try:
+                    if self.review_collections_tokens_wrap is not None:
+                        if not self.review_collections_tokens_wrap.winfo_manager():
+                            self.review_collections_tokens_wrap.grid()
+                        self.review_collections_tokens_wrap.grid_configure(row=target_row, column=3)
+                except Exception:
+                    pass
+                next_row_by_column[2] = max(next_row_by_column.get(2, 0), target_row + 1)
 
             # Keep the fitment checkbox immediately after the application entry
             if field_name == "application" and hasattr(self, "fitment_vehicles_check"):

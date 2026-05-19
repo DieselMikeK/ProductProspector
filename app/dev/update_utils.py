@@ -24,10 +24,23 @@ MAIN_EXECUTABLE_NAME = "ProductProspector.exe"
 UPDATER_EXECUTABLE_NAME = "ProductProspectorUpdater.exe"
 VERSION_FILENAME = "VERSION"
 PRIMARY_RELEASE_RELATIVE_PATH = MAIN_EXECUTABLE_NAME
+UPDATE_FOLDER_NAME = "update"
 DEFAULT_UPDATE_MANIFEST_URL = (
+    "https://raw.githubusercontent.com/DieselMikeK/ProductProspector/master/app/update/release.json"
+)
+LEGACY_UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/DieselMikeK/ProductProspector/master/app/docs/release.json"
 )
 CERTIFI_CA_BUNDLE = certifi.where() if certifi else ""
+
+
+def get_update_dir(base_path: str | os.PathLike[str] | None = None) -> str:
+    """Return the update folder path for the current runtime or a provided app/base folder."""
+    root = os.fspath(base_path) if base_path else get_base_dir()
+    root_path = Path(root)
+    if root_path.name.lower() == "app":
+        return str(root_path / UPDATE_FOLDER_NAME)
+    return str(root_path / "app" / UPDATE_FOLDER_NAME)
 
 
 def get_source_dir() -> str:
@@ -118,6 +131,10 @@ def load_app_version() -> str:
     """Read the current application version from the bundled VERSION file."""
     source_dir = Path(get_source_dir()).resolve()
     candidates = [
+        Path(get_resource_path(os.path.join("app", UPDATE_FOLDER_NAME, VERSION_FILENAME))),
+        Path(get_update_dir()) / VERSION_FILENAME,
+        source_dir.parent / UPDATE_FOLDER_NAME / VERSION_FILENAME,
+        source_dir.parents[1] / "app" / UPDATE_FOLDER_NAME / VERSION_FILENAME,
         Path(get_resource_path(VERSION_FILENAME)),
         Path(get_base_dir()) / VERSION_FILENAME,
         source_dir / VERSION_FILENAME,
@@ -140,17 +157,34 @@ def load_app_version() -> str:
 
 def load_update_config(required_dir: str | os.PathLike[str] | None) -> dict[str, object]:
     """Load optional update configuration overrides from the runtime app data folder."""
-    if not required_dir:
-        return {}
-    path = Path(required_dir) / "update_config.json"
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    if isinstance(data, dict):
-        return data
+    candidates: list[Path] = []
+    if required_dir:
+        required_path = Path(required_dir)
+        candidates.extend(
+            [
+                required_path.parent / UPDATE_FOLDER_NAME / "update_config.json",
+                required_path / "update_config.json",
+            ]
+        )
+    candidates.extend(
+        [
+            Path(get_update_dir()) / "update_config.json",
+            Path(get_source_dir()).resolve().parent / UPDATE_FOLDER_NAME / "update_config.json",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for path in candidates:
+        normalized = path.resolve(strict=False)
+        if normalized in seen or not normalized.exists():
+            continue
+        seen.add(normalized)
+        try:
+            data = json.loads(normalized.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
     return {}
 
 
@@ -261,16 +295,31 @@ def normalize_release_manifest(data: object, source_url: str = "") -> dict[str, 
 
 def fetch_release_manifest(required_dir: str | os.PathLike[str] | None = None, timeout: int = 5) -> dict[str, object]:
     """Fetch and parse the remote release manifest."""
-    url = get_update_manifest_url(required_dir)
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": f"{APP_NAME.replace(' ', '')}/UpdateCheck"},
-    )
-    with open_url_with_tls_fallback(request, timeout=timeout) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        payload = response.read().decode(charset)
-    data = json.loads(payload)
-    return normalize_release_manifest(data, source_url=url)
+    primary_url = get_update_manifest_url(required_dir)
+    candidate_urls = [primary_url]
+    normalized_primary = primary_url.strip().lower()
+    if normalized_primary == DEFAULT_UPDATE_MANIFEST_URL.lower():
+        candidate_urls.append(LEGACY_UPDATE_MANIFEST_URL)
+
+    last_error: Exception | None = None
+    for url in candidate_urls:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": f"{APP_NAME.replace(' ', '')}/UpdateCheck"},
+        )
+        try:
+            with open_url_with_tls_fallback(request, timeout=timeout) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                payload = response.read().decode(charset)
+            data = json.loads(payload)
+            return normalize_release_manifest(data, source_url=url)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to load a release manifest.")
 
 
 def compute_file_sha256(path: str | os.PathLike[str]) -> str:
@@ -285,10 +334,12 @@ def compute_file_sha256(path: str | os.PathLike[str]) -> str:
 def find_updater_source_path() -> str:
     """Locate the updater executable bundled with or beside the app."""
     candidates = [
-        get_resource_path(os.path.join("update", UPDATER_EXECUTABLE_NAME)),
+        get_resource_path(os.path.join("app", UPDATE_FOLDER_NAME, UPDATER_EXECUTABLE_NAME)),
+        os.path.join(get_update_dir(), UPDATER_EXECUTABLE_NAME),
         os.path.join(get_base_dir(), UPDATER_EXECUTABLE_NAME),
-        os.path.join(get_base_dir(), "update", UPDATER_EXECUTABLE_NAME),
+        os.path.join(get_base_dir(), UPDATE_FOLDER_NAME, UPDATER_EXECUTABLE_NAME),
         os.path.join(get_source_dir(), "update", UPDATER_EXECUTABLE_NAME),
+        os.path.join(Path(get_source_dir()).resolve().parent, UPDATE_FOLDER_NAME, UPDATER_EXECUTABLE_NAME),
         os.path.join(get_source_dir(), "dist", UPDATER_EXECUTABLE_NAME),
     ]
     seen: set[str] = set()

@@ -364,6 +364,17 @@ mutation PublishProductToPublications($id: ID!, $input: [PublicationInput!]!) {
 }
 """
 
+_PUBLISHABLE_UNPUBLISH_MUTATION = """
+mutation UnpublishProductFromPublications($id: ID!, $input: [PublicationInput!]!) {
+  publishableUnpublish(id: $id, input: $input) {
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
 
 def _chunked(values: list[str], size: int) -> list[list[str]]:
     if size <= 0:
@@ -413,6 +424,13 @@ def _load_all_publications(
     return publications, None
 
 
+def _is_point_of_sale_publication(publication_name: object) -> bool:
+    name = _clean_text(publication_name).lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", name).strip()
+    compact = re.sub(r"[^a-z0-9]+", "", name)
+    return normalized in {"point of sale", "pos"} or compact in {"pointofsale", "pos"}
+
+
 def _publish_product_to_publications(
     config: ShopifyConfig,
     access_token: str,
@@ -444,6 +462,53 @@ def _publish_product_to_publications(
             continue
 
         payload = (data or {}).get("publishablePublish") or {}
+        user_errors = payload.get("userErrors") or []
+        for user_error in user_errors:
+            message = _clean_text((user_error or {}).get("message", ""))
+            if message:
+                errors.append(message)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in errors:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(item)
+    return deduped
+
+
+def _unpublish_product_from_publications(
+    config: ShopifyConfig,
+    access_token: str,
+    product_gid: str,
+    publication_ids: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    clean_product_gid = _clean_text(product_gid)
+    if not clean_product_gid:
+        return ["missing product gid"]
+    targets = [_clean_text(item) for item in publication_ids if _clean_text(item)]
+    if not targets:
+        return []
+
+    for publication_chunk in _chunked(targets, 25):
+        input_items = [{"publicationId": publication_id} for publication_id in publication_chunk]
+        data, error = _request_graphql_json(
+            config=config,
+            access_token=access_token,
+            query=_PUBLISHABLE_UNPUBLISH_MUTATION,
+            variables={
+                "id": clean_product_gid,
+                "input": input_items,
+            },
+        )
+        if error:
+            errors.append(error)
+            continue
+
+        payload = (data or {}).get("publishableUnpublish") or {}
         user_errors = payload.get("userErrors") or []
         for user_error in user_errors:
             message = _clean_text((user_error or {}).get("message", ""))
@@ -822,12 +887,27 @@ def push_new_products_as_drafts(
         return summary
 
     publication_targets, publication_error = _load_all_publications(config=config, access_token=access_token)
-    publication_ids = [item[0] for item in publication_targets if _clean_text(item[0])]
-    publication_names = [item[1] for item in publication_targets if _clean_text(item[1])]
+    publication_ids = [
+        item[0]
+        for item in publication_targets
+        if _clean_text(item[0]) and not _is_point_of_sale_publication(item[1])
+    ]
+    point_of_sale_publication_ids = [
+        item[0]
+        for item in publication_targets
+        if _clean_text(item[0]) and _is_point_of_sale_publication(item[1])
+    ]
+    excluded_publications = [
+        item[1]
+        for item in publication_targets
+        if _clean_text(item[0]) and _is_point_of_sale_publication(item[1])
+    ]
     publish_to_all_channels_enabled = bool(publication_ids)
     if publication_error:
         summary.warnings.append(f"Sales channel publication lookup failed ({publication_error}).")
-    else:
+    elif excluded_publications:
+        summary.warnings.append("Point of Sale publication excluded from draft publish.")
+    elif not publication_targets:
         summary.warnings.append("No Shopify publications found; sales channels could not be assigned.")
 
     low_stock_type = "single_line_text_field"
@@ -978,6 +1058,18 @@ def push_new_products_as_drafts(
                     )
                     publish_to_all_channels_enabled = False
 
+        if point_of_sale_publication_ids:
+            product_gid = f"gid://shopify/Product/{product_id}"
+            unpublish_errors = _unpublish_product_from_publications(
+                config=config,
+                access_token=access_token,
+                product_gid=product_gid,
+                publication_ids=point_of_sale_publication_ids,
+            )
+            if unpublish_errors:
+                combined = "; ".join(unpublish_errors)
+                summary.warnings.append(f"{sku}: Point of Sale not removed ({combined})")
+
         variant_id: int | None
         try:
             variant_id = int(variant_id_raw)
@@ -1040,6 +1132,8 @@ def push_new_products_as_drafts(
             ("custom", "google_product_type", _clean_text(product.google_product_type), "single_line_text_field"),
             ("custom", "category_codes_4", _clean_text(product.category_code), "list.single_line_text_field"),
             ("custom", "product_subtype", _clean_text(product.product_subtype), "single_line_text_field"),
+            ("custom", "prod_description_2", _clean_text(getattr(product, "description_2", "")), "multi_line_text_field"),
+            ("custom", "ad_words_spend", _clean_text(getattr(product, "ad_words_spend", "")), "single_line_text_field"),
             (
                 "custom",
                 "core_charge_product_code",

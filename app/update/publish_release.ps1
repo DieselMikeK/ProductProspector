@@ -9,7 +9,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
 Set-Location $repoRoot
 
 $currentBranch = (git branch --show-current).Trim()
@@ -28,7 +29,7 @@ if ($statusLines.Count -gt 0) {
     throw "Working tree must be clean before requesting a release. Push normal code changes first."
 }
 
-$versionPath = Join-Path $repoRoot "VERSION"
+$versionPath = Join-Path $repoRoot "app\update\VERSION"
 $releaseVersion = (Get-Content $versionPath -Raw).Trim()
 if (-not [string]::IsNullOrWhiteSpace($Version)) {
     $releaseVersion = $Version.Trim()
@@ -38,14 +39,14 @@ if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
     throw "VERSION is empty."
 }
 
-$requestPath = Join-Path $repoRoot "release_request.json"
+$requestPath = Join-Path $repoRoot "app\update\release_request.json"
 $requestPayload = [ordered]@{
     notes        = $Notes.Trim()
     requested_at = (Get-Date).ToUniversalTime().ToString("o")
 }
 $requestPayload | ConvertTo-Json | Set-Content -Path $requestPath -Encoding UTF8
 
-git add VERSION release_request.json
+git add app/update/VERSION app/update/release_request.json
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to stage the release request."
 }
@@ -67,4 +68,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Release requested for v$releaseVersion."
-Write-Host "GitHub Actions will build Product Prospector, create the release, and update app\\docs\\release.json."
+Write-Host "GitHub Actions will build Product Prospector, create the release, and update app\update\release.json."

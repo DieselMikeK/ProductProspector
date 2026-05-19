@@ -6,7 +6,7 @@ on:
     branches:
       - master
     paths:
-      - release_request.json
+      - app/update/release_request.json
 
 permissions:
   contents: write
@@ -33,13 +33,13 @@ jobs:
 
       - name: Build release artifacts
         shell: pwsh
-        run: .\build_release.ps1
+        run: .\app\update\build_release.ps1
 
       - name: Collect release metadata
         id: meta
         shell: pwsh
         run: |
-          $version = (Get-Content VERSION -Raw).Trim()
+          $version = (Get-Content 'app\update\VERSION' -Raw).Trim()
           if ([string]::IsNullOrWhiteSpace($version)) {
               throw "VERSION is empty."
           }
@@ -49,13 +49,13 @@ jobs:
           if (-not (Test-Path $mainExe)) {
               throw "Missing app\dev\dist\ProductProspector.exe after build."
           }
-          $templatePath = Join-Path $PWD 'app\dev\dist\release-template.json'
+          $templatePath = Join-Path $PWD 'app\update\release-template.json'
           if (-not (Test-Path $templatePath)) {
               throw "Missing app\dev\dist\release-template.json after build."
           }
 
           $requestNotes = ''
-          $requestPath = Join-Path $PWD 'release_request.json'
+          $requestPath = Join-Path $PWD 'app\update\release_request.json'
           if (Test-Path $requestPath) {
               try {
                   $request = Get-Content -Path $requestPath -Raw | ConvertFrom-Json
@@ -152,17 +152,17 @@ jobs:
         run: |
           $manifest = Get-Content -Path "${{ steps.meta.outputs.manifest_file }}" -Raw | ConvertFrom-Json
           $manifest.published_at = "${{ steps.release.outputs.published_at }}"
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path 'app\docs\release.json' -Encoding UTF8
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path 'app\update\release.json' -Encoding UTF8
 
       - name: Commit updated release manifest
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/docs/release.json
+          git add app/update/release.json
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
-              Write-Host "app/docs/release.json did not change."
+              Write-Host "app/update/release.json did not change."
               exit 0
           }
           git commit -m "Publish release manifest for v${{ steps.meta.outputs.version }}"

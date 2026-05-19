@@ -223,6 +223,10 @@ def _apply_search_term_step(term: str, step: str) -> str:
     if action == "drop_restock_suffix":
         trimmed = re.sub(r"(?i)\s+RESTOCK[-_ ]*[A-Z0-9]+$", "", value).strip()
         return normalize_sku(trimmed or value)
+    if action == "drop_cardinal_grizzly_sku_prefix":
+        if re.match(r"(?i)^GAGA[A-Z0-9]", value):
+            return normalize_sku(f"GA{value[4:]}")
+        return value
     return value
 
 
@@ -2667,6 +2671,55 @@ def _extract_partstitan_payload(html: str, page_url: str) -> dict[str, str]:
     if fitment_lines:
         application_values = [value for value in [fitment_summary, *fitment_lines] if _clean_text(value)]
         payload["application"] = " | ".join(application_values)
+    return payload
+
+
+def _is_cardinalparts_page(page_url: str) -> bool:
+    host = _normalize_host(_host_key_from_url(page_url))
+    return host in {"cardinalparts.com", "www.cardinalparts.com"}
+
+
+def _format_core_charge_code_from_amount(value: object) -> str:
+    text = _clean_text(value).replace(",", "")
+    if not text:
+        return ""
+    try:
+        amount = float(re.sub(r"[^0-9.\-]", "", text))
+    except Exception:
+        return ""
+    if amount <= 0:
+        return ""
+    return f"CORECHARGE-{int(round(amount))}"
+
+
+def _extract_cardinalparts_payload(html: str, page_url: str) -> dict[str, str]:
+    if not _is_cardinalparts_page(page_url):
+        return {}
+
+    page_text = "\n".join(_html_fragment_to_lines(html))
+    core_charge = ""
+    for pattern in [
+        r"(?is)\bAccept\s+Core\s+Charge\s*:\s*(?:Required)?\s*(?:\[[^\]]+\]\s*)?\$\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))",
+        r"(?is)\bAccept\s+Core\s+Charge\b.{0,180}?\$\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))",
+    ]:
+        core_charge = _extract_first(pattern, page_text)
+        if core_charge:
+            break
+
+    vendor = ""
+    brand_line = _extract_first(r"(?im)^\s*Brand\s*:\s*(.+?)\s*$", page_text)
+    if brand_line:
+        parts = [_clean_text(part) for part in re.split(r"\s+-\s+|\s+\|\s+", brand_line) if _clean_text(part)]
+        for part in reversed(parts):
+            if len(part) > 2 and not re.fullmatch(r"[A-Z]{1,4}", part):
+                vendor = part
+                break
+
+    payload: dict[str, str] = {}
+    if core_charge:
+        payload["core_charge_product_code"] = _format_core_charge_code_from_amount(core_charge)
+    if vendor:
+        payload["vendor"] = vendor
     return payload
 
 
@@ -5183,7 +5236,24 @@ def _download_images_for_sku(
         except Exception as exc:
             if first_error is None:
                 first_error = str(exc)
-    for index, url in enumerate(media_urls[:max_images], start=1):
+    unique_urls: list[str] = []
+    seen_url_keys: set[str] = set()
+    for url in media_urls:
+        clean_url = _clean_text(url)
+        if not clean_url:
+            continue
+        parsed = urllib.parse.urlsplit(clean_url)
+        normalized_path = urllib.parse.unquote(parsed.path).lower()
+        normalized_path = re.sub(r"/images/stencil/[^/]+/", "/images/stencil/", normalized_path)
+        url_key = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{normalized_path}"
+        if url_key in seen_url_keys:
+            continue
+        seen_url_keys.add(url_key)
+        unique_urls.append(clean_url)
+        if len(unique_urls) >= max_images:
+            break
+
+    for url in unique_urls:
         body, content_type, error = _fetch_binary(url)
         if error or not body:
             if first_error is None:
@@ -5193,10 +5263,6 @@ def _download_images_for_sku(
             if first_error is None:
                 first_error = f"non-image content-type: {content_type or 'unknown'}"
             continue
-        digest = hashlib.sha1(body).hexdigest()
-        if digest in seen_hashes:
-            continue
-        seen_hashes.add(digest)
         normalized_body, normalize_error = _normalize_image_to_square_jpeg(body, target_size=1500)
         if normalized_body is None:
             if first_error is None and normalize_error:
@@ -5205,6 +5271,10 @@ def _download_images_for_sku(
             extension = _extension_for_download(url, content_type)
         else:
             extension = ".jpg"
+        digest = hashlib.sha1(normalized_body).hexdigest()
+        if digest in seen_hashes:
+            continue
+        seen_hashes.add(digest)
 
         vendor_token = _safe_file_token(vendor_hint, "IMG")
         sku_token = _safe_file_token(sku, "SKU")
@@ -5399,6 +5469,7 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool, 
     output: dict[str, str] = {}
     is_product_page = _is_likely_product_page(page_url) or _html_looks_like_product_page(html)
     partstitan_payload = _extract_partstitan_payload(html, page_url)
+    cardinalparts_payload = _extract_cardinalparts_payload(html, page_url)
     if is_product_page and (not _clean_text(sku) or not _contains_compact_sku(context, sku)):
         # Direct product pages should still scrape cleanly even when the user-entered
         # identifier is not present in the HTML (for example MPN vs site part number).
@@ -5433,10 +5504,15 @@ def _heuristic_extract(html: str, page_url: str, sku: str, scrape_images: bool, 
         r"(?i)(?:core(?:\s*charge)?|corecharge)\D{0,28}(\$?\s*[0-9]{1,5}(?:\.[0-9]{1,2})?)",
         context,
     )
+    output["core_charge_product_code"] = (
+        _clean_text(cardinalparts_payload.get("core_charge_product_code", ""))
+        or output["core_charge_product_code"]
+    )
     output["weight"] = _extract_first(r'(?i)(?:weight|wt)\D{0,20}([0-9]{1,3}(?:\.[0-9]{1,3})?)', context)
     output["barcode"] = _extract_heuristic_barcode(html, context)
     output["vendor"] = (
         _clean_text(partstitan_payload.get("vendor", ""))
+        or _clean_text(cardinalparts_payload.get("vendor", ""))
         or _vendor_override_from_page_url(page_url)
         or _extract_meta_content(html, "og:site_name")
         or _infer_vendor_from_title(output.get("title", ""))

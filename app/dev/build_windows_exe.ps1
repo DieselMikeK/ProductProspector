@@ -225,7 +225,7 @@ Pop-Location
 
 $MainExe = Join-Path $AppDevDir "dist\ProductProspector.exe"
 $UpdaterExe = Join-Path $AppDevDir "dist\ProductProspectorUpdater.exe"
-$RuntimeUpdateDir = Join-Path $ProjectRoot "update"
+$RuntimeUpdateDir = Join-Path $ProjectRoot "app\update"
 $RuntimeUpdaterExe = Join-Path $RuntimeUpdateDir "ProductProspectorUpdater.exe"
 
 if (-not (Test-Path $MainExe)) {

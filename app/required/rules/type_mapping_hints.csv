@@ -3,4 +3,7 @@ pattern,category,subtype,google_leaf,enabled,notes
 \b(cat[-\s]*back|turbo[-\s]*back|axle[-\s]*back|exhaust\s+system)\b,Exhaust,Exhaust Kits,Motor Vehicle Exhaust,1,Common exhaust system phrasing
 \b(?:hot\s+street|aggressor|drop[-\s]*in|complete)\s+turbo(?:charger)?\b|\bvgt\s+turbo\b,Turbos & Accessories,Complete Turbos,Motor Vehicle Engine Parts,1,Complete turbo products
 \bturbo(?![-\s]*back)\b|\bturbocharger\b|\bvgt\b|\bwastegate\b,Turbos & Accessories,,Motor Vehicle Engine Parts,1,Turbo category fallback
+\btorque\s+converter(?:s)?\b,Automatic Transmission,Torque Converters,Motor Vehicle Transmission & Drivetrain Parts,1,Direct torque converter products
 \bexhaust\s+brake\b|\bengine\s+brake\b|\bpacbrake\b,Exhaust Brakes / Engine Brakes,,,1,Brake-specific override
+\btie\s+rod\b(?!\s+end)|\bdrag\s+link\b,Suspension & Steering,Tie Rods & Steering Linkage,Motor Vehicle Suspension Parts,1,Steering linkage products
+\bheavy\s+duty\s+steering\s+kit\b|\bcomplete\s+steering\s+upgrade\s+kit\b|\bsteering\s+upgrade\s+kit\b,Suspension & Steering,Tie Rods & Steering Linkage,Motor Vehicle Suspension Parts,1,Steering kit products

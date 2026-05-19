@@ -4071,7 +4071,7 @@
     "product_url_template": "",
     "product_extraction_priority": "jsonld>embedded_state>dom",
     "media_strategy": "gallery_scope_only",
-    "notes": "PARKED: search.asp JS-rendered; search_quick.asp API works but name/description-based only; EXP1 SKU codes do not map to their product name index. | PARKED: search.asp is JS-rendered (HTTP returns empty results). search_quick.asp AJAX API works with cookie sessions but indexes by product name only \u2014 EXP1 SKU codes (FORDSD-17-FB-PC etc.) do not match their product name index. Category pages statically render _p_ URLs. Needs custom name-based search term derivation from SKU segments."
+    "notes": "PARKED: search.asp JS-rendered; search_quick.asp API works but name/description-based only; EXP1 SKU codes do not map to their product name index. | PARKED: search.asp is JS-rendered (HTTP returns empty results). search_quick.asp AJAX API works with cookie sessions but indexes by product name only — EXP1 SKU codes (FORDSD-17-FB-PC etc.) do not match their product name index. Category pages statically render _p_ URLs. Needs custom name-based search term derivation from SKU segments."
   },
   {
     "vendor": "Factor 55",
@@ -7095,7 +7095,7 @@
     "product_url_template": "",
     "product_extraction_priority": "jsonld>embedded_state>dom",
     "media_strategy": "gallery_scope_only",
-    "notes": "Searchspring site_id=k5zzdj added to engine registry. drop_first_dash_token strips NX- prefix. Results on nitrousexpress.com. Search page bot-challenge bypassed via Searchspring API. | Searchspring site_id=k5zzdj registered in engine. drop_first_dash_token strips NX- prefix (NX-20421 -> 20421 matches bgfilter.sku exactly). Numeric NX SKUs resolve via Searchspring. NXD-prefix diesel SKUs break bgfilter.ss_sku \u2014 avoid as test samples."
+    "notes": "Searchspring site_id=k5zzdj added to engine registry. drop_first_dash_token strips NX- prefix. Results on nitrousexpress.com. Search page bot-challenge bypassed via Searchspring API. | Searchspring site_id=k5zzdj registered in engine. drop_first_dash_token strips NX- prefix (NX-20421 -> 20421 matches bgfilter.sku exactly). Numeric NX SKUs resolve via Searchspring. NXD-prefix diesel SKUs break bgfilter.ss_sku — avoid as test samples."
   },
   {
     "vendor": "No Limit Fabrication",
@@ -9405,7 +9405,7 @@
     "product_url_template": "",
     "product_extraction_priority": "jsonld>embedded_state>dom",
     "media_strategy": "gallery_scope_only",
-    "notes": "Searchspring site_id=k5zzdj added to engine registry. drop_first_dash_token strips SP- prefix (SP-430 -> 430). Results point to nitrousexpress.com product pages which are directly accessible. | Searchspring site_id=k5zzdj registered. drop_first_dash_token strips SP- prefix; numeric SKUs (430 325) match bgfilter.sku directly. SP-40016 has SNO- prefix in Searchspring catalog causing ss_sku false positives \u2014 use numeric-only SP SKUs."
+    "notes": "Searchspring site_id=k5zzdj added to engine registry. drop_first_dash_token strips SP- prefix (SP-430 -> 430). Results point to nitrousexpress.com product pages which are directly accessible. | Searchspring site_id=k5zzdj registered. drop_first_dash_token strips SP- prefix; numeric SKUs (430 325) match bgfilter.sku directly. SP-40016 has SNO- prefix in Searchspring catalog causing ss_sku false positives — use numeric-only SP SKUs."
   },
   {
     "vendor": "Snyder Performance Engineering",
@@ -11086,5 +11086,47 @@
     "product_extraction_priority": "jsonld>embedded_state>dom",
     "media_strategy": "gallery_scope_only",
     "notes": ""
+  },
+  {
+    "vendor": "Grizzly",
+    "display_name": "Grizzly Products",
+    "official_website_status": "alternate_source",
+    "official_website_url": "https://cardinalparts.com/",
+    "sample_sku": "GA109",
+    "search_url_template": "https://cardinalparts.com/grizzly-{sku}/",
+    "search_result_mode": "direct_product",
+    "search_transport": "GET",
+    "search_parameter_name": "",
+    "platform_family": "bigcommerce",
+    "search_family": "cardinalparts_grizzly_direct",
+    "search_entry_mode": "direct_product_url_template",
+    "runtime_preference": "http_first",
+    "http_search_allowed": "yes",
+    "browser_required": "no",
+    "blocking_risk": "low",
+    "verification_level": "verified",
+    "template_status": "confirmed",
+    "confidence_bucket": "high",
+    "resolver_hint": "cardinalparts_grizzly_product_path",
+    "product_fetch_mode": "http_first",
+    "interaction_strategy": "",
+    "search_term_strategy": "identity",
+    "search_term_fallbacks": "drop_first_dash_token|drop_cardinal_grizzly_sku_prefix",
+    "direct_url_sufficient": "yes",
+    "search_entry_url": "https://cardinalparts.com/",
+    "search_container_selector": "",
+    "search_input_selector": "",
+    "search_submit_selector": "",
+    "result_container_selector": "",
+    "result_link_selector": "",
+    "result_match_mode": "",
+    "api_request_url_template": "",
+    "api_response_collection": "",
+    "api_result_id_field": "",
+    "api_result_sku_field": "",
+    "product_url_template": "",
+    "product_extraction_priority": "cardinalparts>jsonld>embedded_state>dom",
+    "media_strategy": "gallery_scope_only",
+    "notes": "Alternate Grizzly source for Cardinal Parts pages; keep separate from grizzly.com resolver training."
   }
 ]

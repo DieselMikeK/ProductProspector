@@ -10,7 +10,7 @@ PRODUCT_EXPORT_COLUMNS = [
     "product_url",
     "title",
     "description_html",
-    "media_urls",
+    "description_2",
     "price",
     "map_price",
     "msrp_price",
@@ -29,6 +29,7 @@ PRODUCT_EXPORT_COLUMNS = [
     "mpn",
     "brand",
     "application",
+    "ad_words_spend",
     "collections",
     "tags",
     "metafields",
@@ -90,6 +91,32 @@ def _flatten_list_like_text(value: object) -> str:
     return text
 
 
+def _to_float(value: object) -> float | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", text.replace(",", ""))
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def calculate_ad_words_spend(price: object, cost: object) -> str:
+    price_value = _to_float(price)
+    cost_value = _to_float(cost)
+    if price_value is None or cost_value is None or price_value <= 0:
+        return ""
+    margin = (price_value - cost_value) / price_value
+    if margin <= 0.20:
+        return "c"
+    if margin < 0.30:
+        return "b"
+    return "a"
+
+
 @dataclass
 class Product:
     record_type: str = "Product"
@@ -109,6 +136,7 @@ class Product:
     original_application: str = ""
     title: str = ""
     description_html: str = ""
+    description_2: str = ""
     media_urls: list[str] = field(default_factory=list)
     price: str = ""
     map_price: str = ""
@@ -130,6 +158,7 @@ class Product:
     mpn: str = ""
     brand: str = ""
     application: str = ""
+    ad_words_spend: str = ""
     application_context_title: str = ""
     application_context_description: str = ""
     collections: str = ""
@@ -170,6 +199,9 @@ class Product:
         self.product_subtype = _flatten_list_like_text(self.product_subtype)
         self.mpn = _clean_text(self.mpn) or self.sku
         self.brand = _clean_text(self.brand) or _clean_text(self.vendor)
+        calculated_ad_words_spend = calculate_ad_words_spend(self.price, self.cost)
+        if calculated_ad_words_spend:
+            self.ad_words_spend = calculated_ad_words_spend
 
     def to_row(self) -> dict[str, str]:
         return {
@@ -195,7 +227,7 @@ class Product:
             "product_url": _clean_text(self.product_url),
             "title": _clean_text(self.title),
             "description_html": _clean_text(self.description_html),
-            "media_urls": " | ".join([item for item in self.media_urls if _clean_text(item)]),
+            "description_2": _clean_text(self.description_2),
             "price": _clean_text(self.price),
             "map_price": _clean_text(self.map_price),
             "msrp_price": _clean_text(self.msrp_price),
@@ -214,6 +246,7 @@ class Product:
             "mpn": _clean_text(self.mpn),
             "brand": _clean_text(self.brand),
             "application": _clean_text(self.application),
+            "ad_words_spend": _clean_text(self.ad_words_spend),
             "collections": _clean_text(self.collections),
             "variant_google_mpn": _clean_text(self.variant_google_mpn),
             "variant_enable_low_stock_message": _clean_text(self.variant_enable_low_stock_message),
