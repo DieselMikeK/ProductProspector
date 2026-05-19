@@ -57,6 +57,7 @@ def _effective_update_fields(session: AppSession) -> set[str]:
         "weight",
         "barcode",
         "application",
+        "core_charge_product_code",
         "type",
         "google_product_type",
         "category_code",

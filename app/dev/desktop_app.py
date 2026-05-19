@@ -7061,7 +7061,18 @@ class ProductProspectorDesktopApp:
         return selected
 
     def _requested_scrape_fields(self) -> set[str]:
-        _all_scrapeable = {"title", "description_html", "media_urls", "price", "cost", "vendor", "weight", "barcode", "application"}
+        _all_scrapeable = {
+            "title",
+            "description_html",
+            "media_urls",
+            "price",
+            "cost",
+            "vendor",
+            "weight",
+            "barcode",
+            "application",
+            "core_charge_product_code",
+        }
         if self.session.mode == MODE_UPDATE:
             selected_update = [f for f in (self.session.update_fields or []) if str(f or "").strip()]
             if not selected_update:
@@ -7070,6 +7081,8 @@ class ProductProspectorDesktopApp:
             # Specific fields selected — only scrape the ones that overlap with scrapeable fields
             requested = {f for f in selected_update if f in _all_scrapeable}
             if "core_charge_product_code" in selected_update:
+                requested.add("core_charge_product_code")
+            if requested:
                 requested.add("core_charge_product_code")
             return requested
         # New/Upsert mode — drive from missing_fields as before
@@ -7083,12 +7096,16 @@ class ProductProspectorDesktopApp:
             "weight": "weight",
             "barcode": "barcode",
             "application": "application",
+            "core_charge": "core_charge_product_code",
+            "core_charge_product_code": "core_charge_product_code",
         }
         requested: set[str] = set()
         for field_name in self.session.missing_fields or []:
             mapped = field_map.get(str(field_name or "").strip())
             if mapped:
                 requested.add(mapped)
+        if requested:
+            requested.add("core_charge_product_code")
         return requested
 
     def _effective_update_processing_fields(self) -> set[str]:
@@ -7107,6 +7124,7 @@ class ProductProspectorDesktopApp:
             "weight",
             "barcode",
             "application",
+            "core_charge_product_code",
             "type",
             "google_product_type",
             "category_code",
