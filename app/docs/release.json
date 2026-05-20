@@ -1,0 +1,14 @@
+{
+  "version": "1.0.6",
+  "download_url": "https://github.com/DieselMikeK/ProductProspector/releases/download/v1.0.6/ProductProspector.exe",
+  "sha256": "91e64622884be29f5826fdb8ebc0137b67ad9c1caa4076bd0ccebea005947228",
+  "notes": "Includes core charge scrape field request updates and local handoff artifact ignore cleanup.",
+  "published_at": "05/20/2026 21:19:20",
+  "files": [
+    {
+      "relative_path": "ProductProspector.exe",
+      "download_url": "https://github.com/DieselMikeK/ProductProspector/releases/download/v1.0.6/ProductProspector.exe",
+      "sha256": "91e64622884be29f5826fdb8ebc0137b67ad9c1caa4076bd0ccebea005947228"
+    }
+  ]
+}

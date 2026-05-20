@@ -153,13 +153,15 @@ jobs:
           $manifest = Get-Content -Path "${{ steps.meta.outputs.manifest_file }}" -Raw | ConvertFrom-Json
           $manifest.published_at = "${{ steps.release.outputs.published_at }}"
           $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path 'app\update\release.json' -Encoding UTF8
+          New-Item -ItemType Directory -Force -Path 'app\docs' | Out-Null
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path 'app\docs\release.json' -Encoding UTF8
 
       - name: Commit updated release manifest
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/update/release.json
+          git add app/update/release.json app/docs/release.json
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
               Write-Host "app/update/release.json did not change."
