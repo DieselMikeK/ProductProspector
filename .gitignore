@@ -22,6 +22,9 @@ env/
 build/
 dist/
 *.spec
+app/dev/.policy_test
+app/dev/_handoff_nonessential/
+app/dev/_handoff_temp/
 
 # === Compiled binaries ===
 *.exe
