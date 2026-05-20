@@ -1,4 +1,4 @@
-{
-  "notes": "Updater verification release",
-  "requested_at": "2026-03-26T19:08:38.6146040Z"
+﻿{
+    "notes":  "Includes core charge scrape field request updates and local handoff artifact ignore cleanup.",
+    "requested_at":  "2026-05-20T21:17:14.8965915Z"
 }
