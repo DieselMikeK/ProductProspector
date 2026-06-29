@@ -362,16 +362,17 @@ def build_existing_shopify_index(
         return index
 
     # Determine which product_ids have multiple variants.
-    # Prefer the full catalog when available (targeted fetch may only contain 1 row per product).
+    # Prefer the full catalog when available, but always include the targeted
+    # fetch as a fallback because product-id scopes often contain every variant
+    # for the product even when the cache is stale.
     ref_df = full_catalog_df if (full_catalog_df is not None and not full_catalog_df.empty) else shopify_df
     multi_variant_pids: set[str] = set()
     has_variants_col = "parent_has_variants" in shopify_df.columns
-    if not has_variants_col and "product_id" in ref_df.columns:
-        pid_counts = (
-            ref_df[ref_df["product_id"].astype(str).str.strip() != ""]["product_id"]
-            .value_counts()
-        )
-        multi_variant_pids = set(pid_counts[pid_counts > 1].index.astype(str))
+    for count_df in (ref_df, shopify_df):
+        if count_df is None or count_df.empty or "product_id" not in count_df.columns:
+            continue
+        pid_counts = count_df[count_df["product_id"].astype(str).str.strip() != ""]["product_id"].value_counts()
+        multi_variant_pids.update(pid_counts[pid_counts > 1].index.astype(str))
 
     for _, row in shopify_df.iterrows():
         sku = normalize_sku(row.get("sku", ""))
@@ -382,7 +383,10 @@ def build_existing_shopify_index(
         pid = _clean_text(row.get("product_id", ""))
         vid = _clean_text(row.get("variant_id", ""))
         if has_variants_col:
-            has_variants = _clean_text(row.get("parent_has_variants", "")).lower() in {"yes", "true", "1"}
+            has_variants = (
+                _clean_text(row.get("parent_has_variants", "")).lower() in {"yes", "true", "1"}
+                or (pid in multi_variant_pids if pid else False)
+            )
         else:
             has_variants = pid in multi_variant_pids if pid else False
         index[sku] = {
@@ -405,6 +409,7 @@ def build_existing_shopify_index(
             "product_subtype": _clean_text(row.get("product_subtype", "")),
             "collections": _clean_text(row.get("collections", "")),
             "variant_google_mpn": _clean_text(row.get("variant_google_mpn", "")),
+            "variant_option_summary": _clean_text(row.get("variant_option_summary", "")),
             "variant_weight_value": _clean_text(row.get("variant_weight_value", "")),
             "variant_weight_unit": _clean_text(row.get("variant_weight_unit", "")) or "POUNDS",
             "variant_enable_low_stock_message": "true",
@@ -798,6 +803,8 @@ def build_products_from_session(
             _set_if_present(product, "collections", existing.get("collections", ""), "shopify")
             if existing.get("variant_google_mpn"):
                 product.variant_google_mpn = existing["variant_google_mpn"]
+            if existing.get("variant_option_summary"):
+                product.variant_option_summary = existing["variant_option_summary"]
             if existing.get("variant_weight_value"):
                 product.weight = existing["variant_weight_value"]
             if existing.get("variant_weight_unit"):

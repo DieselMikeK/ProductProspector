@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 from collections import defaultdict
 import ctypes
 from datetime import datetime, timezone
@@ -47,7 +48,7 @@ from product_prospector.core.pricing_rules import (
     load_vendor_discounts,
     resolve_discount_candidates,
 )
-from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS, Product, has_shopify_collective_tag
+from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS, Product, calculate_ad_words_spend, has_shopify_collective_tag
 from product_prospector.core.processing import (
     PlanningConfig,
     RUN_MODE_CREATE,
@@ -71,6 +72,10 @@ from product_prospector.core.shopify_variant_updates import (
     ProductApplicationUpdateSummary,
     ProductCollectionUpdate,
     ProductCollectionUpdateSummary,
+    ProductMediaUpdate,
+    ProductMediaUpdateSummary,
+    ProductMetafieldsUpdate,
+    ProductMetafieldsUpdateSummary,
     VariantSnapshot,
     VariantWeightUpdate,
     add_tag_to_products,
@@ -78,6 +83,8 @@ from product_prospector.core.shopify_variant_updates import (
     fetch_variant_snapshots_by_skus,
     push_product_application_bulk,
     push_product_collections_bulk,
+    push_product_media_bulk,
+    push_product_metafields_bulk,
     push_variant_weights_bulk,
 )
 from product_prospector.core.blog_tagging import (
@@ -97,6 +104,7 @@ from product_prospector.core.workflow_build import (
     merge_mode_label,
     products_to_dataframe,
 )
+from product_prospector.core.years import format_years_compact, parse_years_from_many, replace_years_in_text
 from product_prospector.core.scraper_engine import scrape_direct_product_record, scrape_product_page_images, scrape_vendor_records
 from update_utils import (
     MAIN_EXECUTABLE_NAME,
@@ -199,6 +207,28 @@ def _normalize_url_for_open(value: str) -> str:
     if re.match(r"^https?://", text, flags=re.IGNORECASE):
         return text
     return ""
+
+
+def _looks_like_product_page_url(value: str) -> bool:
+    url = _normalize_url_for_open(value)
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    path = str(parsed.path or "").strip().lower()
+    if not path:
+        return False
+    if re.search(r"(?:^|/)(?:search|collections?|category|brands?)(?:[./_-]|$)", path):
+        return False
+    if re.search(r"/i-\d+-.+\.html$", path):
+        return True
+    if path.endswith((".html", ".htm")):
+        return True
+    if re.search(r"/products?/", path):
+        return True
+    return False
 
 
 def _open_url_in_chrome(url: str) -> bool:
@@ -673,6 +703,7 @@ class ProductProspectorDesktopApp:
         self._duplicate_check_started_at = 0.0
         self.shopify_push_inflight = False
         self.push_selected_skus: set[str] = set()
+        self.variant_selected_keys: set[str] = set()
         self.review_table_row_index_map: dict[str, int] = {}
 
         self._mode_initialized = False
@@ -1940,6 +1971,7 @@ class ProductProspectorDesktopApp:
         products = self.session.products or []
         if not products:
             self.push_selected_skus = set()
+            self.variant_selected_keys = set()
             self.review_table_row_index_map = {}
             _tree_show_dataframe(self.review_table, pd.DataFrame())
             self._refresh_push_button_state()
@@ -1951,13 +1983,35 @@ class ProductProspectorDesktopApp:
             if self._is_push_eligible(product) and self._product_push_key(product)
         }
         self.push_selected_skus = {key for key in self.push_selected_skus if key in available_keys}
+        available_variant_keys = {
+            self._product_make_variant_key(product)
+            for product in products
+            if self._is_make_variant_eligible(product) and self._product_make_variant_key(product)
+        }
+        self.variant_selected_keys = {key for key in self.variant_selected_keys if key in available_variant_keys}
 
         # Keep review grid lightweight to avoid UI lockups on large/long text payloads.
         rows: list[dict[str, str]] = []
         display_pairs = list(enumerate(products[:80]))
+        product_level_only_fields = {
+            "vendor",
+            "type",
+            "google_product_type",
+            "category_code",
+            "product_subtype",
+            "application",
+            "collections",
+            "tags",
+            "brand",
+            "core_charge_product_code",
+        }
+        variant_level_only_fields = {"sku", "price", "cost", "barcode", "weight", "inventory", "mpn"}
         for product_index, product in display_pairs:
             push_key = self._product_push_key(product)
             record_type = str(getattr(product, "record_type", "") or "Product").strip() or "Product"
+            record_type_key = record_type.lower()
+            is_variant_row = record_type_key == "variant"
+            is_variant_parent_row = record_type_key == "product" and bool(getattr(product, "parent_has_variants", False))
             excluded = bool(getattr(product, "excluded", False))
             exclusion_reason = str(getattr(product, "exclusion_reason", "") or "").strip()
             remove_marked = bool(getattr(product, "remove_marked", False))
@@ -1970,10 +2024,10 @@ class ProductProspectorDesktopApp:
                 push_state = "[ ]"
             else:
                 push_state = "[x]" if push_key and push_key in self.push_selected_skus else "[ ]"
-            rows.append(
-                {
+            row_values = {
                     "push": push_state,
                     "remove": "[x]" if remove_marked else "[ ]",
+                    "make_variant": "[x]" if self._product_make_variant_key(product) in self.variant_selected_keys else "[ ]",
                     "record_type": record_type,
                     "sku": str(product.sku or ""),
                     "product_id": str(getattr(product, "product_id", "") or ""),
@@ -1995,7 +2049,15 @@ class ProductProspectorDesktopApp:
                     "scrape_status": str(product.scrape_status or ""),
                     "status": exclusion_reason or remove_reason or search_adjustment_note or "ready",
                 }
-            )
+            if is_variant_row:
+                for field_name in product_level_only_fields:
+                    row_values[field_name] = ""
+            if is_variant_parent_row:
+                for field_name in variant_level_only_fields:
+                    row_values[field_name] = ""
+                row_values["variant_id"] = ""
+                row_values["variant_option_summary"] = ""
+            rows.append(row_values)
         df = pd.DataFrame(rows)
         df = self._apply_update_scope_to_dataframe(df)
         _tree_show_dataframe(self.review_table, df, max_rows=80, max_cell_chars=3000)
@@ -2004,6 +2066,8 @@ class ProductProspectorDesktopApp:
             try:
                 self.review_table.column("push", width=52, minwidth=52, stretch=False)
                 self.review_table.column("remove", width=68, minwidth=68, stretch=False)
+                self.review_table.column("make_variant", width=104, minwidth=98, stretch=False)
+                self.review_table.heading("make_variant", text="make variant")
                 self.review_table.column("record_type", width=92, minwidth=90, stretch=False)
                 self.review_table.column("product_id", width=108, minwidth=98, stretch=False)
                 self.review_table.column("variant_id", width=108, minwidth=98, stretch=False)
@@ -2077,7 +2141,37 @@ class ProductProspectorDesktopApp:
                     return f"parent:{product_gid}"
                 if product_id:
                     return f"parent:{product_id}"
-        return normalize_sku(getattr(product, "sku", ""))
+        sku = normalize_sku(getattr(product, "sku", ""))
+        if sku:
+            return sku
+        if record_type == "product" and bool(getattr(product, "parent_has_variants", False)):
+            title_key = re.sub(r"\s+", " ", str(getattr(product, "title", "") or "").strip().lower())
+            application_key = re.sub(r"\s+", " ", str(getattr(product, "application", "") or "").strip().lower())
+            if title_key:
+                return f"parent-create:{title_key}:{application_key}"
+        return ""
+
+    def _product_make_variant_key(self, product) -> str:
+        if product is None:
+            return ""
+        sku = normalize_sku(getattr(product, "sku", ""))
+        if sku:
+            return f"sku:{sku}"
+        product_id = str(getattr(product, "product_id", "") or "").strip()
+        variant_id = str(getattr(product, "variant_id", "") or "").strip()
+        if product_id or variant_id:
+            return f"id:{product_id}:{variant_id}"
+        title = str(getattr(product, "title", "") or "").strip().lower()
+        return f"title:{title}" if title else ""
+
+    def _is_make_variant_eligible(self, product) -> bool:
+        if product is None:
+            return False
+        if bool(getattr(product, "excluded", False)) or bool(getattr(product, "remove_marked", False)):
+            return False
+        if bool(getattr(product, "parent_has_variants", False)):
+            return False
+        return str(getattr(product, "record_type", "") or "Product").strip().lower() == "product"
 
     def _is_push_eligible(self, product) -> bool:
         if product is None:
@@ -2097,6 +2191,9 @@ class ProductProspectorDesktopApp:
                     or str(getattr(product, "product_id", "") or "").strip()
                 )
             return False
+        record_type = str(getattr(product, "record_type", "") or "").strip().lower()
+        if record_type == "product" and bool(getattr(product, "parent_has_variants", False)):
+            return bool(str(getattr(product, "title", "") or "").strip())
         return bool(normalize_sku(getattr(product, "sku", "")))
 
     @staticmethod
@@ -2177,6 +2274,24 @@ class ProductProspectorDesktopApp:
             self.push_selected_skus = {sku for sku in self.push_selected_skus if sku not in removed_from_push}
         self._refresh_review_table_async()
 
+    def _toggle_review_table_variant_selection(self) -> None:
+        products = self.session.products or []
+        available_keys = {
+            self._product_make_variant_key(product)
+            for product in products
+            if self._is_make_variant_eligible(product) and self._product_make_variant_key(product)
+        }
+        if not available_keys:
+            self.variant_selected_keys = set()
+            self._refresh_review_table_async()
+            return
+        selected = {key for key in self.variant_selected_keys if key in available_keys}
+        if len(selected) == len(available_keys):
+            self.variant_selected_keys = set()
+        else:
+            self.variant_selected_keys = set(available_keys)
+        self._refresh_review_table_async()
+
     def _lock_run_mode(self) -> None:
         self.run_mode_locked.set(True)
         self._refresh_mode_lock_ui()
@@ -2186,6 +2301,7 @@ class ProductProspectorDesktopApp:
         self.session.reset_for_new_run()
         self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
         self.push_selected_skus = set()
+        self.variant_selected_keys = set()
         self.review_table_row_index_map = {}
         self.run_mode.set("")
         self.setup_status_text.set("Run mode unlocked. Choose mode to continue.")
@@ -2259,6 +2375,7 @@ class ProductProspectorDesktopApp:
         _tree_show_dataframe(self.processing_preview, pd.DataFrame())
 
         self.push_selected_skus = set()
+        self.variant_selected_keys = set()
         self.review_table_row_index_map = {}
         self.review_index = 0
         self.review_refresh_pending = False
@@ -2500,9 +2617,10 @@ class ProductProspectorDesktopApp:
         ttk.Button(table_action_row, text="Select All for Push", command=self._select_all_for_push).pack(side=LEFT, padx=(8, 0))
         ttk.Button(table_action_row, text="Clear Push Selection", command=self._clear_push_selection).pack(side=LEFT, padx=(8, 0))
         ttk.Button(table_action_row, text="Remove Marked", command=self._remove_marked_products).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(table_action_row, text="Make Variants", command=self._make_selected_products_variants).pack(side=LEFT, padx=(8, 0))
         ttk.Label(
             table_action_row,
-            text="Click the [x]/[ ] cell in Push or Remove to toggle rows.",
+            text="Click the [x]/[ ] cell in Push, Remove, or Make Variant to toggle rows.",
             foreground="#1f4e79",
         ).pack(side=LEFT, padx=(10, 0))
 
@@ -2683,6 +2801,7 @@ class ProductProspectorDesktopApp:
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=col_offset + 1, sticky="ew", padx=(0, 12), pady=2)
         frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=0)
         frame.columnconfigure(1, weight=0)
         frame.columnconfigure(2, weight=0)
         self.review_variant_weight_entry = ttk.Entry(frame, textvariable=self.review_variant_fields["variant_weight"])
@@ -2918,9 +3037,17 @@ class ProductProspectorDesktopApp:
         entry.bind("<Escape>", self._on_review_collections_entry_escape, add="+")
         entry.bind("<FocusOut>", self._on_review_collections_entry_focus_out, add="+")
         self.review_collections_entry = entry
+        build_button = ttk.Button(
+            frame,
+            text="v",
+            width=2,
+            command=self._build_current_review_collections,
+        )
+        build_button.grid(row=0, column=1, sticky=W, padx=(6, 0))
+        self.review_collections_build_btn = build_button
 
         suggestions_frame = ttk.Frame(frame)
-        suggestions_frame.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        suggestions_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
         suggestions_frame.columnconfigure(0, weight=1)
         suggestions = tk.Listbox(suggestions_frame, height=4, activestyle="none", exportselection=False)
         suggestions.grid(row=0, column=0, sticky="ew")
@@ -2990,6 +3117,26 @@ class ProductProspectorDesktopApp:
         self._refresh_review_collection_chips()
         self.review_collections_query.set("")
         self._hide_review_collections_suggestions()
+
+    def _build_current_review_collections(self) -> None:
+        product_type = self.review_fields["type"].get().strip()
+        application_text = self.review_fields["application"].get().strip()
+        title_text = self.review_fields["title"].get().strip()
+        description_text = self._read_review_field("description_html")
+        targets, warnings = resolve_collection_assignments(
+            product_type=product_type,
+            application_text=application_text,
+            required_root=self.required_root,
+            title_text=title_text,
+            description_text=description_text,
+        )
+        titles = [str(item.get("collection_title", "") or "").strip() for item in targets]
+        titles = [title for title in titles if title]
+        if not titles:
+            self.review_status_text.set(warnings[0] if warnings else "No collections matched application and type.")
+            return
+        self._set_review_collections_from_text(", ".join(titles))
+        self.review_status_text.set(f"Built {len(titles)} collection(s) from application + type.")
 
     def _refresh_review_collection_chips(self) -> None:
         wrap = self.review_collections_tokens_inner
@@ -4029,9 +4176,15 @@ class ProductProspectorDesktopApp:
             messagebox.showerror(APP_TITLE, "Invalid scraper settings. Use numeric values for workers/delay/retries.")
             return False
 
-        direct_product_url_raw = self.scrape_product_url.get().strip()
+        direct_product_url_visible = self._should_show_scrape_product_url_input()
+        direct_product_url_raw = self.scrape_product_url.get().strip() if direct_product_url_visible else ""
         direct_product_url = self._effective_scrape_product_url()
-        if direct_product_url_raw and not direct_product_url:
+        vendor_search_url_raw = self.scrape_search_url.get().strip()
+        vendor_search_url = _normalize_url_for_open(vendor_search_url_raw) or vendor_search_url_raw
+        if not direct_product_url and _looks_like_product_page_url(vendor_search_url):
+            direct_product_url = _normalize_url_for_open(vendor_search_url)
+            vendor_search_url = ""
+        if direct_product_url_visible and direct_product_url_raw and not direct_product_url:
             messagebox.showerror(APP_TITLE, "Direct Product URL must start with http://, https://, or www.")
             return False
         if direct_product_url:
@@ -4044,7 +4197,7 @@ class ProductProspectorDesktopApp:
             messagebox.showwarning(APP_TITLE, cookie_error)
             return False
         self.session.scrape_settings.product_url = direct_product_url
-        self.session.scrape_settings.vendor_search_url = "" if direct_product_url else self.scrape_search_url.get().strip()
+        self.session.scrape_settings.vendor_search_url = "" if direct_product_url else vendor_search_url
         self.session.scrape_settings.cookies = list(scrape_cookies or [])
         self.session.scrape_settings.chrome_workers = workers
         self.session.scrape_settings.delay_seconds = delay
@@ -4061,12 +4214,19 @@ class ProductProspectorDesktopApp:
 
         target_skus = collect_session_skus(self.session)
         if not target_skus:
+            target_product_ids = list(self.session.target_product_ids or [])
+            if self.session.mode == MODE_UPDATE and target_product_ids:
+                self.processing_status_text.set("Loading existing Shopify product + variant data...")
+                return self._start_update_shopify_review_load(
+                    target_skus=[],
+                    target_product_ids=target_product_ids,
+                )
             messagebox.showwarning(APP_TITLE, "No valid SKUs found in the current scope.")
             return False
-        if direct_product_url and (self.session.mode not in {MODE_NEW, MODE_UPDATE} or len(target_skus) != 1):
+        if direct_product_url and self.session.mode not in {MODE_NEW, MODE_UPDATE}:
             messagebox.showwarning(
                 APP_TITLE,
-                "Direct Product URL only works for single-item Create/Update runs with exactly one scoped item.",
+                "Direct Product URL only works for Create/Update runs.",
             )
             return False
 
@@ -4238,8 +4398,6 @@ class ProductProspectorDesktopApp:
                 should_scrape = can_scrape and bool(requested_scrape_fields)
             if should_scrape:
                 if self.session.scrape_settings.product_url:
-                    if len(target_skus) != 1:
-                        raise RuntimeError("Direct Product URL requires exactly one scoped SKU.")
                     direct_sku = normalize_sku(target_skus[0])
                     direct_search_term = normalize_sku((self.session.search_terms_by_sku or {}).get(direct_sku, direct_sku)) or direct_sku
                     direct_payload, direct_error = scrape_direct_product_record(
@@ -4252,9 +4410,30 @@ class ProductProspectorDesktopApp:
                         cookies=self.session.scrape_settings.cookies,
                     )
                     if direct_payload:
-                        scrape_records[direct_sku] = direct_payload
+                        if len(target_skus) == 1:
+                            scrape_records[direct_sku] = direct_payload
+                        else:
+                            shared_payload = dict(direct_payload)
+                            for variant_field in {
+                                "price",
+                                "map_price",
+                                "msrp_price",
+                                "jobber_price",
+                                "cost",
+                                "dealer_cost",
+                                "barcode",
+                                "weight",
+                            }:
+                                shared_payload.pop(variant_field, None)
+                            for target_sku in target_skus:
+                                normalized_target = normalize_sku(target_sku)
+                                if normalized_target:
+                                    scrape_records[normalized_target] = dict(shared_payload)
                     if direct_error:
-                        scrape_sku_errors[direct_sku] = direct_error
+                        for target_sku in target_skus:
+                            normalized_target = normalize_sku(target_sku)
+                            if normalized_target:
+                                scrape_sku_errors[normalized_target] = direct_error
                 else:
                     scrape_records, scrape_sku_errors, scrape_general_errors = scrape_vendor_records(
                         vendor_search_url=self.session.scrape_settings.vendor_search_url,
@@ -4432,6 +4611,7 @@ class ProductProspectorDesktopApp:
             scrape_general_errors = list(result_payload.get("scrape_general_errors") or [])
 
             self.session.products = normalized_products
+            self.variant_selected_keys = set()
             self.push_selected_skus = {
                 self._product_push_key(product)
                 for product in normalized_products
@@ -4776,6 +4956,7 @@ class ProductProspectorDesktopApp:
         total = len(self.session.products)
         if total == 0:
             self.push_selected_skus = set()
+            self.variant_selected_keys = set()
             self.review_table_row_index_map = {}
             self.review_index = 0
             self.review_index_text.set("Product 0 / 0")
@@ -4914,7 +5095,8 @@ class ProductProspectorDesktopApp:
         )
         if hasattr(self, "fitment_vehicles_check"):
             try:
-                self.fitment_vehicles_check.grid() if is_update_parent else self.fitment_vehicles_check.grid_remove()
+                if not is_update_parent:
+                    self.fitment_vehicles_check.grid_remove()
             except Exception:
                 pass
 
@@ -5045,22 +5227,65 @@ class ProductProspectorDesktopApp:
             return
 
         self._save_current_review_product()
-        selected = {normalize_sku(sku) for sku in self.push_selected_skus if normalize_sku(sku)}
-        products = [
-            product
-            for product in list(self.session.products or [])
-            if normalize_sku(getattr(product, "sku", "")) in selected
-            and not bool(getattr(product, "excluded", False))
-            and not bool(getattr(product, "remove_marked", False))
-        ]
+        selected = {str(key or "").strip() for key in self.push_selected_skus if str(key or "").strip()}
+        products: list[Product] = []
+        all_products = list(self.session.products or [])
+        scan_index = 0
+        while scan_index < len(all_products):
+            product = all_products[scan_index]
+            record_type = str(getattr(product, "record_type", "") or "").strip().lower()
+            is_parent_variant_row = record_type == "product" and bool(getattr(product, "parent_has_variants", False))
+            if is_parent_variant_row:
+                parent_selected = self._product_push_key(product) in selected
+                variant_rows: list[Product] = []
+                cursor = scan_index + 1
+                while cursor < len(all_products):
+                    candidate = all_products[cursor]
+                    candidate_type = str(getattr(candidate, "record_type", "") or "").strip().lower()
+                    if candidate_type != "variant":
+                        break
+                    if (
+                        self._product_push_key(candidate) in selected
+                        and not bool(getattr(candidate, "excluded", False))
+                        and not bool(getattr(candidate, "remove_marked", False))
+                    ):
+                        variant_rows.append(candidate)
+                    cursor += 1
+                if (parent_selected or variant_rows) and not bool(getattr(product, "excluded", False)) and not bool(getattr(product, "remove_marked", False)):
+                    products.append(product)
+                    products.extend(variant_rows)
+                scan_index = cursor
+                continue
+            if (
+                self._product_push_key(product) in selected
+                and not bool(getattr(product, "excluded", False))
+                and not bool(getattr(product, "remove_marked", False))
+            ):
+                products.append(product)
+            scan_index += 1
         if not products:
             messagebox.showwarning(APP_TITLE, "No selected rows to push. Check [x] next to at least one product.")
             return
+        create_product_count = 0
+        scan_index = 0
+        while scan_index < len(products):
+            row = products[scan_index]
+            if (
+                str(getattr(row, "record_type", "") or "").strip().lower() == "product"
+                and bool(getattr(row, "parent_has_variants", False))
+            ):
+                create_product_count += 1
+                scan_index += 1
+                while scan_index < len(products) and str(getattr(products[scan_index], "record_type", "") or "").strip().lower() == "variant":
+                    scan_index += 1
+                continue
+            create_product_count += 1
+            scan_index += 1
 
         confirmed = messagebox.askyesno(
             APP_TITLE,
             (
-                f"Create {len(products)} Shopify products as DRAFT?\n\n"
+                f"Create {create_product_count} Shopify product(s) as DRAFT?\n\n"
                 "Safety checks:\n"
                 "- Existing SKUs are skipped.\n"
                 "- No existing products are updated.\n"
@@ -5245,6 +5470,271 @@ class ProductProspectorDesktopApp:
 
         self._run_on_ui_thread(apply)
 
+    @staticmethod
+    def _first_consensus_text(products: list[Product], field_name: str) -> tuple[str, bool]:
+        counts: dict[str, tuple[str, int, int]] = {}
+        for index, product in enumerate(products):
+            value = str(getattr(product, field_name, "") or "").strip()
+            if not value:
+                continue
+            key = re.sub(r"\s+", " ", value).strip().lower()
+            if not key:
+                continue
+            existing_value, count, first_index = counts.get(key, (value, 0, index))
+            counts[key] = (existing_value, count + 1, first_index)
+        if not counts:
+            return "", False
+        ordered = sorted(counts.values(), key=lambda item: (-item[1], item[2]))
+        return ordered[0][0], len(counts) > 1
+
+    @staticmethod
+    def _merge_unique_text_values(values: list[object], separator: str = " | ") -> str:
+        output: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            for part in re.split(r"[|\n]+", text):
+                item = part.strip()
+                key = re.sub(r"\s+", " ", item).strip().lower()
+                if not item or key in seen:
+                    continue
+                seen.add(key)
+                output.append(item)
+        return separator.join(output)
+
+    @staticmethod
+    def _replace_short_year_range_in_text(text: str, years: list[int]) -> str:
+        if not text or not years:
+            return text
+        replacement = format_years_compact(years)
+        if re.search(r"\b(?:19|20|21)\d{2}\b", text):
+            return replace_years_in_text(text, years)
+        if re.search(r"\b\d{2}(?:\.\d)?\s*-\s*\d{2}(?:\.\d)?\b", text):
+            return re.sub(r"\b\d{2}(?:\.\d)?\s*-\s*\d{2}(?:\.\d)?\b", replacement, text, count=1)
+        return replace_years_in_text(text, years)
+
+    @staticmethod
+    def _strip_title_for_variant_option(product: Product) -> str:
+        title = str(getattr(product, "title", "") or "").strip()
+        if not title:
+            return normalize_sku(getattr(product, "sku", "")) or "Variant"
+        vendor = str(getattr(product, "vendor", "") or "").strip()
+        value = title
+        if vendor:
+            value = re.sub(rf"^\s*{re.escape(vendor)}\s+", "", value, flags=re.IGNORECASE)
+        application = str(getattr(product, "application", "") or "").strip()
+        if application:
+            value = re.sub(re.escape(application), "", value, flags=re.IGNORECASE).strip()
+        value = re.sub(r"\b(?:19|20|21)?\d{2}(?:\.\d)?\s*-\s*(?:19|20|21)?\d{2}(?:\.\d)?\b", "", value)
+        value = re.sub(r"\b(?:19|20|21)\d{2}\b", "", value)
+        value = re.sub(r"\s{2,}", " ", value).strip(" -|")
+        return value or title
+
+    @staticmethod
+    def _variant_option_value(product: Product) -> str:
+        summary = str(getattr(product, "variant_option_summary", "") or "").strip()
+        if summary:
+            first = summary.split("|", 1)[0].strip()
+            if ":" in first:
+                return first.split(":", 1)[1].strip() or first
+            return first
+        return ProductProspectorDesktopApp._strip_title_for_variant_option(product)
+
+    def _build_variant_parent_row(self, selected_products: list[Product]) -> tuple[Product, list[str]]:
+        first = selected_products[0]
+        warnings: list[str] = []
+        parent = Product(
+            record_type="Product",
+            parent_has_variants=True,
+            title=str(getattr(first, "title", "") or "").strip(),
+            description_html="",
+            description_2="",
+            inventory=int(self.session.inventory_default or 3000000),
+            vendor="",
+            type="",
+            google_product_type="",
+            category_code="",
+            product_subtype="",
+            application="",
+            collections="",
+            tags=[],
+            brand="",
+            core_charge_product_code="",
+            media_urls=[],
+        )
+        for field_name in ["vendor", "type", "google_product_type", "category_code", "product_subtype", "brand", "core_charge_product_code"]:
+            value, conflicted = self._first_consensus_text(selected_products, field_name)
+            setattr(parent, field_name, value)
+            if conflicted:
+                warnings.append(f"{field_name} had conflicting values; used '{value}'.")
+
+        years = parse_years_from_many(
+            [
+                str(getattr(product, "application", "") or "")
+                + " "
+                + str(getattr(product, "title", "") or "")
+                for product in selected_products
+            ]
+        )
+        application_values = [str(getattr(product, "application", "") or "").strip() for product in selected_products]
+        first_application = next((item for item in application_values if item), "")
+        application_keys_without_years = {
+            re.sub(r"\b(?:19|20|21)?\d{2}(?:\.\d)?\s*-\s*(?:19|20|21)?\d{2}(?:\.\d)?\b", "", item).strip().lower()
+            for item in application_values
+            if item
+        }
+        application_keys_without_years.discard("")
+        if first_application and years and len(application_keys_without_years) <= 1:
+            parent.application = self._replace_short_year_range_in_text(first_application, years)
+        else:
+            parent.application = self._merge_unique_text_values(application_values)
+
+        if years:
+            parent.title = self._replace_short_year_range_in_text(parent.title, years)
+        if parent.vendor and parent.title and not parent.title.lower().startswith(parent.vendor.lower()):
+            parent.title = f"{parent.vendor} {parent.title}".strip()
+
+        parent.collections = self._merge_unique_text_values([getattr(product, "collections", "") for product in selected_products], separator=", ")
+        if not parent.collections and parent.type and parent.application:
+            targets, _collection_warnings = resolve_collection_assignments(
+                product_type=parent.type,
+                application_text=parent.application,
+                required_root=self.required_root,
+                title_text=parent.title,
+                description_text="",
+            )
+            parent.collections = ", ".join(
+                str(item.get("collection_title", "") or "").strip()
+                for item in targets
+                if str(item.get("collection_title", "") or "").strip()
+            )
+
+        tag_values: list[str] = []
+        seen_tags: set[str] = set()
+        for product in selected_products:
+            for tag in list(getattr(product, "tags", []) or []):
+                tag_text = str(tag or "").strip()
+                key = tag_text.lower()
+                if not tag_text or key in seen_tags:
+                    continue
+                seen_tags.add(key)
+                tag_values.append(tag_text)
+        parent.tags = tag_values
+
+        media_urls: list[str] = []
+        seen_media: set[str] = set()
+        for product in selected_products:
+            for media_url in list(getattr(product, "media_urls", []) or []):
+                text = str(media_url or "").strip()
+                key = text.lower()
+                if not text or key in seen_media:
+                    continue
+                seen_media.add(key)
+                media_urls.append(text)
+        parent.media_urls = media_urls
+        parent.finalize_defaults()
+        return parent, warnings
+
+    def _make_selected_products_variants(self) -> None:
+        products = list(self.session.products or [])
+        if len(products) < 2:
+            messagebox.showwarning(APP_TITLE, "At least two product rows are required to make variants.")
+            return
+        self._save_current_review_product()
+        selected_keys = {key for key in self.variant_selected_keys if key}
+        selected_indexes: list[int] = []
+        if selected_keys:
+            selected_indexes = [
+                index
+                for index, product in enumerate(products)
+                if self._product_make_variant_key(product) in selected_keys and self._is_make_variant_eligible(product)
+            ]
+        else:
+            push_keys = {key for key in self.push_selected_skus if key}
+            selected_indexes = [
+                index
+                for index, product in enumerate(products)
+                if self._product_push_key(product) in push_keys and self._is_make_variant_eligible(product)
+            ]
+        if len(selected_indexes) < 2:
+            messagebox.showwarning(APP_TITLE, "Check at least two rows in Make Variant or Push before pressing Make Variants.")
+            return
+
+        self._show_review_busy_overlay("Making variants...")
+        self.root.after(50, lambda: self._finish_make_selected_products_variants(selected_indexes))
+
+    def _finish_make_selected_products_variants(self, selected_indexes: list[int]) -> None:
+        try:
+            products = list(self.session.products or [])
+            selected_set = set(selected_indexes)
+            selected_products = [products[index] for index in selected_indexes if 0 <= index < len(products)]
+            if len(selected_products) < 2:
+                self.review_status_text.set("Could not make variants: selected rows changed.")
+                return
+
+            parent_row, warnings = self._build_variant_parent_row(selected_products)
+            variant_rows: list[Product] = []
+            option_values_seen: dict[str, int] = {}
+            for product in selected_products:
+                variant = copy.deepcopy(product)
+                variant.record_type = "Variant"
+                variant.parent_has_variants = True
+                variant.product_gid = ""
+                variant.product_id = ""
+                variant.variant_gid = ""
+                variant.variant_id = ""
+                variant.inventory_item_gid = ""
+                variant.inventory_item_id = ""
+                variant.description_html = ""
+                variant.description_2 = ""
+                option_value = self._variant_option_value(variant)
+                option_key = option_value.strip().lower()
+                option_values_seen[option_key] = option_values_seen.get(option_key, 0) + 1
+                if option_values_seen[option_key] > 1:
+                    option_value = f"{option_value} {option_values_seen[option_key]}"
+                variant.variant_option_summary = f"Type: {option_value}"
+                variant.variant_google_mpn = str(getattr(variant, "variant_google_mpn", "") or "").strip() or str(getattr(variant, "mpn", "") or "").strip() or normalize_sku(getattr(variant, "sku", ""))
+                variant.variant_enable_low_stock_message = str(getattr(variant, "variant_enable_low_stock_message", "") or "").strip() or "true"
+                variant.finalize_defaults()
+                variant_rows.append(variant)
+
+            insert_at = min(selected_indexes)
+            merged_rows = [parent_row, *variant_rows]
+            rebuilt: list[Product] = []
+            inserted = False
+            for index, product in enumerate(products):
+                if index in selected_set:
+                    if not inserted and index == insert_at:
+                        rebuilt.extend(merged_rows)
+                        inserted = True
+                    continue
+                rebuilt.append(product)
+            if not inserted:
+                rebuilt.extend(merged_rows)
+
+            self.session.products = rebuilt
+            self.variant_selected_keys = set()
+            self.push_selected_skus = {
+                self._product_push_key(product)
+                for product in merged_rows
+                if self._is_push_eligible(product) and self._product_push_key(product)
+            }
+            self.review_index = insert_at
+            self._load_review_product(self.review_index)
+            self._refresh_review_table_async()
+            suffix = ""
+            if warnings:
+                suffix = f" {warnings[0]}"
+            self.review_status_text.set(f"Made 1 parent product with {len(variant_rows)} variant row(s).{suffix}")
+        except Exception as exc:
+            error_text = str(exc) or exc.__class__.__name__
+            self.review_status_text.set(f"Could not make variants: {error_text}")
+            messagebox.showerror(APP_TITLE, f"Could not make variants:\n{error_text}")
+        finally:
+            self._hide_review_busy_overlay()
+
     def _select_all_for_push(self) -> None:
         products = self.session.products or []
         self.push_selected_skus = {
@@ -5319,6 +5809,9 @@ class ProductProspectorDesktopApp:
             if column_name == "remove":
                 self._toggle_review_table_remove_selection()
                 return "break"
+            if column_name == "make_variant":
+                self._toggle_review_table_variant_selection()
+                return "break"
             return
 
         row_id = tree.identify_row(event.y)
@@ -5350,6 +5843,7 @@ class ProductProspectorDesktopApp:
             product.remove_marked = not bool(getattr(product, "remove_marked", False))
             if bool(getattr(product, "remove_marked", False)):
                 self.push_selected_skus.discard(self._product_push_key(product))
+                self.variant_selected_keys.discard(self._product_make_variant_key(product))
                 reason = str(getattr(product, "remove_reason", "") or "").strip()
                 label = sku_value or str(getattr(product, "record_type", "") or "row")
                 if reason:
@@ -5359,6 +5853,18 @@ class ProductProspectorDesktopApp:
             else:
                 label = sku_value or str(getattr(product, "record_type", "") or "row")
                 self.review_status_text.set(f"Unmarked {label} for removal.")
+            self._refresh_review_table_async()
+            return "break"
+
+        if column_name == "make_variant":
+            variant_key = self._product_make_variant_key(product)
+            if not variant_key or not self._is_make_variant_eligible(product):
+                self.review_status_text.set("Only active product rows can be selected for Make Variants.")
+                return "break"
+            if variant_key in self.variant_selected_keys:
+                self.variant_selected_keys.remove(variant_key)
+            else:
+                self.variant_selected_keys.add(variant_key)
             self._refresh_review_table_async()
             return "break"
 
@@ -6286,6 +6792,18 @@ class ProductProspectorDesktopApp:
         return scope_count
 
     def _should_show_scrape_product_url_input(self) -> bool:
+        if self.session.mode not in {MODE_NEW, MODE_UPDATE}:
+            return False
+        if self.session.mode == MODE_UPDATE:
+            if str(self.scrape_product_url.get() or "").strip():
+                return True
+            product_ids: list[str] = []
+            if self.session.setup_complete and self.session.target_product_ids:
+                product_ids = list(self.session.target_product_ids or [])
+            elif hasattr(self, "product_id_text_widget"):
+                product_ids = self._parse_product_id_text(self.product_id_text_widget.get("1.0", END))
+            if len(product_ids) == 1:
+                return True
         return self._single_direct_scrape_scope_input_count() == 1
 
     def _effective_scrape_product_url(self) -> str:
@@ -6408,6 +6926,8 @@ class ProductProspectorDesktopApp:
         vendor_key = self._canonical_vendor_key(vendor_name) if vendor_name else ""
         known_url = self._known_scrape_search_url_for_vendor(vendor_name)
         current_value = self.scrape_search_url.get().strip()
+        if not force and _looks_like_product_page_url(current_value):
+            return
         current_host = self._search_url_host_key(current_value)
         auto_host = self._search_url_host_key(self._scrape_search_url_auto_value)
         vendor_changed = bool(
@@ -7211,6 +7731,39 @@ class ProductProspectorDesktopApp:
 
     def _apply_review_field_visibility(self) -> None:
         visible_fields = self._effective_update_review_fields()
+        current_product = None
+        if self.session.products and 0 <= self.review_index < len(self.session.products):
+            current_product = self.session.products[self.review_index]
+        current_record_type = str(getattr(current_product, "record_type", "") or "").strip().lower()
+        is_variant_row = current_record_type == "variant"
+        is_variant_parent_row = (
+            current_record_type == "product"
+            and bool(getattr(current_product, "parent_has_variants", False))
+        )
+        product_level_only_fields = {
+            "type",
+            "google_product_type",
+            "category_code",
+            "product_subtype",
+            "application",
+            "collections",
+            "tags",
+            "brand",
+            "core_charge_product_code",
+        }
+        variant_level_only_fields = {
+            "sku",
+            "barcode",
+            "weight",
+            "price",
+            "cost",
+            "map_price",
+            "msrp_price",
+            "jobber_price",
+            "dealer_cost",
+            "inventory",
+            "mpn",
+        }
         ordered_fields = sorted(
             self.review_field_widgets.keys(),
             key=lambda field_name: self.review_field_layouts.get(field_name, (999, 999)),
@@ -7221,6 +7774,10 @@ class ProductProspectorDesktopApp:
             label_widget, value_widget = self.review_field_widgets[field_name]
             original_row, col_offset = self.review_field_layouts.get(field_name, (0, 0))
             show = visible_fields is None or field_name in visible_fields
+            if is_variant_row and field_name in product_level_only_fields:
+                show = False
+            if is_variant_parent_row and field_name in variant_level_only_fields:
+                show = False
             if not show:
                 try:
                     if label_widget.winfo_manager():
@@ -7263,27 +7820,42 @@ class ProductProspectorDesktopApp:
                     if self.review_collections_tokens_label is not None:
                         if not self.review_collections_tokens_label.winfo_manager():
                             self.review_collections_tokens_label.grid()
-                        self.review_collections_tokens_label.grid_configure(row=target_row, column=2)
+                        self.review_collections_tokens_label.grid_configure(row=target_row + 1, column=col_offset)
                 except Exception:
                     pass
                 try:
                     if self.review_collections_tokens_wrap is not None:
                         if not self.review_collections_tokens_wrap.winfo_manager():
                             self.review_collections_tokens_wrap.grid()
-                        self.review_collections_tokens_wrap.grid_configure(row=target_row, column=3)
+                        self.review_collections_tokens_wrap.grid_configure(row=target_row + 1, column=col_offset + 1)
                 except Exception:
                     pass
-                next_row_by_column[2] = max(next_row_by_column.get(2, 0), target_row + 1)
+                next_row_by_column[col_offset] = max(next_row_by_column.get(col_offset, 0), target_row + 2)
 
-            # Keep the fitment checkbox immediately after the application entry
-            if field_name == "application" and hasattr(self, "fitment_vehicles_check"):
-                try:
-                    if self.fitment_vehicles_check.winfo_manager():
-                        fitment_row = next_row_by_column.get(col_offset, target_row + 1)
-                        self.fitment_vehicles_check.grid_configure(row=fitment_row, column=col_offset, columnspan=2)
-                        next_row_by_column[col_offset] = fitment_row + 1
-                except Exception:
-                    pass
+        if hasattr(self, "fitment_vehicles_check"):
+            try:
+                show_fitment = (
+                    self.session.mode == MODE_UPDATE
+                    and current_record_type == "product"
+                    and bool(
+                        str(getattr(current_product, "product_gid", "") or "").strip()
+                        or str(getattr(current_product, "product_id", "") or "").strip()
+                    )
+                    and not is_variant_row
+                )
+                if show_fitment:
+                    fitment_row = max(next_row_by_column.get(2, 0), 0)
+                    self.fitment_vehicles_check.grid(
+                        row=fitment_row,
+                        column=3,
+                        sticky=W,
+                        padx=(0, 0),
+                        pady=(4, 0),
+                    )
+                else:
+                    self.fitment_vehicles_check.grid_remove()
+            except Exception:
+                pass
 
     def _update_tab_access(self) -> None:
         if not hasattr(self, "notebook"):
@@ -7424,7 +7996,7 @@ class ProductProspectorDesktopApp:
         has_update_product_ids = self.session.mode == MODE_UPDATE and bool(pasted_product_ids)
         if not target_skus and has_update_product_ids and not skip_to_review and self._product_id_resolved_skus:
             target_skus = list(self._product_id_resolved_skus)
-        if not target_skus and not (skip_to_review and has_update_product_ids):
+        if not target_skus and not has_update_product_ids:
             if show_messages:
                 if self.session.mode == MODE_UPDATE and (raw_pasted_skus or raw_pasted_mpns):
                     messagebox.showwarning(
@@ -7586,6 +8158,16 @@ class ProductProspectorDesktopApp:
         )
         self.review_status_text.set("")
         self._update_tab_access()
+        target_skus = collect_session_skus(self.session)
+        target_product_ids = list(self.session.target_product_ids or [])
+        if self.session.mode == MODE_UPDATE and not target_skus and target_product_ids:
+            self.setup_status_text.set("Setup saved. Loading Shopify product IDs into Review...")
+            self.notebook.select(1)
+            self._start_update_shopify_review_load(
+                target_skus=[],
+                target_product_ids=target_product_ids,
+            )
+            return
         if self.session.missing_fields:
             self.setup_status_text.set("Setup saved. Missing fields found; continue in Processing to scrape.")
             self.notebook.select(1)
@@ -7659,6 +8241,36 @@ class ProductProspectorDesktopApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _start_update_shopify_review_load(
+        self,
+        target_skus: list[str],
+        target_product_ids: list[str],
+    ) -> bool:
+        if not target_skus and not target_product_ids:
+            messagebox.showwarning(APP_TITLE, "Provide SKUs and/or Product IDs before loading review data.")
+            return False
+
+        self._processing_request_id += 1
+        request_id = self._processing_request_id
+        self._set_processing_busy(True)
+        self.review_tab_unlocked = False
+        self._update_tab_access()
+        self.processing_status_text.set("Loading existing Shopify product + variant data...")
+        self.review_status_text.set("Loading Shopify products into Review...")
+        self._show_review_busy_overlay("Loading Shopify products and variants...")
+
+        worker = threading.Thread(
+            target=self._run_skip_to_review_worker,
+            kwargs={
+                "request_id": request_id,
+                "target_skus": target_skus,
+                "target_product_ids": target_product_ids,
+            },
+            daemon=True,
+        )
+        worker.start()
+        return True
+
     def _skip_to_review_from_setup(self) -> None:
         if self.processing_inflight or self.shopify_push_inflight:
             return
@@ -7697,28 +8309,31 @@ class ProductProspectorDesktopApp:
             messagebox.showwarning(APP_TITLE, "Provide SKUs and/or Product IDs before skipping to review.")
             return
 
-        self._processing_request_id += 1
-        request_id = self._processing_request_id
-        self._set_processing_busy(True)
-        self.review_tab_unlocked = False
-        self._update_tab_access()
-        self.processing_status_text.set("Loading existing Shopify product + variant data...")
-        self.review_status_text.set("Loading Shopify products into Review...")
-        self._show_review_busy_overlay("Loading Shopify products and variants...")
-
-        worker = threading.Thread(
-            target=self._run_skip_to_review_worker,
-            kwargs={
-                "request_id": request_id,
-                "target_skus": target_skus,
-                "target_product_ids": target_product_ids,
-            },
-            daemon=True,
+        self._start_update_shopify_review_load(
+            target_skus=target_skus,
+            target_product_ids=target_product_ids,
         )
-        worker.start()
 
     def _inject_workflow_parent_rows(self, products: list[Product]) -> list[Product]:
-        """Insert an excluded parent row above each variant (or group) that belongs to a multi-variant product."""
+        """Insert a product-level parent row above each multi-variant product's variant rows."""
+        product_id_counts: dict[str, int] = defaultdict(int)
+        for p in products:
+            pid = str(getattr(p, "product_id", "") or "").strip()
+            variant_id = str(getattr(p, "variant_id", "") or "").strip()
+            if pid and variant_id:
+                product_id_counts[pid] += 1
+
+        for p in products:
+            record_type = str(getattr(p, "record_type", "") or "").strip().lower()
+            pid = str(getattr(p, "product_id", "") or "").strip()
+            variant_id = str(getattr(p, "variant_id", "") or "").strip()
+            if not pid or not variant_id:
+                continue
+            if bool(getattr(p, "parent_has_variants", False)) or product_id_counts.get(pid, 0) > 1:
+                p.parent_has_variants = True
+                if record_type != "variant":
+                    p.record_type = "Variant"
+
         needs_parent_pids: set[str] = set()
         for p in products:
             if str(getattr(p, "record_type", "") or "").strip().lower() == "variant":
@@ -7739,8 +8354,6 @@ class ProductProspectorDesktopApp:
                 parent_row = Product(
                     record_type="Product",
                     parent_has_variants=True,
-                    excluded=True,
-                    exclusion_reason="Parent row is for reference. Push variant rows.",
                     title=str(getattr(p, "title", "") or "").strip(),
                     description_html=str(getattr(p, "description_html", "") or "").strip(),
                     vendor=str(getattr(p, "vendor", "") or "").strip(),
@@ -7750,9 +8363,23 @@ class ProductProspectorDesktopApp:
                     product_subtype=str(getattr(p, "product_subtype", "") or "").strip(),
                     application=str(getattr(p, "application", "") or "").strip(),
                     collections=str(getattr(p, "collections", "") or "").strip(),
+                    tags=list(getattr(p, "tags", []) or []),
+                    brand=str(getattr(p, "brand", "") or "").strip(),
+                    core_charge_product_code=str(getattr(p, "core_charge_product_code", "") or "").strip(),
+                    product_url=str(getattr(p, "product_url", "") or "").strip(),
+                    media_urls=list(getattr(p, "media_urls", []) or []),
+                    product_gid=str(getattr(p, "product_gid", "") or "").strip(),
                     product_id=pid,
+                    original_application=str(getattr(p, "original_application", "") or getattr(p, "application", "") or "").strip(),
+                    shopify_collective_locked=bool(getattr(p, "shopify_collective_locked", False)),
                 )
                 parent_row.finalize_defaults()
+                parent_ad_spend = calculate_ad_words_spend(
+                    getattr(p, "price", ""),
+                    getattr(p, "cost", ""),
+                )
+                if parent_ad_spend:
+                    parent_row.ad_words_spend = parent_ad_spend
                 result.append(parent_row)
             result.append(p)
         return result
@@ -7783,8 +8410,13 @@ class ProductProspectorDesktopApp:
         weight_updates: list[VariantWeightUpdate] = []
         app_updates: list[ProductApplicationUpdate] = []
         collection_updates: list[ProductCollectionUpdate] = []
+        metafields_updates: list[ProductMetafieldsUpdate] = []
+        media_updates: list[ProductMediaUpdate] = []
         skipped_unchanged = 0
         skipped_invalid = 0
+        update_scope = self._effective_update_processing_fields()
+        should_push_product_metafields = True
+        should_push_images = not update_scope or "media_urls" in update_scope
 
         for row in selected_rows:
             record_type = str(getattr(row, "record_type", "") or "").strip().lower()
@@ -7823,6 +8455,46 @@ class ProductProspectorDesktopApp:
                     )
                     queued_any = True
 
+                if should_push_product_metafields:
+                    metadata_update = ProductMetafieldsUpdate(
+                        product_id=product_id,
+                        product_gid=product_gid,
+                        product_type=str(getattr(row, "type", "") or "").strip(),
+                        google_product_type=str(getattr(row, "google_product_type", "") or "").strip(),
+                        category_code=str(getattr(row, "category_code", "") or "").strip(),
+                        product_subtype=str(getattr(row, "product_subtype", "") or "").strip(),
+                        ad_words_spend=str(getattr(row, "ad_words_spend", "") or "").strip().lower(),
+                        core_charge_product_code=str(getattr(row, "core_charge_product_code", "") or "").strip(),
+                    )
+                    if any(
+                        [
+                            metadata_update.google_product_type,
+                            metadata_update.category_code,
+                            metadata_update.product_subtype,
+                            metadata_update.product_type,
+                            metadata_update.ad_words_spend,
+                            metadata_update.core_charge_product_code,
+                        ]
+                    ):
+                        metafields_updates.append(metadata_update)
+                        queued_any = True
+
+                if should_push_images:
+                    media_values = [
+                        str(value or "").strip()
+                        for value in list(getattr(row, "media_urls", []) or [])
+                        if str(value or "").strip()
+                    ]
+                    if media_values:
+                        media_updates.append(
+                            ProductMediaUpdate(
+                                product_id=product_id,
+                                product_gid=product_gid,
+                                media_values=media_values,
+                            )
+                        )
+                        queued_any = True
+
                 if not queued_any:
                     if application:
                         skipped_unchanged += 1
@@ -7854,7 +8526,7 @@ class ProductProspectorDesktopApp:
                 )
             )
 
-        if not weight_updates and not app_updates and not collection_updates:
+        if not weight_updates and not app_updates and not collection_updates and not metafields_updates and not media_updates:
             details = []
             if skipped_unchanged:
                 details.append(f"unchanged: {skipped_unchanged}")
@@ -7871,6 +8543,10 @@ class ProductProspectorDesktopApp:
             confirm_lines.append(f"Application metafield updates: {len(app_updates)}")
         if collection_updates:
             confirm_lines.append(f"Collection updates: {len(collection_updates)}")
+        if metafields_updates:
+            confirm_lines.append(f"Product metafield updates: {len(metafields_updates)}")
+        if media_updates:
+            confirm_lines.append(f"Product image uploads: {len(media_updates)} product(s)")
         if skipped_unchanged:
             confirm_lines.append(f"Skipped unchanged: {skipped_unchanged}")
         if skipped_invalid:
@@ -7895,7 +8571,7 @@ class ProductProspectorDesktopApp:
             return
 
         self._set_shopify_push_busy(True)
-        total_ops = len(weight_updates) + len(app_updates) + len(collection_updates)
+        total_ops = len(weight_updates) + len(app_updates) + len(collection_updates) + len(metafields_updates) + len(media_updates)
         self.review_busy_text.set(f"Pushing updates... 0/{total_ops}")
         self._show_review_busy_overlay(f"Pushing updates... 0/{total_ops}")
         self.review_status_text.set(f"Pushing {total_ops} update(s) to Shopify...")
@@ -7909,6 +8585,8 @@ class ProductProspectorDesktopApp:
                 "updates": weight_updates,
                 "app_updates": app_updates,
                 "collection_updates": collection_updates,
+                "metafields_updates": metafields_updates,
+                "media_updates": media_updates,
                 "required_root": self.required_root,
                 "operator_tag": operator_tag,
             },
@@ -7923,12 +8601,16 @@ class ProductProspectorDesktopApp:
         updates: list[VariantWeightUpdate],
         app_updates: list[ProductApplicationUpdate] | None = None,
         collection_updates: list[ProductCollectionUpdate] | None = None,
+        metafields_updates: list[ProductMetafieldsUpdate] | None = None,
+        media_updates: list[ProductMediaUpdate] | None = None,
         required_root=None,
         operator_tag: str = "",
     ) -> None:
         summary = None
         app_summary: ProductApplicationUpdateSummary | None = None
         collection_summary: ProductCollectionUpdateSummary | None = None
+        metafields_summary: ProductMetafieldsUpdateSummary | None = None
+        media_summary: ProductMediaUpdateSummary | None = None
         tag_summary = None
         error_text: str | None = None
         tag_error_text: str | None = None
@@ -7966,6 +8648,36 @@ class ProductProspectorDesktopApp:
                     progress_callback=on_collection_progress,
                 )
 
+            if metafields_updates:
+                def on_metafields_progress(done: int, total: int, product_gid: str) -> None:
+                    short_id = str(product_gid or "").strip().rsplit("/", 1)[-1]
+                    label = f"Updating product metafields... {done}/{total}"
+                    if short_id:
+                        label += f" | {short_id}"
+                    self._run_on_ui_thread(self.review_busy_text.set, label)
+
+                metafields_summary = push_product_metafields_bulk(
+                    config=config,
+                    access_token=access_token,
+                    updates=metafields_updates,
+                    progress_callback=on_metafields_progress,
+                )
+
+            if media_updates:
+                def on_media_progress(done: int, total: int, product_gid: str) -> None:
+                    short_id = str(product_gid or "").strip().rsplit("/", 1)[-1]
+                    label = f"Uploading product images... {done}/{total}"
+                    if short_id:
+                        label += f" | {short_id}"
+                    self._run_on_ui_thread(self.review_busy_text.set, label)
+
+                media_summary = push_product_media_bulk(
+                    config=config,
+                    access_token=access_token,
+                    updates=media_updates,
+                    progress_callback=on_media_progress,
+                )
+
             if updates:
                 def on_progress(done: int, total: int, variant_gid: str) -> None:
                     short_id = str(variant_gid or "").strip().rsplit("/", 1)[-1]
@@ -7994,6 +8706,16 @@ class ProductProspectorDesktopApp:
                         clean = str(gid or "").strip()
                         if clean:
                             tag_product_gids.add(clean)
+                if metafields_summary is not None:
+                    for gid in metafields_summary.updated_product_ids:
+                        clean = str(gid or "").strip()
+                        if clean:
+                            tag_product_gids.add(clean)
+                if media_summary is not None:
+                    for gid in media_summary.updated_product_ids:
+                        clean = str(gid or "").strip()
+                        if clean:
+                            tag_product_gids.add(clean)
                 if summary is not None:
                     updated_variant_ids = {str(item or "").strip() for item in summary.updated_variant_ids if str(item or "").strip()}
                     for item in (updates or []):
@@ -8018,7 +8740,7 @@ class ProductProspectorDesktopApp:
                         progress_callback=on_tag_progress,
                     )
         except Exception as exc:
-            if summary is None and app_summary is None and collection_summary is None:
+            if summary is None and app_summary is None and collection_summary is None and metafields_summary is None and media_summary is None:
                 error_text = str(exc)
             else:
                 tag_error_text = str(exc)
@@ -8068,6 +8790,36 @@ class ProductProspectorDesktopApp:
                 if collection_summary.warnings:
                     details.append("Collection warnings:")
                     for warning in collection_summary.warnings[:5]:
+                        details.append(f"  - {warning}")
+
+            # Product metafield updates
+            if metafields_summary is not None:
+                metafields_updated_count = len(metafields_summary.updated_product_ids)
+                metafields_failed_count = len(metafields_summary.failed_by_product_id)
+                details.append(f"Product metafields updated: {metafields_updated_count}, failed: {metafields_failed_count}")
+                if metafields_summary.failed_by_product_id:
+                    details.append("Product metafield failures:")
+                    for gid, reason in list(metafields_summary.failed_by_product_id.items())[:5]:
+                        short_id = str(gid or "").strip().rsplit("/", 1)[-1]
+                        details.append(f"  - {short_id}: {reason}")
+                if metafields_summary.warnings:
+                    details.append("Product metafield warnings:")
+                    for warning in metafields_summary.warnings[:5]:
+                        details.append(f"  - {warning}")
+
+            # Product image uploads
+            if media_summary is not None:
+                media_updated_count = len(media_summary.updated_product_ids)
+                media_failed_count = len(media_summary.failed_by_product_id)
+                details.append(f"Product image uploads: {media_updated_count}, failed: {media_failed_count}")
+                if media_summary.failed_by_product_id:
+                    details.append("Image upload failures:")
+                    for gid, reason in list(media_summary.failed_by_product_id.items())[:5]:
+                        short_id = str(gid or "").strip().rsplit("/", 1)[-1]
+                        details.append(f"  - {short_id}: {reason}")
+                if media_summary.warnings:
+                    details.append("Image upload notes:")
+                    for warning in media_summary.warnings[:5]:
                         details.append(f"  - {warning}")
 
             # Weight updates
@@ -8182,6 +8934,12 @@ class ProductProspectorDesktopApp:
                 shopify_collective_locked=collective_locked,
             )
             parent_row.finalize_defaults()
+            parent_ad_spend = calculate_ad_words_spend(
+                str(lead.variant_price or "").strip(),
+                str(lead.inventory_item_cost or "").strip(),
+            )
+            if parent_ad_spend:
+                parent_row.ad_words_spend = parent_ad_spend
             rows.append(parent_row)
 
             for snapshot in group_sorted:

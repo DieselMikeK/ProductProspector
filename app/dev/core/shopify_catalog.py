@@ -56,6 +56,10 @@ query Catalog($cursor: String, $search: String, $sortKey: ProductSortKeys, $reve
               id
               sku
               barcode
+              selectedOptions {
+                name
+                value
+              }
               mpnMetafield: metafield(namespace: "mm-google-shopping", key: "mpn") {
                 value
               }
@@ -94,6 +98,10 @@ query VariantsBySku($cursor: String, $search: String!) {
         id
         sku
         barcode
+        selectedOptions {
+          name
+          value
+        }
         mpnMetafield: metafield(namespace: "mm-google-shopping", key: "mpn") {
           value
         }
@@ -154,6 +162,20 @@ def _extract_numeric_id(value: object) -> str:
         if tail.isdigit():
             return tail
     return ""
+
+
+def _selected_options_summary(values: list[dict]) -> str:
+    parts: list[str] = []
+    for item in values or []:
+        name = _clean_optional_text((item or {}).get("name", ""))
+        value = _clean_optional_text((item or {}).get("value", ""))
+        if not name and not value:
+            continue
+        if name and value:
+            parts.append(f"{name}: {value}")
+        else:
+            parts.append(name or value)
+    return " | ".join(parts)
 
 
 def _request_graphql(config: ShopifyConfig, access_token: str, query: str, variables: dict) -> tuple[dict | None, str | None]:
@@ -262,6 +284,7 @@ def fetch_shopify_catalog_dataframe(
                 variant_weight_value = _clean_optional_text(weight_block.get("value", ""))
                 variant_weight_unit = _clean_optional_text(weight_block.get("unit", "")) or "POUNDS"
                 variant_google_mpn = _clean_optional_text(((variant.get("mpnMetafield") or {}).get("value", "")))
+                variant_option_summary = _selected_options_summary(variant.get("selectedOptions") or [])
                 row = {
                     "sku": sku,
                     "product_id": _extract_numeric_id(node.get("id", "")),
@@ -279,6 +302,7 @@ def fetch_shopify_catalog_dataframe(
                     "product_subtype": product_subtype,
                     "collections": collections,
                     "variant_google_mpn": variant_google_mpn,
+                    "variant_option_summary": variant_option_summary,
                     "variant_weight_value": variant_weight_value,
                     "variant_weight_unit": variant_weight_unit,
                     "variant_enable_low_stock_message": "true",
@@ -310,7 +334,7 @@ def fetch_shopify_catalog_dataframe(
 
     if not rows:
         return pd.DataFrame(
-            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
+            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
         ), None
 
     df = pd.DataFrame(rows)
@@ -347,7 +371,7 @@ def fetch_shopify_catalog_for_skus(
     normalized_skus = [_normalize_sku(sku) for sku in skus if _normalize_sku(sku)]
     if not normalized_skus:
         return pd.DataFrame(
-            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode"]
+            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
         ), None
 
     rows: list[dict[str, str]] = []
@@ -395,6 +419,7 @@ def fetch_shopify_catalog_for_skus(
                 variant_weight_value = _clean_optional_text(weight_block.get("value", ""))
                 variant_weight_unit = _clean_optional_text(weight_block.get("unit", "")) or "POUNDS"
                 variant_google_mpn = _clean_optional_text(((node.get("mpnMetafield") or {}).get("value", "")))
+                variant_option_summary = _selected_options_summary(node.get("selectedOptions") or [])
                 rows.append(
                     {
                         "sku": sku,
@@ -413,6 +438,7 @@ def fetch_shopify_catalog_for_skus(
                         "product_subtype": product_subtype,
                         "collections": collections,
                         "variant_google_mpn": variant_google_mpn,
+                        "variant_option_summary": variant_option_summary,
                         "variant_weight_value": variant_weight_value,
                         "variant_weight_unit": variant_weight_unit,
                         "variant_enable_low_stock_message": "true",
@@ -428,7 +454,7 @@ def fetch_shopify_catalog_for_skus(
 
     if not rows:
         return pd.DataFrame(
-            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
+            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
         ), None
 
     df = pd.DataFrame(rows)

@@ -20,6 +20,10 @@ TOKEN_STOP_WORDS = {
     "truck",
 }
 
+TRAINING_HINT_MIN_SUPPORT = 10
+TRAINING_HINT_MIN_PRECISION = 0.90
+TRAINING_HINT_MIN_CONFIDENCE = 0.75
+
 WEAK_MATCH_TOKENS = {
     "engine",
     "motor",
@@ -380,20 +384,97 @@ def _load_explicit_hints_from_path(path: Path) -> list[ExplicitHint]:
     return hints
 
 
+def _load_training_hints_from_path(path: Path) -> list[ExplicitHint]:
+    table = _read_raw_table(path)
+    if table.empty:
+        return []
+
+    header_values = [_clean_text(value).lower() for value in table.iloc[0].tolist()]
+    if "pattern" not in header_values or "category" not in header_values:
+        return []
+    normalized_columns = [value.replace(" ", "_") if value else "" for value in header_values]
+    table = table.iloc[1:].copy()
+    table.columns = normalized_columns
+
+    def _value(row: pd.Series, keys: list[str]) -> str:
+        for key in keys:
+            if key in row.index:
+                return _clean_text(row.get(key, ""))
+        return ""
+
+    def _float_value(row: pd.Series, key: str) -> float:
+        text = _clean_text(row.get(key, ""))
+        if not text:
+            return 0.0
+        try:
+            return float(text)
+        except Exception:
+            return 0.0
+
+    def _int_value(row: pd.Series, key: str) -> int:
+        text = _clean_text(row.get(key, ""))
+        if not text:
+            return 0
+        try:
+            return int(float(text))
+        except Exception:
+            return 0
+
+    hints: list[ExplicitHint] = []
+    for _, row in table.iterrows():
+        support = _int_value(row, "support_products")
+        precision = _float_value(row, "precision")
+        confidence = _float_value(row, "confidence")
+        vendor_count = _int_value(row, "vendor_count")
+        if support < TRAINING_HINT_MIN_SUPPORT:
+            continue
+        if precision < TRAINING_HINT_MIN_PRECISION:
+            continue
+        if confidence < TRAINING_HINT_MIN_CONFIDENCE:
+            continue
+        # Permit very high-support same-vendor clusters, but otherwise require
+        # at least two vendors so one vendor's naming style does not dominate.
+        if vendor_count < 2 and support < 20:
+            continue
+        pattern = _value(row, ["pattern"])
+        category = _value(row, ["category", "type"])
+        subtype = _value(row, ["subtype", "product_subtype"])
+        google_leaf = _value(row, ["google_leaf", "google_product_type"])
+        if not pattern or not category:
+            continue
+        hints.append(
+            ExplicitHint(
+                pattern=pattern,
+                category=category,
+                subtype=subtype,
+                google_leaf=google_leaf,
+            )
+        )
+    return hints
+
+
 def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
     candidate_groups = [
-        [
-            rules_root / "type_mapping_custom_hints.csv",
-            rules_root / "type_mapping_custom_hints.xlsx",
-        ],
-        [
-            rules_root / "type_mapping_hints.csv",
-            rules_root / "type_mapping_hints.xlsx",
-        ],
+        ("explicit", [rules_root / "type_mapping_custom_hints.csv", rules_root / "type_mapping_custom_hints.xlsx"]),
+        (
+            "training",
+            [
+                rules_root / "type_mapping_training_candidates_global.csv",
+                rules_root / "type_mapping_training_candidates_global.xlsx",
+            ],
+        ),
+        (
+            "training",
+            [
+                rules_root / "type_mapping_training_candidates.csv",
+                rules_root / "type_mapping_training_candidates.xlsx",
+            ],
+        ),
+        ("explicit", [rules_root / "type_mapping_hints.csv", rules_root / "type_mapping_hints.xlsx"]),
     ]
     merged_hints: list[ExplicitHint] = []
     seen: set[tuple[str, str, str, str]] = set()
-    for group in candidate_groups:
+    for group_kind, group in candidate_groups:
         selected_path: Path | None = None
         for path in group:
             if path.exists():
@@ -401,7 +482,8 @@ def _load_explicit_hints(rules_root: Path) -> list[ExplicitHint]:
                 break
         if selected_path is None:
             continue
-        for hint in _load_explicit_hints_from_path(selected_path):
+        loader = _load_training_hints_from_path if group_kind == "training" else _load_explicit_hints_from_path
+        for hint in loader(selected_path):
             key = (hint.pattern, hint.category, hint.subtype, hint.google_leaf)
             if key in seen:
                 continue

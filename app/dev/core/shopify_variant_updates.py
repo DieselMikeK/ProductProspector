@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import base64
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from product_prospector.core.config_store import ShopifyConfig
 from product_prospector.core.processing import normalize_sku
@@ -254,6 +256,7 @@ def _parse_variant_snapshot(node: dict, product_node: dict) -> VariantSnapshot:
     product_app = _clean_text(((product_node or {}).get("metafield") or {}).get("value", ""))
     variant_gid = _clean_text((node or {}).get("id", ""))
     inventory_item = (node or {}).get("inventoryItem") or {}
+    unit_cost = _clean_text(((inventory_item.get("unitCost") or {}).get("amount", "")))
     measurement = inventory_item.get("measurement") or {}
     weight = measurement.get("weight") or {}
     selected_options = (node or {}).get("selectedOptions") or []
@@ -287,7 +290,7 @@ def _parse_variant_snapshot(node: dict, product_node: dict) -> VariantSnapshot:
         variant_enable_low_stock_message=variant_low_stock,
         inventory_item_gid=_clean_text(inventory_item.get("id", "")),
         inventory_item_id=_extract_numeric_id(inventory_item.get("id", "")),
-        inventory_item_cost=_clean_text(inventory_item.get("cost", "")),
+        inventory_item_cost=unit_cost or _clean_text(inventory_item.get("cost", "")),
         variant_weight_value=_weight_value_text(weight.get("value", "")),
         variant_weight_unit=_normalize_weight_unit(weight.get("unit", "")),
     )
@@ -348,6 +351,9 @@ query ProductsByIds($ids: [ID!]!) {
               id
               tracked
               requiresShipping
+              unitCost {
+                amount
+              }
               measurement {
                 weight {
                   value
@@ -395,6 +401,9 @@ query VariantsBySku($cursor: String, $search: String!) {
           id
           tracked
           requiresShipping
+          unitCost {
+            amount
+          }
           measurement {
             weight {
               value
@@ -880,6 +889,41 @@ class ProductCollectionUpdateSummary:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ProductMetafieldsUpdate:
+    product_id: str
+    product_gid: str
+    product_type: str = ""
+    google_product_type: str = ""
+    category_code: str = ""
+    product_subtype: str = ""
+    ad_words_spend: str = ""
+    core_charge_product_code: str = ""
+
+
+@dataclass
+class ProductMetafieldsUpdateSummary:
+    requested: int = 0
+    updated_product_ids: list[str] = field(default_factory=list)
+    failed_by_product_id: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProductMediaUpdate:
+    product_id: str
+    product_gid: str
+    media_values: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProductMediaUpdateSummary:
+    requested: int = 0
+    updated_product_ids: list[str] = field(default_factory=list)
+    failed_by_product_id: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
 def _push_metafield(
     config: ShopifyConfig,
     access_token: str,
@@ -911,6 +955,220 @@ def _push_metafield(
         },
     )
     return error
+
+
+def _split_multi_value(value: object) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item or "") for item in value]
+    else:
+        raw_items = re.split(r"[|,\n]+", _clean_text(value))
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = _clean_text(item)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(text)
+    return output
+
+
+def _prepare_local_or_remote_image_payload(value: str) -> tuple[dict | None, str | None]:
+    text = _clean_text(value)
+    if not text:
+        return None, "empty image value"
+    if re.match(r"^https?://", text, flags=re.IGNORECASE):
+        return {"image": {"src": text}}, None
+
+    path = Path(text)
+    if not path.exists() or not path.is_file():
+        return None, f"image file not found: {text}"
+    try:
+        body = path.read_bytes()
+    except Exception as exc:
+        return None, str(exc)
+    if not body:
+        return None, "empty image file"
+    return {
+        "image": {
+            "attachment": base64.b64encode(body).decode("ascii"),
+            "filename": path.name,
+        }
+    }, None
+
+
+def _upload_product_image_value(
+    config: ShopifyConfig,
+    access_token: str,
+    product_numeric_id: str,
+    media_value: str,
+) -> str | None:
+    payload, payload_error = _prepare_local_or_remote_image_payload(media_value)
+    if payload_error or payload is None:
+        return payload_error or "invalid image payload"
+    _, error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="POST",
+        path=f"/products/{product_numeric_id}/images.json",
+        payload=payload,
+    )
+    return error
+
+
+def _update_product_type(
+    config: ShopifyConfig,
+    access_token: str,
+    product_numeric_id: str,
+    product_type: str,
+) -> str | None:
+    value = _clean_text(product_type)
+    if not value:
+        return None
+    _, error = _request_rest_json(
+        config=config,
+        access_token=access_token,
+        method="PUT",
+        path=f"/products/{product_numeric_id}.json",
+        payload={"product": {"id": int(product_numeric_id), "product_type": value}},
+    )
+    return error
+
+
+def push_product_metafields_bulk(
+    config: ShopifyConfig,
+    access_token: str,
+    updates: list[ProductMetafieldsUpdate],
+    progress_callback=None,
+) -> ProductMetafieldsUpdateSummary:
+    summary = ProductMetafieldsUpdateSummary(requested=len(updates))
+    if not updates:
+        return summary
+
+    metafield_specs = [
+        ("custom", "google_product_type", "google_product_type", "single_line_text_field"),
+        ("custom", "category_codes_4", "category_code", "list.single_line_text_field"),
+        ("custom", "product_subtype", "product_subtype", "single_line_text_field"),
+        ("custom", "ad_words_spend", "ad_words_spend", "single_line_text_field"),
+        ("custom", "core_charge_product_code", "core_charge_product_code", "single_line_text_field"),
+    ]
+
+    total = len(updates)
+    for index, item in enumerate(updates, start=1):
+        product_key = item.product_gid or item.product_id
+        product_numeric_id = _extract_numeric_id(item.product_id or item.product_gid)
+        if not product_numeric_id:
+            summary.failed_by_product_id[product_key] = "Missing product ID."
+            continue
+
+        updated_any = False
+        errors: list[str] = []
+        product_type_error = _update_product_type(
+            config=config,
+            access_token=access_token,
+            product_numeric_id=product_numeric_id,
+            product_type=item.product_type,
+        )
+        if product_type_error:
+            errors.append(f"product_type: {product_type_error}")
+        elif _clean_text(item.product_type):
+            updated_any = True
+
+        for namespace, key, attr_name, metafield_type in metafield_specs:
+            value = _clean_text(getattr(item, attr_name, ""))
+            if not value:
+                continue
+            error = _push_metafield(
+                config=config,
+                access_token=access_token,
+                product_numeric_id=product_numeric_id,
+                namespace=namespace,
+                key=key,
+                value=value,
+                metafield_type=metafield_type,
+            )
+            if error:
+                errors.append(f"{namespace}.{key}: {error}")
+            else:
+                updated_any = True
+
+        if updated_any:
+            summary.updated_product_ids.append(product_key)
+        if errors:
+            message = "; ".join(errors)
+            if updated_any:
+                summary.warnings.append(f"{product_key}: {message}")
+            else:
+                summary.failed_by_product_id[product_key] = message
+        if not updated_any and not errors:
+            summary.warnings.append(f"{product_key}: no product metafield values provided")
+
+        if progress_callback is not None:
+            try:
+                progress_callback(index, total, product_key)
+            except Exception:
+                pass
+
+    return summary
+
+
+def push_product_media_bulk(
+    config: ShopifyConfig,
+    access_token: str,
+    updates: list[ProductMediaUpdate],
+    progress_callback=None,
+) -> ProductMediaUpdateSummary:
+    summary = ProductMediaUpdateSummary(requested=len(updates))
+    if not updates:
+        return summary
+
+    total = len(updates)
+    for index, item in enumerate(updates, start=1):
+        product_key = item.product_gid or item.product_id
+        product_numeric_id = _extract_numeric_id(item.product_id or item.product_gid)
+        if not product_numeric_id:
+            summary.failed_by_product_id[product_key] = "Missing product ID."
+            continue
+
+        media_values = _split_multi_value(item.media_values)
+        if not media_values:
+            summary.failed_by_product_id[product_key] = "No media values provided."
+            continue
+
+        uploaded = 0
+        errors: list[str] = []
+        for media_value in media_values:
+            error = _upload_product_image_value(
+                config=config,
+                access_token=access_token,
+                product_numeric_id=product_numeric_id,
+                media_value=media_value,
+            )
+            if error:
+                errors.append(error)
+            else:
+                uploaded += 1
+
+        if uploaded:
+            summary.updated_product_ids.append(product_key)
+            summary.warnings.append(f"{product_key}: uploaded {uploaded} image(s)")
+        if errors:
+            message = "; ".join(errors[:5])
+            if uploaded:
+                summary.warnings.append(f"{product_key}: {message}")
+            else:
+                summary.failed_by_product_id[product_key] = message
+
+        if progress_callback is not None:
+            try:
+                progress_callback(index, total, product_key)
+            except Exception:
+                pass
+
+    return summary
 
 
 def push_product_application_bulk(

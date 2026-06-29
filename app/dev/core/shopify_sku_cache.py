@@ -7,7 +7,7 @@ import pandas as pd
 from product_prospector.core.config_store import APP_BASE_DIR
 
 
-CACHE_COLUMNS = ["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
+CACHE_COLUMNS = ["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
 CACHE_PATH = APP_BASE_DIR / "config" / "shopify_sku_cache.csv"
 
 

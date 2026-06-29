@@ -420,6 +420,63 @@ def _post_json(
         return None, f"Invalid JSON response: {exc}"
 
 
+def _post_form_html(
+    url: str,
+    form_data: dict[str, str],
+    *,
+    referer: str = "",
+    timeout: int = 30,
+) -> tuple[str, str, str | None]:
+    data = urllib.parse.urlencode(form_data).encode("utf-8")
+    parsed = urllib.parse.urlparse(url)
+    origin = ""
+    if parsed.scheme and parsed.netloc:
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+    headers = {
+        "User-Agent": _REQUEST_USER_AGENT,
+        "Accept": _REQUEST_ACCEPT,
+        "Accept-Language": _REQUEST_ACCEPT_LANGUAGE,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if origin:
+        headers["Origin"] = origin
+    if referer:
+        headers["Referer"] = referer
+
+    request = urllib.request.Request(url=url, data=data, method="POST", headers=headers)
+    opener = _get_session_opener_for_host(url)
+    try:
+        if opener is not None:
+            with opener.open(request, timeout=timeout) as response:
+                body = response.read()
+                content_encoding = _clean_text(response.headers.get("Content-Encoding", "")).lower()
+                final_url = _clean_text(response.geturl()) or url
+        else:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+                content_encoding = _clean_text(response.headers.get("Content-Encoding", "")).lower()
+                final_url = _clean_text(response.geturl()) or url
+    except urllib.error.HTTPError as exc:
+        response_text = ""
+        try:
+            response_text = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            response_text = ""
+        return url, "", f"HTTP {exc.code}: {response_text[:240] or 'request failed'}"
+    except Exception as exc:
+        return url, "", str(exc)
+
+    if content_encoding == "gzip" or body[:2] == b"\x1f\x8b":
+        try:
+            body = gzip.decompress(body)
+        except Exception:
+            pass
+    text = body.decode("utf-8", errors="ignore")
+    if _looks_like_bot_challenge(text):
+        return final_url, "", "Bot challenge page detected"
+    return final_url, text, None
+
+
 def _is_alliant_parts_search_url(url: str) -> bool:
     parsed = urllib.parse.urlparse(_clean_text(url))
     host = _clean_text(parsed.netloc).lower()
@@ -2525,6 +2582,106 @@ def _is_partstitan_page(page_url: str) -> bool:
     return host in {"partstitan.com", "www.partstitan.com"}
 
 
+def _is_partstitan_cross_search_url(page_url: str) -> bool:
+    if not _is_partstitan_page(page_url):
+        return False
+    path = urllib.parse.urlparse(_clean_text(page_url)).path.lower()
+    return path.endswith("/part_cross.php") or path.endswith("part_cross.php")
+
+
+def _extract_partstitan_search_result_candidates(
+    html: str,
+    page_url: str,
+    sku: str,
+) -> list[tuple[str, int, dict[str, str]]]:
+    if not _is_partstitan_cross_search_url(page_url):
+        return []
+
+    target = _compact_sku(sku)
+    if not target:
+        return []
+
+    scored: dict[str, tuple[int, dict[str, str]]] = {}
+    result_blocks: list[str] = []
+    tbody_match = re.search(
+        r"(?is)<tbody[^>]+class=[\"'][^\"']*searchfilter[^\"']*[\"'][^>]*>(.*?)</tbody>",
+        html,
+    )
+    search_html = tbody_match.group(1) if tbody_match else html
+    for row_match in re.finditer(r"(?is)<tr\b[^>]*>(.*?)</tr>", search_html):
+        row_html = row_match.group(1) or ""
+        row_text = _clean_text(re.sub(r"<[^>]+>", " ", unescape(row_html)))
+        if target and target not in _compact_sku(row_text):
+            continue
+        result_blocks.append(row_html)
+
+    for block in result_blocks:
+        block_text = _clean_text(re.sub(r"<[^>]+>", " ", unescape(block)))
+        for href, anchor_text in _extract_anchor_link_candidates(block, page_url=page_url):
+            if not _same_host_family(href, page_url=page_url):
+                continue
+            low_href = href.lower()
+            low_anchor = anchor_text.lower()
+            if any(token in low_href for token in ["welcome.php", "review_complete.php", "comments.php", "order_", "invoice_"]):
+                continue
+            score = 160
+            if target in _compact_sku(f"{href} {anchor_text} {block_text}"):
+                score += 420
+            if "detail" in low_href or "detail" in low_anchor:
+                score += 180
+            if any(token in low_href for token in ["part", "product", "item"]):
+                score += 80
+            if score < 300:
+                continue
+            seed_payload = _build_partstitan_search_seed_payload(block, page_url=href)
+            seed_payload["search_provider"] = "partstitan_result_row"
+            existing = scored.get(href)
+            if existing is None or score > existing[0]:
+                scored[href] = (score, seed_payload)
+
+    return sorted(
+        [(url, score, payload) for url, (score, payload) in scored.items()],
+        key=lambda entry: (-entry[1], len(entry[0])),
+    )
+
+
+def _build_partstitan_search_seed_payload(row_html: str, page_url: str) -> dict[str, str]:
+    cells = [
+        _clean_text(re.sub(r"<[^>]+>", " ", unescape(cell_match.group(1) or "")))
+        for cell_match in re.finditer(r"(?is)<td\b[^>]*>(.*?)</td>", row_html)
+    ]
+
+    payload: dict[str, str] = {}
+    # PartsTitan result rows are typically: logo, number, description, brand, notes, price.
+    if len(cells) >= 3:
+        description = _clean_text(cells[2])
+        if description:
+            payload["title"] = description
+            payload["description_html"] = description
+    if len(cells) >= 4:
+        vendor = _clean_text(cells[3])
+        if vendor:
+            payload["vendor"] = _pick_preferred_brand_label(vendor)
+    row_text = " | ".join(cells)
+    price = _extract_currency_amount(row_text)
+    if price:
+        payload["price"] = price
+    core = _extract_first(
+        r"(?is)\bcore\s*(?:deposit|charge)?\D{0,40}\$\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))",
+        row_text,
+    )
+    if core:
+        payload["core_charge_product_code"] = _format_core_charge_code_from_amount(core)
+    media_values = [
+        _normalize_media_candidate(match.group(1), page_url=page_url)
+        for match in re.finditer(r"(?is)<img\b[^>]+src=[\"']([^\"']+)[\"']", row_html)
+    ]
+    media_values = [value for value in media_values if value]
+    if media_values:
+        payload["media_urls"] = " | ".join(_normalize_media_values(media_values, page_url=page_url))
+    return payload
+
+
 def _extract_partstitan_info_fields(html: str) -> dict[str, str]:
     output: dict[str, str] = {}
     for match in re.finditer(
@@ -2542,7 +2699,7 @@ def _extract_partstitan_info_fields(html: str) -> dict[str, str]:
 
 
 def _pick_preferred_brand_label(value: str) -> str:
-    parts = [_clean_text(part) for part in re.split(r"[|/]", _clean_text(value)) if _clean_text(part)]
+    parts = [_clean_text(part) for part in re.split(r"\s+-\s+|[|/]", _clean_text(value)) if _clean_text(part)]
     if not parts:
         return ""
     if len(parts) == 1:
@@ -2802,7 +2959,8 @@ def _from_json_ld(html: str, page_url: str, sku: str) -> dict[str, str]:
         for node in nodes:
             node_sku = normalize_sku(node.get("sku", "") or node.get("mpn", ""))
             node_handle = _extract_product_handle_from_url(_clean_text(node.get("url", "")))
-            if node_sku and node_sku != normalize_sku(sku) and (not page_handle or node_handle != page_handle):
+            target_sku = normalize_sku(sku)
+            if target_sku and node_sku and node_sku != target_sku and (not page_handle or node_handle != page_handle):
                 continue
 
             if not output.get("title"):
@@ -2907,6 +3065,69 @@ def _strip_shopify_size_suffix(path: str) -> str:
     )
 
 
+def _bigcommerce_stencil_size_score(path: str) -> int:
+    match = re.search(r"(?i)/images/stencil/([^/]+)/", path)
+    if not match:
+        return 0
+    token = match.group(1).lower()
+    if token in {"original", "zoom"}:
+        return 700
+
+    size_match = re.fullmatch(r"(\d{2,5})x(\d{2,5})", token)
+    if size_match:
+        try:
+            width = int(size_match.group(1))
+            height = int(size_match.group(2))
+        except Exception:
+            return 0
+        return (min(width * height, 4_000_000) // 10_000) + (min(max(width, height), 5000) // 4)
+
+    width_match = re.fullmatch(r"(\d{2,5})w", token)
+    if width_match:
+        try:
+            return min(int(width_match.group(1)), 5000) // 4
+        except Exception:
+            return 0
+
+    height_match = re.fullmatch(r"(\d{2,5})h", token)
+    if height_match:
+        try:
+            return min(int(height_match.group(1)), 5000) // 4
+        except Exception:
+            return 0
+
+    return 0
+
+
+def _upgrade_bigcommerce_stencil_path(path: str) -> str:
+    match = re.search(r"(?i)(/images/stencil/)([^/]+)(/)", path)
+    if not match:
+        return path
+    token = match.group(2).lower()
+    width = 0
+    height = 0
+
+    size_match = re.fullmatch(r"(\d{2,5})x(\d{2,5})", token)
+    if size_match:
+        try:
+            width = int(size_match.group(1))
+            height = int(size_match.group(2))
+        except Exception:
+            width = height = 0
+    else:
+        width_match = re.fullmatch(r"(\d{2,5})w", token)
+        height_match = re.fullmatch(r"(\d{2,5})h", token)
+        try:
+            width = int(width_match.group(1)) if width_match else 0
+            height = int(height_match.group(1)) if height_match else 0
+        except Exception:
+            width = height = 0
+
+    if max(width, height) and max(width, height) < 1280:
+        return path[: match.start(2)] + "1280x1280" + path[match.end(2) :]
+    return path
+
+
 def _upgrade_image_url(url: str) -> str:
     normalized = _normalize_media_candidate(url, page_url=url)
     if not normalized:
@@ -2914,6 +3135,7 @@ def _upgrade_image_url(url: str) -> str:
     parsed = urllib.parse.urlparse(normalized)
     path = _strip_shopify_size_suffix(parsed.path)
     path = re.sub(r"(?i)^/var/images/product/\d+\.\d+/", "/images/product/", path)
+    path = _upgrade_bigcommerce_stencil_path(path)
 
     keep_pairs: list[tuple[str, str]] = []
     for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
@@ -2928,7 +3150,7 @@ def _upgrade_image_url(url: str) -> str:
                 continue
             keep_pairs.append((key, value))
             continue
-        if lower in {"h", "height", "crop", "fit", "dpr"}:
+        if lower in {"h", "height", "crop", "fit", "dpr", "canvas"}:
             continue
         keep_pairs.append((key, value))
 
@@ -2957,6 +3179,7 @@ def _image_quality_score(url: str) -> int:
             score += min(width * height, 4_000_000) // 10_000
         except Exception:
             pass
+    score += _bigcommerce_stencil_size_score(path)
 
     query_pairs = urllib.parse.parse_qs(urllib.parse.urlparse(value).query)
     width_text = (query_pairs.get("w") or query_pairs.get("width") or [""])[0]
@@ -2989,6 +3212,7 @@ def _image_canonical_key(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     path = _strip_shopify_size_suffix(parsed.path)
     path = re.sub(r"(?i)^/var/images/product/\d+\.\d+/", "/images/product/", path)
+    path = re.sub(r"(?i)(/images/stencil/)[^/]+/", r"\1", path)
     # Normalize common ecommerce image transform tokens so width/quality variants
     # of the same underlying asset collapse to one canonical key.
     path = re.sub(r"(?i)(?:[_-](?:w|width)\d{2,5})", "", path)
@@ -3004,7 +3228,7 @@ def _image_canonical_key(url: str) -> str:
     keep_pairs: list[tuple[str, str]] = []
     for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
         lower = key.lower()
-        if lower in {"w", "width", "h", "height", "crop", "fit", "dpr", "q", "quality", "auto", "format"}:
+        if lower in {"w", "width", "h", "height", "crop", "fit", "dpr", "q", "quality", "auto", "format", "canvas", "optimize"}:
             continue
         keep_pairs.append((key, value))
     query = urllib.parse.urlencode(keep_pairs, doseq=True)
@@ -3678,6 +3902,81 @@ def _extract_product_page_candidates(html: str, page_url: str, sku: str) -> list
 
     ordered = sorted(scored.items(), key=lambda item: (-item[1], first_seen.get(item[0], 10**9), len(item[0])))
     return ordered
+
+
+def _is_afepower_catalog_search_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(_clean_text(url))
+    return _host_matches(url, "afepower.com") and "/catalogsearch/result" in parsed.path.lower()
+
+
+def _extract_first_regex(pattern: str, text: str, flags: int = re.IGNORECASE | re.DOTALL) -> str:
+    match = re.search(pattern, text, flags=flags)
+    return _clean_text(unescape(match.group(1))) if match else ""
+
+
+def _extract_afepower_search_result_payload(
+    html: str,
+    page_url: str,
+    sku: str,
+    scrape_images: bool,
+) -> dict[str, str]:
+    normalized_target = normalize_sku(sku)
+    if not html or not normalized_target:
+        return {}
+
+    blocks = re.split(r'<li\b[^>]*class=["\'][^"\']*\bproduct-item\b[^"\']*["\'][^>]*>', html, flags=re.IGNORECASE)
+    for block in blocks[1:]:
+        sku_text = _strip_html_tags(
+            _extract_first_regex(r'<div\b[^>]*class=["\'][^"\']*\bproduct-item-sku\b[^"\']*["\'][^>]*>(.*?)</div>', block)
+        )
+        if normalize_sku(sku_text) != normalized_target:
+            continue
+
+        product_url = _extract_first_regex(
+            r'<a\b[^>]*class=["\'][^"\']*\bproduct-item-link\b[^"\']*["\'][^>]*href=["\']([^"\']+)["\']',
+            block,
+        ) or _extract_first_regex(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*\bproduct-item-link\b', block)
+        product_url = _normalize_candidate_link(product_url, page_url=page_url)
+        title = _strip_html_tags(
+            _extract_first_regex(r'<a\b[^>]*class=["\'][^"\']*\bproduct-item-link\b[^"\']*["\'][^>]*>(.*?)</a>', block)
+        )
+        application = _strip_html_tags(
+            _extract_first_regex(r'<div\b[^>]*class=["\'][^"\']*\bproduct-item-short-description\b[^"\']*["\'][^>]*>(.*?)</div>', block)
+        )
+        price = _extract_first_regex(
+            r'data-price-type=["\']finalPrice["\'][^>]*data-price-amount=["\']([^"\']+)["\']',
+            block,
+        ) or _extract_first_regex(
+            r'data-price-amount=["\']([^"\']+)["\'][^>]*data-price-type=["\']finalPrice["\']',
+            block,
+        )
+        parsed_price = _parse_price_text(price)
+        if parsed_price is not None:
+            price = f"{parsed_price:.2f}"
+
+        payload: dict[str, str] = {
+            "source_url": product_url or page_url,
+            "search_url": page_url,
+            "vendor": "AFE",
+            "sku": sku_text,
+        }
+        if product_url:
+            payload["product_url"] = product_url
+        if title:
+            payload["title"] = title
+        if application:
+            payload["application"] = application
+            payload["description_html"] = application
+        if price:
+            payload["price"] = price
+
+        image_url = _extract_first_regex(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\']', block)
+        if image_url and scrape_images:
+            normalized_media = _normalize_media_values([image_url], page_url=page_url)
+            if normalized_media:
+                payload["media_urls"] = " | ".join(normalized_media)
+        return payload
+    return {}
 
 
 def _extract_searchspring_site_ids(html: str) -> list[str]:
@@ -4856,6 +5155,7 @@ def _score_image_candidate(url: str) -> int:
         score += 20
     if re.search(r"(?i)(cdn|cloudfront|shopify|bigcommerce|woocommerce)", value):
         score += 8
+    score += _bigcommerce_stencil_size_score(urllib.parse.urlparse(value).path) // 20
     if re.search(r"(?i)(?:^|[/._-])(logo|icon|sprite|favicon|payment|badge|loader|placeholder)(?:$|[/._-])", value):
         score -= 50
     if re.search(r"(?i)(thumbnail|thumb|small)", value):
@@ -4938,6 +5238,24 @@ def _extract_script_gallery_candidates(html: str) -> list[str]:
 
 
 def _extract_gallery_scope_blocks(html: str) -> list[str]:
+    magic_blocks: list[str] = []
+    magic_seen: set[str] = set()
+    for pattern in [
+        r'(?is)<div[^>]+id=["\']MagicToolboxSelectors[^"\']*["\'][^>]*>.*?</div>',
+        r'(?is)<div[^>]+class=["\'][^"\']*MagicToolboxMainContainer[^"\']*["\'][^>]*>.*?</div>',
+    ]:
+        for match in re.finditer(pattern, html):
+            block = _clean_text(match.group(0))
+            if not block:
+                continue
+            key = str(hash(block))
+            if key in magic_seen:
+                continue
+            magic_seen.add(key)
+            magic_blocks.append(block)
+    if magic_blocks:
+        return magic_blocks
+
     xcart_blocks: list[str] = []
     xcart_seen: set[str] = set()
     for match in re.finditer(
@@ -5066,7 +5384,10 @@ def _split_multi_value(raw: str) -> list[str]:
     text = _clean_text(raw)
     if not text:
         return []
-    parts = re.split(r"[|,;\n]+", text)
+    if re.search(r"(?i)(?:https?:)?//", text):
+        parts = re.split(r"[|\n]+|;\s*(?=(?:https?:)?//)", text)
+    else:
+        parts = re.split(r"[|,;\n]+", text)
     return [item.strip() for item in parts if item and item.strip()]
 
 
@@ -5236,22 +5557,29 @@ def _download_images_for_sku(
         except Exception as exc:
             if first_error is None:
                 first_error = str(exc)
-    unique_urls: list[str] = []
-    seen_url_keys: set[str] = set()
-    for url in media_urls:
+    best_by_url_key: dict[str, tuple[int, int, str]] = {}
+    first_index_by_url_key: dict[str, int] = {}
+    for index, url in enumerate(media_urls):
         clean_url = _clean_text(url)
         if not clean_url:
             continue
-        parsed = urllib.parse.urlsplit(clean_url)
-        normalized_path = urllib.parse.unquote(parsed.path).lower()
-        normalized_path = re.sub(r"/images/stencil/[^/]+/", "/images/stencil/", normalized_path)
-        url_key = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{normalized_path}"
-        if url_key in seen_url_keys:
-            continue
-        seen_url_keys.add(url_key)
-        unique_urls.append(clean_url)
-        if len(unique_urls) >= max_images:
-            break
+        candidate_urls = [clean_url]
+        upgraded_url = _upgrade_image_url(clean_url)
+        if upgraded_url and upgraded_url != clean_url:
+            candidate_urls.append(upgraded_url)
+        for candidate_url in candidate_urls:
+            parsed = urllib.parse.urlsplit(candidate_url)
+            normalized_path = urllib.parse.unquote(parsed.path).lower()
+            normalized_path = re.sub(r"/images/stencil/[^/]+/", "/images/stencil/", normalized_path)
+            url_key = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{normalized_path}"
+            quality = _image_quality_score(candidate_url)
+            if url_key not in best_by_url_key or quality > best_by_url_key[url_key][0]:
+                best_by_url_key[url_key] = (quality, index, candidate_url)
+            if url_key not in first_index_by_url_key:
+                first_index_by_url_key[url_key] = index
+
+    ordered_url_keys = sorted(first_index_by_url_key, key=lambda key: first_index_by_url_key[key])
+    unique_urls = [best_by_url_key[key][2] for key in ordered_url_keys[:max_images]]
 
     for url in unique_urls:
         body, content_type, error = _fetch_binary(url)
@@ -5595,6 +5923,9 @@ def _should_probe_search_candidates(
     if _clean_text(direct_product_url):
         return False
 
+    if _is_partstitan_cross_search_url(target_url):
+        return True
+
     if _extract_searchspring_site_ids(search_html):
         return True
 
@@ -5744,6 +6075,36 @@ def _scrape_single_sku(
             search_term=query_value,
         )
         return _finalize_sku_payload_with_images(result_sku, payload, error, sku=sku, scrape_images=scrape_images, image_output_root=image_output_root)
+
+    if _is_afepower_catalog_search_url(target_url):
+        last_error: str | None = None
+        for _attempt in range(max(retry_count + 1, 1)):
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            search_html, error = _fetch_html(target_url, timeout=10)
+            if error:
+                last_error = f"{target_url} ({error})"
+                continue
+            payload = _extract_afepower_search_result_payload(
+                html=search_html,
+                page_url=target_url,
+                sku=query_value,
+                scrape_images=scrape_images,
+            )
+            if payload:
+                if query_value and query_value != sku:
+                    payload.setdefault("search_term", query_value)
+                return _finalize_sku_payload_with_images(
+                    sku,
+                    payload,
+                    None,
+                    sku=sku,
+                    scrape_images=scrape_images,
+                    image_output_root=image_output_root,
+                )
+            last_error = f"{target_url} (exact AFE result not found)"
+            break
+        return sku, {}, last_error or f"{target_url} (exact AFE result not found)"
 
     direct_searchspring_site_ids = _searchspring_site_ids_for_vendor_url(base_url)
     if direct_searchspring_site_ids:
@@ -5980,6 +6341,25 @@ def _scrape_single_sku(
                     if not _b_err and _b_html:
                         search_html = _b_html
 
+        if _is_partstitan_cross_search_url(target_url) and not _extract_partstitan_search_result_candidates(
+            search_html,
+            target_url,
+            query_value,
+        ):
+            parsed_target = urllib.parse.urlparse(target_url)
+            origin = f"{parsed_target.scheme}://{parsed_target.netloc}" if parsed_target.scheme and parsed_target.netloc else target_url
+            post_url = urllib.parse.urljoin(origin, "/php/search.php")
+            posted_url, posted_html, posted_error = _post_form_html(
+                post_url,
+                {"part_number": query_value},
+                referer=target_url,
+            )
+            if posted_html and _extract_partstitan_search_result_candidates(posted_html, posted_url or target_url, query_value):
+                search_html = posted_html
+                target_url = posted_url or target_url
+            elif posted_error:
+                last_error = f"{post_url} ({posted_error})"
+
         resolved_url = target_url
         resolved_html = search_html
         search_payload = _extract_page_payload(search_html, target_url, query_value, scrape_images=scrape_images)
@@ -6004,6 +6384,7 @@ def _scrape_single_sku(
         searchanise_candidates: list[tuple[str, int, dict[str, str]]] = []
         convermax_candidates: list[tuple[str, int, dict[str, str]]] = []
         sunhammer_candidates: list[tuple[str, int, dict[str, str]]] = []
+        partstitan_candidates: list[tuple[str, int, dict[str, str]]] = []
         searchspring_errors: list[str] = []
         searchanise_errors: list[str] = []
         convermax_errors: list[str] = []
@@ -6043,6 +6424,11 @@ def _scrape_single_sku(
                 page_url=target_url,
                 sku=query_value,
             )
+            partstitan_candidates = _extract_partstitan_search_result_candidates(
+                html=search_html,
+                page_url=target_url,
+                sku=query_value,
+            )
             candidates = _extract_product_page_candidates(search_html, page_url=target_url, sku=query_value)
             if resolver_profile is not None:
                 profile_candidates = _extract_profile_result_candidates(
@@ -6063,6 +6449,7 @@ def _scrape_single_sku(
                 + list(searchanise_candidates[:20])
                 + list(convermax_candidates[:20])
                 + list(sunhammer_candidates[:20])
+                + list(partstitan_candidates[:20])
             )
             if provider_candidates:
                 merged_scores: dict[str, int] = {href: score for href, score in candidates}
@@ -6281,7 +6668,7 @@ def _scrape_single_sku(
         title_lower = _clean_text(merged.get("title", "")).lower()
         if (
             resolved_url == target_url
-            and ("/search" in resolved_path or "search results" in title_lower)
+            and ("/search" in resolved_path or "search results" in title_lower or _is_partstitan_cross_search_url(resolved_url))
             and not canonical_product_path
         ):
             detail = _clean_text(merged.get("product_link_error", ""))
@@ -6342,6 +6729,9 @@ def scrape_product_page_images(
     )
 
     media_values = _split_multi_value(_clean_text(payload.get("media_urls", "")))
+    gallery_media = _normalize_media_values(_collect_gallery_image_candidates(html), page_url=url)
+    if gallery_media:
+        media_values = _normalize_media_values(media_values + gallery_media, page_url=url)
     if not media_values:
         return [], "", "No images found on page"
 

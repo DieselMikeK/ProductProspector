@@ -645,11 +645,212 @@ def _build_product_payload(product: Product, vendor_override: str = "", operator
     return payload
 
 
+def _variant_option_value(product: Product) -> str:
+    summary = _clean_text(getattr(product, "variant_option_summary", ""))
+    if summary:
+        first = summary.split("|", 1)[0].strip()
+        if ":" in first:
+            return _clean_text(first.split(":", 1)[1]) or first
+        return first
+    title = _clean_text(getattr(product, "title", ""))
+    sku = normalize_sku(getattr(product, "sku", ""))
+    return title or sku or "Variant"
+
+
+def _build_variant_payload(product: Product, option_value: str = "") -> dict[str, object]:
+    sku = normalize_sku(product.sku)
+    variant: dict[str, object] = {
+        "sku": sku,
+        "barcode": _clean_text(product.barcode),
+        "price": _to_decimal_text(product.price),
+        "inventory_management": "shopify",
+        "inventory_policy": "continue",
+    }
+    option_text = _clean_text(option_value)
+    if option_text:
+        variant["option1"] = option_text
+    weight_lb = _to_weight_lb(product.weight)
+    if weight_lb is not None:
+        variant["weight"] = weight_lb
+        variant["weight_unit"] = "lb"
+    return variant
+
+
+def _dedupe_option_values(variants: list[Product]) -> list[str]:
+    values: list[str] = []
+    counts: dict[str, int] = {}
+    for variant in variants:
+        value = _variant_option_value(variant)
+        key = value.strip().lower()
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] > 1:
+            value = f"{value} {counts[key]}"
+        values.append(value)
+    return values
+
+
+def _build_variant_product_payload(
+    parent: Product,
+    variants: list[Product],
+    vendor_override: str = "",
+    operator_tag: str = "",
+) -> dict:
+    title = _clean_text(parent.title) or _clean_text(variants[0].title) or normalize_sku(variants[0].sku)
+    vendor_value = _clean_text(vendor_override) or _clean_text(parent.vendor)
+    option_values = _dedupe_option_values(variants)
+    payload_variants = [
+        _build_variant_payload(variant, option_value=option_values[index])
+        for index, variant in enumerate(variants)
+    ]
+    payload: dict[str, object] = {
+        "product": {
+            "title": title,
+            "body_html": _clean_text(parent.description_html),
+            "vendor": vendor_value,
+            "product_type": _clean_text(parent.type),
+            "status": "draft",
+            "options": [{"name": "Type", "values": option_values}],
+            "variants": payload_variants,
+        }
+    }
+    tag_values: list[str] = []
+    seen_tags: set[str] = set()
+    for raw_tag in list(getattr(parent, "tags", []) or []):
+        tag = _clean_text(raw_tag)
+        key = tag.lower()
+        if not tag or key in seen_tags:
+            continue
+        seen_tags.add(key)
+        tag_values.append(tag)
+    operator_value = _clean_text(operator_tag)
+    if operator_value and operator_value.lower() not in seen_tags:
+        tag_values.append(operator_value)
+    if tag_values:
+        payload["product"]["tags"] = ", ".join(tag_values)
+    media_urls = _normalize_media_urls(parent.media_urls)
+    if media_urls:
+        payload["product"]["images"] = [{"src": url} for url in media_urls]
+    return payload
+
+
+def _first_nonempty_product_text(products: list[Product], field_name: str) -> str:
+    for product in products:
+        value = _clean_text(getattr(product, field_name, ""))
+        if value:
+            return value
+    return ""
+
+
+def _merge_unique_product_text(products: list[Product], field_name: str, separator: str = " | ") -> str:
+    values: list[str] = []
+    seen: set[str] = set()
+    for product in products:
+        raw_value = _clean_text(getattr(product, field_name, ""))
+        if not raw_value:
+            continue
+        for part in re.split(r"[|\n]+", raw_value):
+            value = _clean_text(part)
+            key = re.sub(r"\s+", " ", value).strip().lower()
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            values.append(value)
+    return separator.join(values)
+
+
+def _build_synthetic_parent_from_variants(variants: list[Product]) -> Product:
+    parent = Product(
+        record_type="Product",
+        parent_has_variants=True,
+        title=_first_nonempty_product_text(variants, "title"),
+        description_html="",
+        description_2="",
+        vendor=_first_nonempty_product_text(variants, "vendor"),
+        type=_first_nonempty_product_text(variants, "type"),
+        google_product_type=_first_nonempty_product_text(variants, "google_product_type"),
+        category_code=_first_nonempty_product_text(variants, "category_code"),
+        product_subtype=_first_nonempty_product_text(variants, "product_subtype"),
+        brand=_first_nonempty_product_text(variants, "brand"),
+        application=_merge_unique_product_text(variants, "application"),
+        collections=_merge_unique_product_text(variants, "collections", separator=", "),
+        core_charge_product_code=_first_nonempty_product_text(variants, "core_charge_product_code"),
+    )
+    tags: list[str] = []
+    seen_tags: set[str] = set()
+    for variant in variants:
+        for raw_tag in list(getattr(variant, "tags", []) or []):
+            tag = _clean_text(raw_tag)
+            key = tag.lower()
+            if not tag or key in seen_tags:
+                continue
+            seen_tags.add(key)
+            tags.append(tag)
+    parent.tags = tags
+
+    media_urls: list[str] = []
+    seen_media: set[str] = set()
+    for variant in variants:
+        for raw_url in list(getattr(variant, "media_urls", []) or []):
+            media_url = _clean_text(raw_url)
+            key = media_url.lower()
+            if not media_url or key in seen_media:
+                continue
+            seen_media.add(key)
+            media_urls.append(media_url)
+    parent.media_urls = media_urls
+    parent.finalize_defaults()
+    return parent
+
+
+def _iter_create_groups(products: list[Product]) -> list[tuple[Product, list[Product]]]:
+    groups: list[tuple[Product, list[Product]]] = []
+    index = 0
+    total = len(products)
+    while index < total:
+        product = products[index]
+        record_type = _clean_text(getattr(product, "record_type", "")).lower()
+        if record_type == "product" and bool(getattr(product, "parent_has_variants", False)):
+            variants: list[Product] = []
+            cursor = index + 1
+            while cursor < total:
+                candidate = products[cursor]
+                candidate_type = _clean_text(getattr(candidate, "record_type", "")).lower()
+                if candidate_type == "variant":
+                    variants.append(candidate)
+                    cursor += 1
+                    continue
+                break
+            if variants:
+                groups.append((product, variants))
+                index = cursor
+                continue
+        if record_type == "variant":
+            variants = [product]
+            cursor = index + 1
+            while cursor < total:
+                candidate = products[cursor]
+                candidate_type = _clean_text(getattr(candidate, "record_type", "")).lower()
+                if candidate_type != "variant":
+                    break
+                variants.append(candidate)
+                cursor += 1
+            if len(variants) > 1:
+                groups.append((_build_synthetic_parent_from_variants(variants), variants))
+                index = cursor
+                continue
+            groups.append((product, variants))
+        else:
+            groups.append((product, [product]))
+        index += 1
+    return groups
+
+
 def _upload_product_image_from_file(
     config: ShopifyConfig,
     access_token: str,
     product_id: int,
     path: Path,
+    variant_ids: list[int] | None = None,
 ) -> str | None:
     try:
         body = path.read_bytes()
@@ -663,6 +864,8 @@ def _upload_product_image_from_file(
             "filename": path.name,
         }
     }
+    if variant_ids:
+        payload["image"]["variant_ids"] = [int(item) for item in variant_ids if item]
     _, error = _request_rest_json(
         config=config,
         access_token=access_token,
@@ -935,19 +1138,30 @@ def push_new_products_as_drafts(
     location_error: str | None = None
     collection_mapping_missing_noted = False
 
-    for index, product in enumerate(products, start=1):
-        sku = normalize_sku(product.sku)
+    create_groups = _iter_create_groups(products)
+    summary.requested = len(create_groups)
+
+    for index, (product, variant_products) in enumerate(create_groups, start=1):
+        is_variant_group = len(variant_products) > 1 or bool(getattr(product, "parent_has_variants", False))
+        variant_skus = [normalize_sku(item.sku) for item in variant_products if normalize_sku(item.sku)]
+        sku = variant_skus[0] if variant_skus else normalize_sku(product.sku)
         if progress_callback is not None:
             try:
-                progress_callback(index - 1, len(products), sku)
+                progress_callback(index - 1, len(create_groups), sku)
             except Exception:
                 pass
 
-        if not sku:
+        if not sku and not variant_skus:
             summary.failed_by_sku[f"row_{index}"] = "Missing SKU."
             continue
-        if sku in existing_norm:
-            summary.skipped_existing_skus.append(sku)
+        existing_variant_skus = [item for item in variant_skus if item in existing_norm]
+        if existing_variant_skus:
+            summary.skipped_existing_skus.extend(existing_variant_skus)
+            if len(existing_variant_skus) == len(variant_skus):
+                continue
+            summary.failed_by_sku[sku or f"row_{index}"] = (
+                "One or more selected variant SKUs already exist in Shopify; grouped product was not created."
+            )
             continue
 
         title = _clean_text(product.title)
@@ -961,22 +1175,55 @@ def push_new_products_as_drafts(
         profile_sku_prefix = _clean_text(vendor_profile.sku_prefix) if vendor_profile is not None else ""
         local_image_files: list[Path] = []
         local_image_candidates: list[str] = []
+        variant_local_images: dict[str, list[Path]] = {}
+        variant_local_candidates: dict[str, list[str]] = {}
         if include_images:
-            local_image_files, local_image_candidates = _collect_local_images_for_sku_candidates(
-                image_root=image_root,
-                sku=sku,
-                sku_prefix_hint=profile_sku_prefix,
-            )
+            if is_variant_group:
+                seen_local_paths: set[str] = set()
+                for variant_product in variant_products:
+                    variant_sku = normalize_sku(variant_product.sku)
+                    files, candidates = _collect_local_images_for_sku_candidates(
+                        image_root=image_root,
+                        sku=variant_sku,
+                        sku_prefix_hint=profile_sku_prefix,
+                    )
+                    variant_local_images[variant_sku] = files
+                    variant_local_candidates[variant_sku] = candidates
+                    for file_path in files:
+                        key = str(file_path.resolve())
+                        if key in seen_local_paths:
+                            continue
+                        seen_local_paths.add(key)
+                        local_image_files.append(file_path)
+                local_image_candidates = [
+                    candidate
+                    for candidates in variant_local_candidates.values()
+                    for candidate in candidates
+                ]
+            else:
+                local_image_files, local_image_candidates = _collect_local_images_for_sku_candidates(
+                    image_root=image_root,
+                    sku=sku,
+                    sku_prefix_hint=profile_sku_prefix,
+                )
         shopify_vendor_value = (
             _clean_text(vendor_profile.shopify_vendor_value) if vendor_profile is not None else ""
         ) or (
             _clean_text(vendor_profile.canonical_vendor) if vendor_profile is not None else ""
         ) or normalized_vendor_value or raw_vendor_value
-        create_payload = _build_product_payload(
-            product,
-            vendor_override=shopify_vendor_value,
-            operator_tag=operator_tag,
-        )
+        if is_variant_group:
+            create_payload = _build_variant_product_payload(
+                product,
+                variant_products,
+                vendor_override=shopify_vendor_value,
+                operator_tag=operator_tag,
+            )
+        else:
+            create_payload = _build_product_payload(
+                product,
+                vendor_override=shopify_vendor_value,
+                operator_tag=operator_tag,
+            )
         if not include_images or local_image_files:
             product_payload = create_payload.get("product") or {}
             if isinstance(product_payload, dict) and "images" in product_payload:
@@ -1004,6 +1251,11 @@ def push_new_products_as_drafts(
         except Exception:
             summary.failed_by_sku[sku] = "Shopify create succeeded but product id was missing."
             continue
+        created_variants_by_sku: dict[str, dict] = {}
+        for created_variant in variants:
+            created_sku = normalize_sku((created_variant or {}).get("sku", ""))
+            if created_sku:
+                created_variants_by_sku[created_sku] = created_variant or {}
 
         manual_collections_text = _clean_text(getattr(product, "collections", ""))
         if manual_collections_text:
@@ -1070,53 +1322,10 @@ def push_new_products_as_drafts(
                 combined = "; ".join(unpublish_errors)
                 summary.warnings.append(f"{sku}: Point of Sale not removed ({combined})")
 
-        variant_id: int | None
-        try:
-            variant_id = int(variant_id_raw)
-        except Exception:
-            variant_id = None
-
-        inventory_item_id: int | None
-        try:
-            inventory_item_id = int(inventory_item_id_raw)
-        except Exception:
-            inventory_item_id = None
-
-        cost_value = _to_decimal_text(product.cost)
-        if inventory_item_id is not None and cost_value:
-            cost_error = _set_variant_cost(
-                config=config,
-                access_token=access_token,
-                inventory_item_id=inventory_item_id,
-                cost_value=cost_value,
-            )
-            if cost_error:
-                summary.warnings.append(f"{sku}: cost not set ({cost_error})")
-
-        if inventory_item_id is not None:
-            if location_id is None and location_error is None:
-                location_id, location_error = _resolve_primary_location_id(config=config, access_token=access_token)
-                if location_error:
-                    summary.warnings.append(f"{sku}: inventory location not resolved ({location_error})")
-            if location_id is not None:
-                # Use review/mapped inventory value; default to 3,000,000 if blank/invalid.
-                inventory_value = _to_int(product.inventory, 3_000_000)
-                inventory_error = _set_inventory_available(
-                    config=config,
-                    access_token=access_token,
-                    location_id=location_id,
-                    inventory_item_id=inventory_item_id,
-                    available=inventory_value,
-                )
-                if inventory_error:
-                    summary.warnings.append(f"{sku}: inventory not set ({inventory_error})")
-
         profile_brand_gid = _clean_text(vendor_profile.brand_gid) if vendor_profile is not None else ""
         profile_brand_name = _clean_text(vendor_profile.brand_name) if vendor_profile is not None else ""
         brand_value = _clean_text(product.brand) or profile_brand_name or normalized_vendor_value or shopify_vendor_value
         brand_gid = profile_brand_gid or resolve_brand_metaobject_gid(brand_value, required_root=required_root)
-        sku_no_prefix = _strip_known_sku_prefix(sku, profile_sku_prefix) or sku
-        google_mpn_value = _strip_known_sku_prefix(_clean_text(product.mpn) or sku, profile_sku_prefix) or sku_no_prefix
         fitment_vehicle_gids, fitment_vehicle_warnings = resolve_fitment_vehicle_metaobject_gids(
             application_text=_clean_text(product.application),
             required_root=required_root,
@@ -1157,13 +1366,64 @@ def push_new_products_as_drafts(
             if metafield_error:
                 summary.warnings.append(f"{sku}: metafield {namespace}.{key} not set ({metafield_error})")
 
-        variant_metafields = [
-            ("mm-google-shopping", "mpn", google_mpn_value, "single_line_text_field"),
-            ("custom", "enable_low_stock_message", low_stock_value, low_stock_type),
-        ]
-        if variant_id is None:
-            summary.warnings.append(f"{sku}: variant metafields not set (missing variant id).")
-        else:
+        for variant_product in variant_products:
+            variant_sku = normalize_sku(variant_product.sku)
+            created_variant = created_variants_by_sku.get(variant_sku)
+            if not created_variant and len(variant_products) == 1:
+                created_variant = first_variant
+            variant_id_raw = (created_variant or {}).get("id")
+            inventory_item_id_raw = (created_variant or {}).get("inventory_item_id")
+            try:
+                variant_id = int(variant_id_raw)
+            except Exception:
+                variant_id = None
+            try:
+                inventory_item_id = int(inventory_item_id_raw)
+            except Exception:
+                inventory_item_id = None
+
+            cost_value = _to_decimal_text(variant_product.cost)
+            if inventory_item_id is not None and cost_value:
+                cost_error = _set_variant_cost(
+                    config=config,
+                    access_token=access_token,
+                    inventory_item_id=inventory_item_id,
+                    cost_value=cost_value,
+                )
+                if cost_error:
+                    summary.warnings.append(f"{variant_sku}: cost not set ({cost_error})")
+
+            if inventory_item_id is not None:
+                if location_id is None and location_error is None:
+                    location_id, location_error = _resolve_primary_location_id(config=config, access_token=access_token)
+                    if location_error:
+                        summary.warnings.append(f"{variant_sku}: inventory location not resolved ({location_error})")
+                if location_id is not None:
+                    inventory_value = _to_int(variant_product.inventory, 3_000_000)
+                    inventory_error = _set_inventory_available(
+                        config=config,
+                        access_token=access_token,
+                        location_id=location_id,
+                        inventory_item_id=inventory_item_id,
+                        available=inventory_value,
+                    )
+                    if inventory_error:
+                        summary.warnings.append(f"{variant_sku}: inventory not set ({inventory_error})")
+
+            sku_no_prefix = _strip_known_sku_prefix(variant_sku, profile_sku_prefix) or variant_sku
+            variant_mpn_source = (
+                _clean_text(getattr(variant_product, "variant_google_mpn", ""))
+                or _clean_text(getattr(variant_product, "mpn", ""))
+                or variant_sku
+            )
+            google_mpn_value = _strip_known_sku_prefix(variant_mpn_source, profile_sku_prefix) or sku_no_prefix
+            variant_metafields = [
+                ("mm-google-shopping", "mpn", google_mpn_value, "single_line_text_field"),
+                ("custom", "enable_low_stock_message", low_stock_value, low_stock_type),
+            ]
+            if variant_id is None:
+                summary.warnings.append(f"{variant_sku}: variant metafields not set (missing variant id).")
+                continue
             for namespace, key, value, metafield_type in variant_metafields:
                 metafield_error = _upsert_variant_metafield(
                     config=config,
@@ -1175,18 +1435,43 @@ def push_new_products_as_drafts(
                     metafield_type=metafield_type,
                 )
                 if metafield_error:
-                    summary.warnings.append(f"{sku}: variant metafield {namespace}.{key} not set ({metafield_error})")
+                    summary.warnings.append(f"{variant_sku}: variant metafield {namespace}.{key} not set ({metafield_error})")
 
         if include_images and local_image_files:
-            for file_path in local_image_files:
-                image_error = _upload_product_image_from_file(
-                    config=config,
-                    access_token=access_token,
-                    product_id=product_id,
-                    path=file_path,
-                )
-                if image_error:
-                    summary.warnings.append(f"{sku}: image {file_path.name} not uploaded ({image_error})")
+            uploaded_paths: set[str] = set()
+            if is_variant_group:
+                for variant_product in variant_products:
+                    variant_sku = normalize_sku(variant_product.sku)
+                    created_variant = created_variants_by_sku.get(variant_sku) or {}
+                    try:
+                        variant_image_id = int(created_variant.get("id"))
+                    except Exception:
+                        variant_image_id = 0
+                    files = variant_local_images.get(variant_sku, [])
+                    for file_index, file_path in enumerate(files):
+                        path_key = str(file_path.resolve())
+                        if path_key in uploaded_paths:
+                            continue
+                        uploaded_paths.add(path_key)
+                        image_error = _upload_product_image_from_file(
+                            config=config,
+                            access_token=access_token,
+                            product_id=product_id,
+                            path=file_path,
+                            variant_ids=[variant_image_id] if file_index == 0 and variant_image_id else None,
+                        )
+                        if image_error:
+                            summary.warnings.append(f"{variant_sku}: image {file_path.name} not uploaded ({image_error})")
+            else:
+                for file_path in local_image_files:
+                    image_error = _upload_product_image_from_file(
+                        config=config,
+                        access_token=access_token,
+                        product_id=product_id,
+                        path=file_path,
+                    )
+                    if image_error:
+                        summary.warnings.append(f"{sku}: image {file_path.name} not uploaded ({image_error})")
         elif include_images:
             media_urls = _normalize_media_urls(product.media_urls)
             if not media_urls:
@@ -1195,15 +1480,19 @@ def push_new_products_as_drafts(
                     f"{sku}: no local images found for candidates [{attempted}] and no media URLs available"
                 )
 
-        summary.created_skus.append(sku)
-        existing_norm.add(sku)
+        created_sku_values = variant_skus or [sku]
+        for created_sku in created_sku_values:
+            if not created_sku:
+                continue
+            summary.created_skus.append(created_sku)
+            existing_norm.add(created_sku)
 
         # Keep write cadence conservative to reduce API burst errors.
         time.sleep(0.12)
 
     if progress_callback is not None:
         try:
-            progress_callback(len(products), len(products), "")
+            progress_callback(len(create_groups), len(create_groups), "")
         except Exception:
             pass
     return summary

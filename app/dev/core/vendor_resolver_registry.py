@@ -158,10 +158,17 @@ def _profile_match_score(profile: VendorResolverProfile, search_url: str) -> int
         template_host
         and candidate_host
         and _same_host_family(candidate_host, template_host)
-        and (template_same_host or template_path_aligned or template_query_aligned)
+        and (
+            candidate_text.lower() == template.lower()
+            or template_path_aligned
+            or template_query_aligned
+            or _is_root_like_path(candidate_path)
+        )
     ):
         matched_host = True
         score += 220
+        if template_same_host:
+            score += 10
         if template_path_aligned:
             score += 70
         if template_query_aligned:
