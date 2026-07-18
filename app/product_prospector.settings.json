@@ -1,8 +1,8 @@
 {
-  "run_mode": "Create New",
+  "run_mode": "Audit",
   "year_policy": "replace",
   "carry_down_sku": false,
   "propose_title_year_update": false,
   "only_rows_with_year_changes": false,
-  "inventory_owner": "Big-Strike Mike Wild"
+  "inventory_owner": "Claim-Stake Cade McQuade"
 }

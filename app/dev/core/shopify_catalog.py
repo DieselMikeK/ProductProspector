@@ -55,6 +55,7 @@ query Catalog($cursor: String, $search: String, $sortKey: ProductSortKeys, $reve
             node {
               id
               sku
+              price
               barcode
               selectedOptions {
                 name
@@ -97,6 +98,7 @@ query VariantsBySku($cursor: String, $search: String!) {
       node {
         id
         sku
+        price
         barcode
         selectedOptions {
           name
@@ -296,6 +298,7 @@ def fetch_shopify_catalog_dataframe(
                     "vendor": vendor,
                     "tags": tags,
                     "cost": unit_cost,
+                    "price": _clean_optional_text(variant.get("price", "")),
                     "barcode": _clean_optional_text(variant.get("barcode", "")),
                     "google_product_type": google_product_type,
                     "category_code": category_code,
@@ -334,7 +337,7 @@ def fetch_shopify_catalog_dataframe(
 
     if not rows:
         return pd.DataFrame(
-            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
+            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "price", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
         ), None
 
     df = pd.DataFrame(rows)
@@ -371,7 +374,7 @@ def fetch_shopify_catalog_for_skus(
     normalized_skus = [_normalize_sku(sku) for sku in skus if _normalize_sku(sku)]
     if not normalized_skus:
         return pd.DataFrame(
-            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
+            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "price", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
         ), None
 
     rows: list[dict[str, str]] = []
@@ -432,6 +435,7 @@ def fetch_shopify_catalog_for_skus(
                         "vendor": vendor,
                         "tags": tags,
                         "cost": unit_cost,
+                        "price": _clean_optional_text(node.get("price", "")),
                         "barcode": _clean_optional_text(node.get("barcode", "")),
                         "google_product_type": google_product_type,
                         "category_code": category_code,
@@ -454,7 +458,7 @@ def fetch_shopify_catalog_for_skus(
 
     if not rows:
         return pd.DataFrame(
-            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
+            columns=["sku", "product_id", "variant_id", "title", "description", "fitment", "product_type", "vendor", "tags", "cost", "price", "barcode", "google_product_type", "category_code", "product_subtype", "collections", "variant_google_mpn", "variant_option_summary", "variant_weight_value", "variant_weight_unit", "variant_enable_low_stock_message"]
         ), None
 
     df = pd.DataFrame(rows)
