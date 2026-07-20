@@ -19,10 +19,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 
 from product_prospector.core.processing import normalize_sku
 from product_prospector.core.vendor_resolver_registry import VendorResolverProfile, resolve_canonical_search_url
+from product_prospector.core.vendor_profiles import resolve_vendor_profile
 
 
 _REQUEST_USER_AGENT = (
@@ -1590,6 +1592,11 @@ def _looks_like_bot_challenge(html: str) -> bool:
         "cf-browser-verification",
         "id=\"challenge-running\"",
         "id=\"challenge-error-text\"",
+        "incapsula incident id",
+        "powered by imperva",
+        "this request was blocked by our security service",
+        "<title>access denied</title>",
+        "<title>request unsuccessful</title>",
     ]
     if any(signal in text for signal in hard_signals):
         return True
@@ -1981,6 +1988,22 @@ def _is_xtreme_diesel_url(url: str) -> bool:
     return _host_matches(url, "xtremediesel.com")
 
 
+def _is_keystone_url(url: str) -> bool:
+    return _host_matches(url, "ekeystone.com")
+
+
+def _is_turn14_url(url: str) -> bool:
+    return _host_matches(url, "turn14.com")
+
+
+def _is_apg_wholesale_url(url: str) -> bool:
+    return _host_matches(url, "apgwholesale.com")
+
+
+def _is_meyer_distributing_url(url: str) -> bool:
+    return _host_matches(url, "online.meyerdistributing.com")
+
+
 def _real_chrome_executable_path() -> str:
     candidates: list[str] = []
     if sys.platform == "darwin":
@@ -2096,13 +2119,48 @@ def _clean_playwright_cookies(cookies: list[dict[str, object]] | None) -> list[d
     if not cookies:
         return []
     allowed_keys = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+    same_site_values = {
+        "lax": "Lax",
+        "strict": "Strict",
+        "none": "None",
+        "no_restriction": "None",
+    }
     cleaned: list[dict[str, object]] = []
     for item in cookies:
         if not isinstance(item, dict):
             continue
-        if not item.get("name") or not item.get("value"):
+        if not item.get("name") or item.get("value") is None:
             continue
-        cleaned.append({key: value for key, value in item.items() if key in allowed_keys})
+        cookie = {key: value for key, value in item.items() if key in allowed_keys}
+
+        # Firefox Cookie-Editor exports the expiry field under the WebExtension
+        # name, while Playwright expects ``expires``.
+        if "expires" not in cookie and item.get("expirationDate") is not None:
+            try:
+                cookie["expires"] = float(item["expirationDate"])
+            except (TypeError, ValueError):
+                pass
+        if "expires" in cookie:
+            try:
+                expires = float(cookie["expires"])
+                # Some Firefox cookie editors export milliseconds even though
+                # Playwright requires Unix seconds.
+                if expires > 50_000_000_000:
+                    expires /= 1000.0
+                if expires <= 0:
+                    cookie.pop("expires", None)
+                else:
+                    cookie["expires"] = expires
+            except (TypeError, ValueError):
+                cookie.pop("expires", None)
+
+        same_site = str(item.get("sameSite", "") or "").strip().lower()
+        if same_site in same_site_values:
+            cookie["sameSite"] = same_site_values[same_site]
+        else:
+            cookie.pop("sameSite", None)
+
+        cleaned.append(cookie)
     return cleaned
 
 
@@ -2439,10 +2497,172 @@ def _fetch_html_with_real_chrome(
     return url, "", [], last_error
 
 
+class _KeystoneFirefoxSession:
+    """Reuse one Playwright Firefox context for a complete Keystone batch."""
+
+    def __init__(self, cookies: "list | None" = None) -> None:
+        self.cookies = cookies
+        self.playwright = None
+        self.browser = None
+        self.context = None
+
+    def _start(self) -> str | None:
+        if self.context is not None:
+            return None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.firefox.launch(headless=True)
+            self.context = self.browser.new_context()
+            clean_cookies = _clean_playwright_cookies(self.cookies)
+            if clean_cookies:
+                self.context.add_cookies(clean_cookies)
+            return None
+        except Exception as exc:
+            self.close()
+            return f"Playwright Firefox unavailable: {exc}"
+
+    def fetch(
+        self,
+        url: str,
+        timeout_ms: int = 12000,
+        settle_ms: int = 1800,
+    ) -> tuple[str, str, list[tuple[str, str]], str | None]:
+        start_error = self._start()
+        if start_error or self.context is None:
+            return url, "", [], start_error or "Playwright Firefox context could not be created."
+
+        page_host = _normalize_host(urllib.parse.urlparse(url).netloc)
+        response_refs: list[object] = []
+        page = None
+        try:
+            page = self.context.new_page()
+
+            def on_response(response: object) -> None:
+                try:
+                    response_url = _clean_text(getattr(response, "url", ""))
+                    response_host = _normalize_host(urllib.parse.urlparse(response_url).netloc)
+                    if page_host and response_host and response_host != page_host:
+                        return
+                    if "/api/catalogsearch/searchproducts" in response_url.lower():
+                        response_refs.append(response)
+                except Exception:
+                    return
+
+            page.on("response", on_response)
+            page.goto(url, wait_until="commit", timeout=timeout_ms)
+            if urllib.parse.urlparse(url).path.lower() == "/search/detail":
+                try:
+                    page.get_by_text("Retail Price:", exact=False).first.wait_for(
+                        state="attached",
+                        timeout=min(3000, timeout_ms),
+                    )
+                except Exception:
+                    # Empty fabricated PIDs return a complete generic Detail
+                    # shell with no product markers. Do not spend the full
+                    # six-second grace period on those pages. If product data
+                    # has begun rendering, retain the second grace period so a
+                    # slow but valid price is not reported as missing.
+                    provisional_html = page.content().lower()
+                    has_product_detail = any(
+                        marker in provisional_html
+                        for marker in (
+                            "manufacturer part #",
+                            "product-detail-header-pricing-amount",
+                            "product-detail-header-title",
+                        )
+                    )
+                    if has_product_detail:
+                        try:
+                            page.get_by_text("Retail Price:", exact=False).first.wait_for(
+                                state="attached",
+                                timeout=min(3000, timeout_ms),
+                            )
+                        except Exception:
+                            page.wait_for_timeout(min(500, settle_ms))
+            else:
+                page.wait_for_timeout(settle_ms)
+
+            final_url = _clean_text(page.url) or url
+            html = page.content()
+            network_bodies: list[tuple[str, str]] = []
+            for response in response_refs[:10]:
+                try:
+                    body_text = _clean_text(response.text())
+                except Exception:
+                    continue
+                if body_text and len(body_text) <= 1_200_000:
+                    network_bodies.append((_clean_text(getattr(response, "url", "")), body_text))
+            if _looks_like_bot_challenge(html):
+                return final_url, "", network_bodies, "Bot challenge page detected"
+            return final_url, html, network_bodies, None
+        except Exception as exc:
+            return url, "", [], str(exc)
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    def reset_context(self) -> str | None:
+        """Start a clean cookie context while keeping the Firefox process warm."""
+        if self.browser is None:
+            return self._start()
+        try:
+            if self.context is not None:
+                self.context.close()
+            self.context = self.browser.new_context()
+            clean_cookies = _clean_playwright_cookies(self.cookies)
+            if clean_cookies:
+                self.context.add_cookies(clean_cookies)
+            return None
+        except Exception as exc:
+            self.close()
+            return f"Playwright Firefox context reset failed: {exc}"
+
+    def close(self) -> None:
+        for value in [self.context, self.browser]:
+            if value is None:
+                continue
+            try:
+                value.close()
+            except Exception:
+                pass
+        if self.playwright is not None:
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+        self.context = None
+        self.browser = None
+        self.playwright = None
+
+
+def _fetch_html_with_real_firefox(
+    url: str,
+    timeout_ms: int = 12000,
+    settle_ms: int = 1800,
+    cookies: "list | None" = None,
+    session: _KeystoneFirefoxSession | None = None,
+) -> tuple[str, str, list[tuple[str, str]], str | None]:
+    """Fetch one Keystone page in real Firefox with a tightly bounded wait."""
+    if session is not None:
+        return session.fetch(url, timeout_ms=timeout_ms, settle_ms=settle_ms)
+    with _BROWSER_DETAIL_SEMAPHORE:
+        owned_session = _KeystoneFirefoxSession(cookies)
+        try:
+            return owned_session.fetch(url, timeout_ms=timeout_ms, settle_ms=settle_ms)
+        finally:
+            owned_session.close()
+
+
 def _should_attempt_xtreme_browser_detail(
     product_url: str,
     payload: dict[str, str],
     requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+    price_verified: bool = False,
 ) -> bool:
     if not _is_xtreme_diesel_url(product_url):
         return False
@@ -2457,6 +2677,13 @@ def _should_attempt_xtreme_browser_detail(
         fields_to_check = set(requested) & {"barcode", "weight", "application", "description_html", "price", "title", "vendor", "type"}
         if not fields_to_check:
             return False
+
+    # Searchspring's generic price is XDP's MAP/street price, not the signed-in
+    # customer purchase price. A price audit is complete only after the labeled
+    # XDP Price has been verified on the product response. Use Chrome only when
+    # the faster authenticated HTTP product fetch could not provide that value.
+    if "price" in fields_to_check and not price_verified:
+        return True
 
     for field_name in fields_to_check:
         value = _clean_text(payload.get(field_name, ""))
@@ -2488,6 +2715,9 @@ def _fetch_xtreme_detail_payload_via_browser(
     )
     dom_payload = _extract_page_payload(html, final_url, sku, scrape_images=scrape_images)
     merged = _merge_seed_payload(network_payload, dom_payload, page_url=final_url)
+    xdp_price = _extract_xtreme_customer_price(html)
+    if xdp_price:
+        merged["price"] = xdp_price
     provider = ""
     if network_payload and dom_payload:
         provider = "chrome_playwright_network_json_plus_dom"
@@ -2533,6 +2763,28 @@ def _extract_currency_amount(text: str) -> str:
     if not value:
         value = _extract_first(r"(?i)\b((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?:\.[0-9]{2}))\s*USD\b", text)
     return _clean_text(value).replace(",", "")
+
+
+def _extract_xtreme_customer_price(html: str) -> str:
+    """Return XDP's customer purchase price, never its MAP/street price."""
+    source = _clean_text(html)
+    if not source:
+        return ""
+
+    amount_pattern = r"([0-9]{1,7}(?:\.[0-9]{1,2})?)"
+    patterns = [
+        rf'(?is)<[^>]+data-hook=["\']product-details__price["\'][^>]*\bcontent=["\']{amount_pattern}["\']',
+        rf'(?is)<[^>]+\bcontent=["\']{amount_pattern}["\'][^>]*data-hook=["\']product-details__price["\']',
+        rf'(?is)<[^>]+id=["\']js-price-value["\'][^>]*\bcontent=["\']{amount_pattern}["\']',
+        rf'(?is)<[^>]+\bcontent=["\']{amount_pattern}["\'][^>]*id=["\']js-price-value["\']',
+        rf'(?is)\bXDP\s*Price\b.{{0,700}}?\$\s*{amount_pattern}',
+    ]
+    for pattern in patterns:
+        value = _extract_first(pattern, source, flags=re.IGNORECASE | re.DOTALL)
+        parsed = _parse_price_text(value)
+        if parsed is not None and parsed > 0:
+            return f"{parsed:.2f}"
+    return ""
 
 
 def _extract_primary_product_price(html: str) -> str:
@@ -3004,6 +3256,89 @@ def _from_json_ld(html: str, page_url: str, sku: str) -> dict[str, str]:
     return output
 
 
+def _from_keystone_detail_html(html: str, page_url: str, sku: str) -> dict[str, str]:
+    """Extract eKeystone's authenticated server-rendered product detail HTML.
+
+    eKeystone does not expose the primary product as JSON-LD or embedded product
+    JSON. The useful product fields are present in the initial HTML response, so
+    this parser intentionally runs before any browser fallback.
+    """
+    parsed_url = urllib.parse.urlparse(_clean_text(page_url))
+    host = _normalize_host(parsed_url.netloc)
+    if not (host == "ekeystone.com" or host.endswith(".ekeystone.com")) or parsed_url.path.lower() != "/search/detail":
+        return {}
+
+    def fragment_text(value: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(value or ""))).strip()
+
+    output: dict[str, str] = {"detail_fetch_provider": "keystone_authenticated_http_dom"}
+    target_sku = normalize_sku(sku)
+
+    title = ""
+    title_patterns = [
+        r'(?is)<[^>]+class=["\'][^"\']*product-detail-header-title[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+        r'(?is)<[^>]+class=["\'][^"\']*product-detail-title[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+        r"(?is)<h1\b[^>]*>(.*?)</h1>",
+        r"(?is)<h2\b[^>]*>(.*?)</h2>",
+    ]
+    for pattern in title_patterns:
+        for match in re.finditer(pattern, html):
+            candidate = fragment_text(match.group(1) or "")
+            if not candidate or len(candidate) > 220:
+                continue
+            if target_sku and not _contains_exact_sku_token(candidate, target_sku):
+                continue
+            title = candidate
+            break
+        if title:
+            break
+    if target_sku and not title:
+        # Never accept a price from an error page or a different product.
+        return {}
+    if title:
+        output["title"] = title
+
+    price_text = _extract_first(
+        r'(?is)<[^>]+class=["\'][^"\']*product-detail-header-pricing-amount[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    price = _extract_currency_amount(fragment_text(price_text))
+    if price:
+        output["price"] = price
+
+    description = ""
+    for pattern in [
+        r'(?is)<[^>]+class=["\'][^"\']*product-detail-header-description[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+        r'(?is)<[^>]+class=["\'][^"\']*product-detail-description[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+    ]:
+        description = fragment_text(_extract_first(pattern, html, flags=re.IGNORECASE | re.DOTALL))
+        if description.lower() in {"description", "product description", "product details"}:
+            description = ""
+        if description:
+            break
+    if description:
+        output["description_html"] = description
+        product_type = _clean_text(description.split(";", 1)[0])
+        if product_type:
+            output["type"] = product_type
+
+    vendor = ""
+    supplier_match = re.search(
+        r'(?is)Supplier\s*:.*?<a\b[^>]*>(.*?)</a>',
+        html,
+    )
+    if supplier_match:
+        vendor = fragment_text(supplier_match.group(1) or "")
+        vendor = re.sub(r"\s*\([A-Z0-9]{2,6}\)\s*$", "", vendor).strip()
+    if not vendor and title and target_sku:
+        vendor = re.sub(re.escape(_clean_text(sku)) + r"\s*$", "", title, flags=re.IGNORECASE).strip(" -")
+    if vendor:
+        output["vendor"] = vendor
+
+    return output
+
+
 def _find_context_near_sku(html: str, sku: str, span: int = 1000) -> str:
     pattern = re.compile(re.escape(sku), flags=re.IGNORECASE)
     match = pattern.search(html)
@@ -3322,6 +3657,68 @@ def _compact_sku(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", normalize_sku(value))
 
 
+def _search_term_fallbacks(
+    sku: str,
+    primary_search_term: str,
+    vendor_name: str = "",
+    required_root: Path | None = None,
+) -> list[str]:
+    """Build a bounded search sequence without weakening exact-result matching."""
+    original = normalize_sku(sku)
+    primary = normalize_sku(primary_search_term) or original
+    prefix = ""
+    profile = resolve_vendor_profile(vendor_name, required_root=required_root)
+    if profile is not None:
+        prefix = normalize_sku(getattr(profile, "sku_prefix", ""))
+
+    output: list[str] = []
+
+    def add(value: object) -> None:
+        text = normalize_sku(value)
+        if text and text not in output:
+            output.append(text)
+
+    def without_prefix(value: str) -> str:
+        text = normalize_sku(value)
+        prefix_text = normalize_sku(prefix)
+        if not text or not prefix_text:
+            return ""
+        match = re.match(rf"^{re.escape(prefix_text)}(?:[-_\s]+)?(.+)$", text, flags=re.IGNORECASE)
+        return normalize_sku(match.group(1)) if match else ""
+
+    # Normal configured term first. If it includes the known vendor prefix,
+    # retry the MPN alone before changing its punctuation.
+    add(primary)
+    add(without_prefix(primary))
+    add(_compact_sku(primary))
+    add(_compact_sku(without_prefix(primary)))
+
+    # The UI may already have removed the prefix. Retain the original full SKU
+    # as a later fallback for sites such as Turn 14 that index the brand prefix.
+    add(original)
+    add(without_prefix(original))
+    add(_compact_sku(original))
+    add(_compact_sku(without_prefix(original)))
+    return output[:8]
+
+
+def _is_search_miss_error(error_text: object) -> bool:
+    text = _clean_text(error_text).lower()
+    if not text:
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "no exact",
+            "not found",
+            "no product data",
+            "no product fields extracted",
+            "exact result not found",
+            "did not contain the exact sku",
+        )
+    )
+
+
 def _contains_compact_sku(text: str, sku: str) -> bool:
     compact_sku = _compact_sku(sku).lower()
     if not compact_sku:
@@ -3330,6 +3727,15 @@ def _contains_compact_sku(text: str, sku: str) -> bool:
     if not compact_text:
         return False
     return compact_sku in compact_text
+
+
+def _contains_exact_sku_token(text: str, sku: str) -> bool:
+    """Match an MPN as a complete token while allowing punctuation in it."""
+    target = _compact_sku(sku)
+    if not target:
+        return False
+    separated = r"[^A-Z0-9]*".join(re.escape(char) for char in target)
+    return bool(re.search(rf"(?<![A-Z0-9]){separated}(?![A-Z0-9])", _clean_text(text).upper()))
 
 
 def _json_loads_safe(value: str) -> object | None:
@@ -3359,6 +3765,205 @@ def _parse_json_with_fallbacks(raw_text: str) -> object | None:
         if parsed is not None:
             return parsed
     return None
+
+
+def _xdp_variant_selection_from_html(
+    html: str,
+    requested_sku: str,
+) -> tuple[str, str, list[tuple[int, int, str]], str | None]:
+    """Map an exact XDP variant MPN to its Miva attribute option IDs."""
+    source = _clean_text(html)
+    target = _compact_sku(requested_sku)
+    if not source or not target:
+        return "", "", [], None
+
+    product_code = _extract_first(
+        r'(?is)new\s+AttributeMachine\s*\(\s*\{.*?["\']product_code["\']\s*:\s*["\']([^"\']+)',
+        source,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not product_code:
+        product_code = _extract_first(
+            r'(?i)mvtjs\.Product_Code\s*=\s*["\']([^"\']+)',
+            source,
+            flags=re.IGNORECASE,
+        )
+    if not product_code:
+        return "", "", [], "XDP product page did not expose its product code."
+
+    attributes_match = re.search(
+        r'(?is)window\.amAttributes\d+\s*=\s*(\{.*?\})\s*;\s*window\.amPossible\d+\s*=',
+        source,
+    )
+    if not attributes_match:
+        return product_code, "", [], None
+    attributes_payload = _parse_json_with_fallbacks(attributes_match.group(1))
+    attributes = attributes_payload.get("data") if isinstance(attributes_payload, dict) else None
+    if not isinstance(attributes, list) or not attributes:
+        return product_code, "", [], None
+
+    matched_part = ""
+    matched_values: list[str] = []
+    for row_match in re.finditer(r"(?is)<tr\b[^>]*>(.*?)</tr>", source):
+        cells = [
+            _clean_text(re.sub(r"<[^>]+>", " ", unescape(cell)))
+            for cell in re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", row_match.group(1))
+        ]
+        cells = [value for value in cells if value]
+        if not cells:
+            continue
+        part_cell = next(
+            (
+                value
+                for value in cells
+                if _compact_sku(value) == target or target.endswith(_compact_sku(value))
+            ),
+            "",
+        )
+        if not part_cell:
+            continue
+        matched_part = normalize_sku(part_cell)
+        matched_values = [value for value in cells if value != part_cell]
+        break
+    if not matched_part:
+        return product_code, "", [], None
+
+    value_keys = {
+        re.sub(r"[^a-z0-9]+", "", value.lower())
+        for value in matched_values
+        if _clean_text(value)
+    }
+    selections: list[tuple[int, int, str]] = []
+    for attribute in attributes:
+        if not isinstance(attribute, dict):
+            continue
+        attribute_id = int(attribute.get("id", 0) or 0)
+        attribute_type = _clean_text(attribute.get("type", "")) or "radio"
+        options = attribute.get("options")
+        if not attribute_id or not isinstance(options, list):
+            continue
+        matching_options: list[dict] = []
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            prompt_key = re.sub(r"[^a-z0-9]+", "", _clean_text(option.get("prompt", "")).lower())
+            code_key = re.sub(r"[^a-z0-9]+", "", _clean_text(option.get("code", "")).lower())
+            if (prompt_key and prompt_key in value_keys) or any(
+                value_key and value_key in code_key for value_key in value_keys
+            ):
+                matching_options.append(option)
+        if len(matching_options) != 1:
+            return product_code, matched_part, [], None
+        option_id = int(matching_options[0].get("id", 0) or 0)
+        if not option_id:
+            return product_code, matched_part, [], None
+        selections.append((attribute_id, option_id, attribute_type))
+
+    if len(selections) != len([item for item in attributes if isinstance(item, dict)]):
+        return product_code, matched_part, [], None
+    return product_code, matched_part, selections, None
+
+
+def _xdp_variant_url(product_url: str, variant_id: object) -> str:
+    parsed = urllib.parse.urlparse(_clean_text(product_url))
+    if not parsed.scheme or not parsed.netloc or not _clean_text(variant_id):
+        return _clean_text(product_url)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    query["variant_id"] = [_clean_text(variant_id)]
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
+
+
+def _resolve_xdp_variant_payload(
+    html: str,
+    product_url: str,
+    requested_sku: str,
+) -> tuple[dict[str, str], str | None]:
+    """Resolve and price one XDP/Miva variant without clicking its UI control."""
+    product_code, matched_part, selections, selection_error = _xdp_variant_selection_from_html(
+        html,
+        requested_sku,
+    )
+    if selection_error:
+        return {}, selection_error
+    if not product_code or not matched_part or not selections:
+        return {}, None
+
+    attribute_ids = [str(attribute_id) for attribute_id, _, _ in selections]
+    option_ids = [str(option_id) for _, option_id, _ in selections]
+    attribute_types = [attribute_type for _, _, attribute_type in selections]
+    api_url = (
+        "https://www.xtremediesel.com/mm5/json.mvc?"
+        "Store_Code=XDP&Function=Runtime_AttributeList_Load_ProductVariant_Possible"
+    )
+    form_data = {
+        "Product_Code": product_code,
+        "Dependency_Resolution": "first",
+        "Predict_Discounts": "1",
+        "Calculate_Sale_Price": "1",
+        "Last_Selected_Attribute_ID": attribute_ids[0],
+        "Last_Selected_AttributeTemplateAttribute_ID": "0",
+        "Last_Selected_Option_ID": option_ids[0],
+        "Selected_Term_ID": "0",
+        "Selected_Attribute_IDs": "|".join(attribute_ids),
+        "Selected_AttributeTemplateAttribute_IDs": "|".join("0" for _ in selections),
+        "Selected_Option_IDs": "|".join(option_ids),
+        "Selected_Attribute_Types": "|".join(attribute_types),
+        "Unselected_Attribute_IDs": "",
+        "Unselected_AttributeTemplateAttribute_IDs": "",
+        "Session_Type": "runtime",
+    }
+    _, response_text, request_error = _post_form_html(
+        api_url,
+        form_data,
+        referer=product_url,
+        timeout=30,
+    )
+    if request_error:
+        return {}, request_error
+    response = _parse_json_with_fallbacks(response_text)
+    data = response.get("data") if isinstance(response, dict) else None
+    variant = data.get("variant") if isinstance(data, dict) else None
+    variant_id = _clean_text(variant.get("variant_id", "")) if isinstance(variant, dict) else ""
+    price_value = _parse_price_text(data.get("price")) if isinstance(data, dict) else None
+    if not variant_id or price_value is None or price_value <= 0:
+        return {}, "XDP variant service did not return a purchasable price."
+
+    # Confirm that Miva resolved the intended MPN before accepting its price.
+    verify_url = "https://www.xtremediesel.com/ajax?" + urllib.parse.urlencode(
+        {
+            "Verb": "Load_Variant_Part_Data",
+            "Product_Code": product_code,
+            "Variant_ID": variant_id,
+        }
+    )
+    verification_text, verification_error = _fetch_html(verify_url, timeout=30)
+    if verification_error:
+        return {}, verification_error
+    verification = _parse_json_with_fallbacks(verification_text)
+    parts = verification.get("data") if isinstance(verification, dict) else None
+    exact_part = next(
+        (
+            part
+            for part in parts or []
+            if isinstance(part, dict)
+            and _compact_sku(
+                _clean_text((part.get("customfield_values") or {}).get("customfields", {}).get("mpn", ""))
+                or _clean_text(part.get("sku", ""))
+            )
+            == _compact_sku(matched_part)
+        ),
+        None,
+    ) if isinstance(parts, list) else None
+    if exact_part is None:
+        return {}, f"XDP variant {variant_id} did not verify as {matched_part}."
+
+    variant_url = _xdp_variant_url(product_url, variant_id)
+    return {
+        "price": f"{price_value:.2f}",
+        "product_url": variant_url,
+        "source_url": variant_url,
+        "detail_fetch_provider": "xdp_miva_variant_api",
+    }, None
 
 
 def _iter_shopify_product_candidates_from_object(value: object) -> list[dict]:
@@ -5097,6 +5702,7 @@ def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: boo
     merged: dict[str, str] = {}
     from_shopify_embed = _from_shopify_embedded_product(html, page_url, sku)
     from_jsonld = _from_json_ld(html, page_url, sku)
+    from_keystone = _from_keystone_detail_html(html, page_url, sku)
     from_heuristic = _heuristic_extract(html, page_url, sku, scrape_images=scrape_images, gallery_scope_only=gallery_scope_only)
 
     # Prefer product-scoped embedded media first. Heuristic media is broad and can
@@ -5129,6 +5735,7 @@ def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: boo
         "application",
         "vendor",
         "core_charge_product_code",
+        "detail_fetch_provider",
     ]:
         if key == "application" and from_shopify_embed:
             # Product-page embedded payload is authoritative; avoid noisy full-page fitment lines.
@@ -5137,10 +5744,15 @@ def _extract_page_payload(html: str, page_url: str, sku: str, scrape_images: boo
             value = (
                 _clean_text(from_shopify_embed.get(key, ""))
                 or _clean_text(from_jsonld.get(key, ""))
+                or _clean_text(from_keystone.get(key, ""))
                 or _clean_text(from_heuristic.get(key, ""))
             )
         if value:
             merged[key] = value
+    if _is_xtreme_diesel_url(page_url):
+        xdp_price = _extract_xtreme_customer_price(html)
+        if xdp_price:
+            merged["price"] = xdp_price
     return merged
 
 
@@ -6210,6 +6822,9 @@ def _scrape_single_sku(
                 if provider:
                     merged["search_provider"] = provider
 
+                xdp_price_verified = bool(
+                    best_candidate_html and _extract_xtreme_customer_price(best_candidate_html)
+                )
                 try:
                     resolved_payload = {}
                     _gallery_scope_only = resolver_profile is not None and _clean_text(resolver_profile.media_strategy).lower() == "gallery_scope_only"
@@ -6226,6 +6841,22 @@ def _scrape_single_sku(
                         best_candidate_payload,
                         page_url=best_candidate_url,
                     )
+                    normalized_requested = _normalize_requested_scrape_fields(requested_fields)
+                    if (
+                        best_candidate_html
+                        and _is_xtreme_diesel_url(best_candidate_url)
+                        and (normalized_requested is None or "price" in normalized_requested)
+                    ):
+                        variant_payload, variant_error = _resolve_xdp_variant_payload(
+                            html=best_candidate_html,
+                            product_url=best_candidate_url,
+                            requested_sku=query_value,
+                        )
+                        if variant_payload:
+                            resolved_payload.update(variant_payload)
+                            xdp_price_verified = bool(_clean_text(variant_payload.get("price", "")))
+                        elif variant_error:
+                            resolved_payload["detail_fetch_error"] = variant_error
                     for key in [
                         "title",
                         "description_html",
@@ -6238,10 +6869,15 @@ def _scrape_single_sku(
                         "application",
                         "vendor",
                         "core_charge_product_code",
+                        "detail_fetch_provider",
                     ]:
                         value = _clean_text(resolved_payload.get(key, ""))
                         if value:
                             merged[key] = value
+                    resolved_url = _clean_text(resolved_payload.get("product_url", ""))
+                    if resolved_url:
+                        merged["product_url"] = resolved_url
+                        merged["source_url"] = _clean_text(resolved_payload.get("source_url", "")) or resolved_url
                 except Exception as exc:
                     merged["extract_error"] = str(exc)
 
@@ -6249,6 +6885,7 @@ def _scrape_single_sku(
                     product_url=best_candidate_url,
                     payload=merged,
                     requested_fields=requested_fields,
+                    price_verified=xdp_price_verified,
                 ):
                     browser_payload, browser_error = _fetch_xtreme_detail_payload_via_browser(
                         product_url=best_candidate_url,
@@ -6853,6 +7490,1151 @@ def scrape_direct_product_record(
     return filtered_payload, None
 
 
+def _keystone_seeded_line_code(vendor_name: str, required_root: Path | None) -> str:
+    """Load an optional data seed; navigation behavior stays vendor-independent."""
+    if required_root is None:
+        return ""
+    mapping_path = Path(required_root) / "mappings" / "KeystoneVendorLineCodes.csv"
+    if not mapping_path.exists():
+        return ""
+
+    candidate_names = {_normalized_vendor_match_key(vendor_name)}
+    profile = resolve_vendor_profile(vendor_name, required_root)
+    if profile is not None:
+        for value in [profile.canonical_vendor, profile.brand_name, profile.shopify_vendor_value, profile.aliases]:
+            for part in re.split(r"[|,;\n]+", _clean_text(value)):
+                key = _normalized_vendor_match_key(part)
+                if key:
+                    candidate_names.add(key)
+    candidate_names.discard("")
+    try:
+        with mapping_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except Exception:
+        return ""
+
+    for row in rows:
+        names = [_clean_text(row.get("vendor", ""))]
+        names.extend(
+            part.strip()
+            for part in re.split(r"[|,;\n]+", _clean_text(row.get("aliases", "")))
+            if part.strip()
+        )
+        if not candidate_names.intersection({_normalized_vendor_match_key(value) for value in names}):
+            continue
+        line_code = re.sub(r"[^A-Za-z0-9]+", "", _clean_text(row.get("line_code", ""))).upper()
+        if 2 <= len(line_code) <= 8:
+            return line_code
+    return ""
+
+
+def _keystone_direct_pid_prefix(vendor_name: str, required_root: Path | None) -> str:
+    """Prefer a confirmed Keystone PID seed, then the vendor's known SKU prefix.
+
+    Keystone's stable detail IDs commonly combine the brand prefix with the
+    manufacturer's part number (for example ``AFE`` + ``24-91092``).  The
+    shared vendor profile gives us a safe direct-URL candidate for brands that
+    are not yet present in the optional Keystone seed file.  The detail page is
+    still accepted only when its exact MPN and requested fields validate.
+    """
+    seeded = _keystone_seeded_line_code(vendor_name, required_root)
+    if seeded:
+        return seeded
+    profile = resolve_vendor_profile(vendor_name, required_root)
+    if profile is None:
+        return ""
+    prefix = re.sub(r"[^A-Za-z0-9]+", "", _clean_text(getattr(profile, "sku_prefix", ""))).upper()
+    return prefix if 2 <= len(prefix) <= 8 else ""
+
+
+def _normalized_vendor_match_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _clean_text(value).lower()).strip()
+
+
+def _keystone_direct_detail_url(sku: str, line_code: str) -> str:
+    part_number = normalize_sku(sku)
+    clean_line_code = re.sub(r"[^A-Za-z0-9]+", "", _clean_text(line_code)).upper()
+    if not part_number or not clean_line_code:
+        return ""
+    part_number = re.sub(
+        rf"^{re.escape(clean_line_code)}(?:[-_\s]+)?",
+        "",
+        part_number,
+        flags=re.IGNORECASE,
+    ).strip("-_ ")
+    if not part_number:
+        return ""
+    query = urllib.parse.urlencode(
+        {
+            "pid": f"{clean_line_code}{part_number}",
+            "sid": "00000000-0000-0000-0000-000000000000",
+        }
+    )
+    return f"https://wwwsc.ekeystone.com/Search/Detail?{query}"
+
+
+def _keystone_line_code_from_detail_url(detail_url: str, sku: str) -> str:
+    target = _compact_sku(sku)
+    if not target:
+        return ""
+    try:
+        pid = urllib.parse.parse_qs(urllib.parse.urlparse(detail_url).query).get("pid", [""])[0]
+    except Exception:
+        return ""
+    compact_pid = _compact_sku(pid)
+    if not compact_pid.endswith(target):
+        return ""
+    line_code = compact_pid[: -len(target)]
+    return line_code if 2 <= len(line_code) <= 8 else ""
+
+
+def _keystone_search_url_for_sku(sku: str) -> str:
+    return "https://wwwsc.ekeystone.com/search?" + urllib.parse.urlencode(
+        {"issl": "1", "SearchTerm": normalize_sku(sku)}
+    )
+
+
+def _keystone_pid_matches_sku(candidate_url: str, sku: str) -> bool:
+    target = _compact_sku(sku)
+    if not target:
+        return False
+    try:
+        pid = urllib.parse.parse_qs(urllib.parse.urlparse(candidate_url).query).get("pid", [""])[0]
+    except Exception:
+        return False
+    compact_pid = _compact_sku(pid)
+    return bool(compact_pid and compact_pid.endswith(target))
+
+
+def _extract_keystone_search_result_url(html: str, page_url: str, sku: str) -> str:
+    """Choose only an exact MPN from Keystone's result markup.
+
+    Keystone may return M1004, M1004S, and M1004T together. Generic substring
+    matching considers all three valid; exact token/PID matching deliberately
+    selects only M1004 regardless of its position in the list.
+    """
+    ranked: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for position, (candidate_url, anchor_text) in enumerate(_extract_anchor_link_candidates(html, page_url)):
+        parsed = urllib.parse.urlparse(candidate_url)
+        if parsed.path.lower() != "/search/detail" or not _is_keystone_url(candidate_url):
+            continue
+        exact_text = _contains_exact_sku_token(anchor_text, sku)
+        exact_pid = _keystone_pid_matches_sku(candidate_url, sku)
+        if not exact_text and not exact_pid:
+            continue
+        if candidate_url in seen:
+            continue
+        seen.add(candidate_url)
+        ranked.append(((20 if exact_text else 0) + (10 if exact_pid else 0), -position, candidate_url))
+    if not ranked:
+        return ""
+    ranked.sort(reverse=True)
+    return ranked[0][2]
+
+
+def _keystone_results_markup_from_json(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("ResultsMarkup", "resultsMarkup"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _resolve_keystone_search_result(
+    sku: str,
+    cookies: list[dict[str, object]] | None,
+    firefox_session: _KeystoneFirefoxSession | None = None,
+) -> tuple[str, str, str | None]:
+    """Resolve an arbitrary Keystone MPN through Firefox only."""
+    search_url = _keystone_search_url_for_sku(sku)
+    last_error = "No exact Keystone search result found."
+    owns_session = firefox_session is None
+    session = firefox_session or _KeystoneFirefoxSession(cookies)
+    try:
+        final_url, browser_html, network_bodies, browser_error = _fetch_html_with_real_firefox(
+            search_url,
+            cookies=cookies,
+            session=session,
+        )
+    finally:
+        if owns_session:
+            session.close()
+    for response_url, body in network_bodies:
+        if "/api/catalogsearch/searchproducts" not in response_url.lower():
+            continue
+        try:
+            browser_payload = json.loads(_clean_text(body))
+        except Exception:
+            continue
+        markup = _keystone_results_markup_from_json(browser_payload)
+        candidate = _extract_keystone_search_result_url(markup, final_url or search_url, sku)
+        if candidate:
+            return candidate, "keystone_catalog_search_browser_json", None
+    if browser_html and not _looks_like_bot_challenge(browser_html):
+        candidate = _extract_keystone_search_result_url(browser_html, final_url or search_url, sku)
+        if candidate:
+            return candidate, "keystone_search_browser_dom", None
+    if browser_error:
+        last_error = browser_error
+    return "", "", last_error
+
+
+def _scrape_keystone_records(
+    *,
+    sku_values: list[str],
+    vendor_name: str,
+    delay_seconds: float,
+    scrape_images: bool,
+    image_output_root: str | Path | None,
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+    required_root: Path | None,
+    cookies: list[dict[str, object]] | None,
+    search_terms_by_sku: dict[str, str] | None,
+) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
+    results: dict[str, dict[str, str]] = {}
+    errors: dict[str, str] = {}
+    warnings: list[str] = []
+
+    if not cookies:
+        message = "Keystone requires a saved authenticated session."
+        return {}, {sku: message for sku in sku_values}, []
+
+    requested = _normalize_requested_scrape_fields(requested_fields)
+    effective_scrape_images = bool(scrape_images and (requested is None or "media_urls" in requested))
+    output_root = Path(image_output_root).resolve() if image_output_root is not None else None
+    safe_delay = max(1.25, float(delay_seconds or 0.0))
+    learned_line_code = _keystone_direct_pid_prefix(vendor_name, required_root)
+    firefox_session = _KeystoneFirefoxSession(cookies)
+
+    for index, sku in enumerate(sku_values):
+        if index:
+            time.sleep(safe_delay)
+        search_term = normalize_sku((search_terms_by_sku or {}).get(sku, "")) or sku
+        payload: dict[str, str] = {}
+        detail_url = _keystone_direct_detail_url(search_term, learned_line_code)
+        search_provider = "keystone_direct_pid" if detail_url else ""
+        detail_fetch_provider = ""
+
+        if detail_url:
+            final_url, firefox_html, _, firefox_error = _fetch_html_with_real_firefox(
+                detail_url,
+                cookies=cookies,
+                session=firefox_session,
+            )
+            if firefox_html:
+                firefox_payload = _extract_page_payload(
+                    firefox_html,
+                    final_url or detail_url,
+                    search_term,
+                    scrape_images=effective_scrape_images,
+                )
+                if _payload_has_requested_product_data(firefox_payload, requested):
+                    payload = firefox_payload
+                    detail_url = final_url or detail_url
+                    detail_fetch_provider = "keystone_authenticated_firefox_dom"
+            if not payload and firefox_error and "bot challenge" in firefox_error.lower():
+                errors[sku] = "Keystone Firefox session was rejected by its access-control service."
+                warnings.append("Keystone Firefox challenge detected; remaining SKUs were not attempted.")
+                for remaining_sku in sku_values[index + 1 :]:
+                    errors.setdefault(remaining_sku, "Keystone run stopped after a Firefox access-control challenge.")
+                break
+            if not payload and learned_line_code and not firefox_error:
+                errors[sku] = f"No exact Keystone product match found for {search_term}."
+                # Keystone's access-control service commonly rejects the next
+                # detail navigation after a fabricated PID returns its empty
+                # product shell. Retire only that context so later valid SKUs
+                # are still attempted; successful detail pages keep sharing a
+                # context for speed.
+                reset_error = firefox_session.reset_context()
+                if reset_error:
+                    warnings.append(reset_error)
+                continue
+        if not payload:
+            detail_url, search_provider, resolve_error = _resolve_keystone_search_result(
+                search_term,
+                cookies,
+                firefox_session=firefox_session,
+            )
+            if not detail_url:
+                errors[sku] = resolve_error or f"No exact Keystone product match found for {search_term}."
+                if "bot challenge" in _clean_text(resolve_error).lower() or "access-control challenge" in _clean_text(resolve_error).lower():
+                    warnings.append("Keystone Firefox challenge detected; remaining SKUs were not attempted.")
+                    for remaining_sku in sku_values[index + 1 :]:
+                        errors.setdefault(remaining_sku, "Keystone run stopped after a Firefox access-control challenge.")
+                    break
+                continue
+            discovered_line_code = _keystone_line_code_from_detail_url(detail_url, search_term)
+            if discovered_line_code:
+                learned_line_code = discovered_line_code
+
+            final_url, html, _, firefox_error = _fetch_html_with_real_firefox(
+                detail_url,
+                cookies=cookies,
+                session=firefox_session,
+            )
+            if not html:
+                error_text = firefox_error or "Keystone Firefox returned an empty response."
+                errors[sku] = error_text
+                if "bot challenge" in error_text.lower():
+                    warnings.append("Keystone Firefox challenge detected; remaining SKUs were not attempted.")
+                    for remaining_sku in sku_values[index + 1 :]:
+                        errors.setdefault(
+                            remaining_sku,
+                            "Keystone run stopped after a Firefox access-control challenge.",
+                        )
+                    break
+                continue
+            detail_url = final_url or detail_url
+            detail_fetch_provider = "keystone_authenticated_firefox_dom"
+
+            payload = _extract_page_payload(
+                html,
+                detail_url,
+                search_term,
+                scrape_images=effective_scrape_images,
+            )
+            if not _payload_has_requested_product_data(payload, requested):
+                errors[sku] = f"No exact Keystone product match found for {search_term}."
+                continue
+            detail_fetch_provider = "keystone_authenticated_firefox_dom"
+
+        payload["search_url"] = detail_url
+        payload["product_url"] = detail_url
+        payload["source_url"] = detail_url
+        payload["search_provider"] = search_provider
+        payload["detail_fetch_provider"] = detail_fetch_provider or "keystone_authenticated_firefox_dom"
+        if normalize_sku(search_term) != normalize_sku(sku):
+            payload["search_term"] = normalize_sku(search_term)
+
+        if effective_scrape_images and output_root is not None:
+            media_values = _split_multi_value(payload.get("media_urls", ""))
+            if media_values:
+                local_files, media_folder, image_error = _download_images_for_sku(
+                    sku=sku,
+                    media_urls=media_values,
+                    image_output_root=output_root,
+                    vendor_hint=_clean_text(payload.get("vendor", "")) or vendor_name,
+                )
+                if media_folder:
+                    payload["media_folder"] = media_folder
+                if local_files:
+                    payload["media_local_files"] = " | ".join(local_files)
+                    payload["media_urls"] = " | ".join(local_files)
+                elif image_error:
+                    payload["image_download_error"] = image_error
+
+        results[sku] = _filter_requested_scrape_payload(payload, requested)
+
+    firefox_session.close()
+    return results, errors, warnings
+
+
+_APG_SEARCHANISE_API_KEY = "8x8H3V9n4Z"
+
+
+def _apg_search_api_url(search_term: str) -> str:
+    return "https://searchserverapi1.com/getresults?" + urllib.parse.urlencode(
+        {
+            "api_key": _APG_SEARCHANISE_API_KEY,
+            "q": normalize_sku(search_term),
+            "startIndex": "0",
+            "maxResults": "100",
+            "items": "true",
+            "pages": "false",
+            "categories": "false",
+            "suggestions": "false",
+            "facets": "false",
+            "output": "json",
+        }
+    )
+
+
+def _apg_vendor_match_keys(vendor_name: str, required_root: Path | None) -> set[str]:
+    values = [normalize_sku(vendor_name)]
+    profile = resolve_vendor_profile(vendor_name, required_root=required_root)
+    if profile is not None:
+        values.extend(
+            [
+                normalize_sku(profile.canonical_vendor),
+                normalize_sku(profile.shopify_vendor_value),
+                normalize_sku(profile.brand_name),
+                normalize_sku(profile.sku_prefix),
+            ]
+        )
+        values.extend(
+            normalize_sku(value)
+            for value in re.split(r"[|,;\n]+", _clean_text(profile.aliases))
+        )
+    return {_compact_sku(value) for value in values if _compact_sku(value)}
+
+
+def _select_apg_search_item(
+    payload: object,
+    search_term: str,
+    original_sku: str,
+    vendor_name: str,
+    required_root: Path | None,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return {}
+
+    target = _compact_sku(search_term)
+    full_target = _compact_sku(original_sku)
+    if not target:
+        return {}
+    vendor_keys = _apg_vendor_match_keys(vendor_name, required_root)
+    candidates: list[tuple[int, int, dict[str, object]]] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        product_code = _clean_text(item.get("product_code", ""))
+        compact_code = _compact_sku(product_code)
+        if not compact_code or not compact_code.endswith(target):
+            continue
+
+        compact_vendor = _compact_sku(_clean_text(item.get("vendor", "")))
+        vendor_match = bool(compact_vendor and compact_vendor in vendor_keys)
+        score = 0
+        if full_target and compact_code == full_target:
+            score += 200
+        if vendor_match:
+            score += 100
+        if _contains_exact_sku_token(_clean_text(item.get("title", "")), search_term):
+            score += 25
+        # Prefer the shortest exact-suffix code if a feed has duplicate aliases.
+        candidates.append((score, -len(compact_code), item))
+
+    if not candidates:
+        return {}
+    vendor_matched = [entry for entry in candidates if entry[0] >= 100]
+    if vendor_matched:
+        candidates = vendor_matched
+    candidates.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    return dict(candidates[0][2])
+
+
+def _apg_payload_from_search_item(
+    item: dict[str, object],
+    search_url: str,
+    vendor_name: str,
+) -> dict[str, str]:
+    variants = item.get("shopify_variants")
+    variant = next((value for value in variants if isinstance(value, dict)), {}) if isinstance(variants, list) else {}
+    product_link = _clean_text(variant.get("link", "")) or _clean_text(item.get("link", ""))
+    product_url = urllib.parse.urljoin("https://apgwholesale.com/", product_link)
+    media_values = item.get("shopify_images")
+    media_urls = " | ".join(
+        _clean_text(value) for value in media_values or [] if _clean_text(value)
+    ) if isinstance(media_values, list) else _clean_text(item.get("image_link", ""))
+    price = _format_shopify_price(variant.get("price", "") or item.get("price", ""))
+    payload = {
+        "title": _clean_text(item.get("title", "")),
+        "description_html": _clean_text(item.get("description", "")),
+        "vendor": _clean_text(vendor_name) or _clean_text(item.get("vendor", "")),
+        "price": price,
+        "barcode": _sanitize_barcode(_clean_text(variant.get("barcode", ""))),
+        "media_urls": media_urls,
+        "search_url": search_url,
+        "product_url": product_url or search_url,
+        "source_url": product_url or search_url,
+        "search_provider": "apg_searchanise_json",
+        "detail_fetch_provider": "apg_searchanise_json",
+    }
+    return {key: value for key, value in payload.items() if _clean_text(value)}
+
+
+def _extract_apg_search_card(html: str, search_term: str) -> dict[str, object]:
+    target = _compact_sku(search_term)
+    if not html or not target:
+        return {}
+    for match in re.finditer(
+        r'<li\b[^>]*class=["\'][^"\']*\bsnize-product\b[^"\']*["\'][^>]*>(.*?)</li>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        card = match.group(1)
+        product_code = _extract_first(
+            r'<span\b[^>]*class=["\'][^"\']*\bsnize-sku\b[^"\']*["\'][^>]*>\s*([^<]+)',
+            card,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not _compact_sku(product_code).endswith(target):
+            continue
+        return {
+            "product_code": product_code,
+            "link": _extract_first(r'<a\b[^>]*href=["\']([^"\']+)', card, flags=re.IGNORECASE),
+            "title": _clean_text(re.sub(
+                r"<[^>]+>",
+                " ",
+                unescape(_extract_first(
+                    r'<span\b[^>]*class=["\'][^"\']*\bsnize-title\b[^"\']*["\'][^>]*>(.*?)</span>',
+                    card,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )),
+            )),
+            "description": _clean_text(re.sub(
+                r"<[^>]+>",
+                " ",
+                unescape(_extract_first(
+                    r'<span\b[^>]*class=["\'][^"\']*\bsnize-description\b[^"\']*["\'][^>]*>(.*?)</span>',
+                    card,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )),
+            )),
+        }
+    return {}
+
+
+def _apg_product_json_payload(
+    search_item: dict[str, object],
+    search_term: str,
+    search_url: str,
+    vendor_name: str,
+) -> tuple[dict[str, str], str | None]:
+    product_link = _clean_text(search_item.get("link", ""))
+    if not product_link:
+        return {}, "APG exact search card did not include a product URL."
+    product_url = urllib.parse.urljoin("https://apgwholesale.com/", product_link).split("?", 1)[0]
+    body, fetch_error = _fetch_html(f"{product_url}.json")
+    if fetch_error or not body:
+        return {}, fetch_error or "APG product JSON returned an empty response."
+    parsed = _parse_json_with_fallbacks(body)
+    product = parsed.get("product") if isinstance(parsed, dict) else None
+    if not isinstance(product, dict):
+        return {}, "APG product JSON was not recognized."
+
+    variants = product.get("variants")
+    exact_variants = [
+        value for value in variants or []
+        if isinstance(value, dict) and _compact_sku(_clean_text(value.get("sku", ""))).endswith(_compact_sku(search_term))
+    ] if isinstance(variants, list) else []
+    if not exact_variants:
+        return {}, f"APG product JSON did not contain the exact SKU {search_term}."
+    variant = exact_variants[0]
+    images = product.get("images")
+    media_urls = " | ".join(
+        _clean_text(image.get("src", ""))
+        for image in images or []
+        if isinstance(image, dict) and _clean_text(image.get("src", ""))
+    ) if isinstance(images, list) else ""
+    weight = ""
+    try:
+        grams = float(variant.get("grams", 0) or 0)
+        if grams > 0:
+            weight = f"{grams / 453.59237:.2f} lb"
+    except Exception:
+        weight = ""
+    payload = {
+        "title": _clean_text(product.get("title", "")),
+        "description_html": _clean_text(product.get("body_html", "")),
+        "vendor": _clean_text(vendor_name) or _clean_text(product.get("vendor", "")),
+        "type": _clean_text(product.get("product_type", "")),
+        "price": _format_shopify_price(variant.get("price", "")),
+        "barcode": _sanitize_barcode(_clean_text(variant.get("barcode", ""))),
+        "weight": weight,
+        "media_urls": media_urls,
+        "search_url": search_url,
+        "product_url": product_url,
+        "source_url": product_url,
+        "search_provider": "apg_search_browser_dom",
+        "detail_fetch_provider": "apg_shopify_product_json",
+    }
+    return {key: value for key, value in payload.items() if _clean_text(value)}, None
+
+
+def _scrape_apg_records(
+    sku_values: list[str],
+    vendor_name: str,
+    workers: int,
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+    required_root: Path | None,
+    cookies: list[dict[str, object]] | None,
+    search_terms_by_sku: dict[str, str],
+) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
+    requested = _normalize_requested_scrape_fields(requested_fields)
+
+    def scrape_one(sku: str) -> tuple[str, dict[str, str], str | None]:
+        search_term = search_terms_by_sku.get(sku, sku)
+        search_url = "https://apgwholesale.com/pages/search-results-page?" + urllib.parse.urlencode({"q": search_term})
+        api_body, api_error = _fetch_html(_apg_search_api_url(search_term))
+        api_payload = _parse_json_with_fallbacks(api_body) if api_body else None
+        exact_item = _select_apg_search_item(
+            api_payload,
+            search_term,
+            sku,
+            vendor_name,
+            required_root,
+        )
+        if exact_item:
+            payload = _apg_payload_from_search_item(exact_item, search_url, vendor_name)
+            if _payload_has_requested_product_data(payload, requested):
+                if normalize_sku(search_term) != normalize_sku(sku):
+                    payload["search_term"] = normalize_sku(search_term)
+                return sku, _filter_requested_scrape_payload(payload, requested), None
+
+        # Searchanise is normally the fast path. A rendered search is retained as
+        # the resilient fallback if its public endpoint or schema changes.
+        final_url, html, _, browser_error = _fetch_html_with_real_chrome(search_url, cookies=cookies)
+        if not html:
+            return sku, {}, browser_error or api_error or "APG search returned an empty response."
+        card = _extract_apg_search_card(html, search_term)
+        if not card:
+            return sku, {}, f"No exact APG product match found for {search_term}."
+        payload, detail_error = _apg_product_json_payload(
+            card,
+            search_term,
+            final_url or search_url,
+            vendor_name,
+        )
+        if not _payload_has_requested_product_data(payload, requested):
+            return sku, {}, detail_error or f"No APG product data found for {search_term}."
+        if normalize_sku(search_term) != normalize_sku(sku):
+            payload["search_term"] = normalize_sku(search_term)
+        return sku, _filter_requested_scrape_payload(payload, requested), None
+
+    results: dict[str, dict[str, str]] = {}
+    errors: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(int(workers or 1), 5))) as executor:
+        futures = {executor.submit(scrape_one, sku): sku for sku in sku_values}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                sku, payload, error = future.result()
+            except Exception as exc:
+                errors[futures[future]] = str(exc)
+                continue
+            if payload:
+                results[sku] = payload
+            if error:
+                errors[sku] = error
+    return results, errors, []
+
+
+def _meyer_post_json(
+    url: str,
+    payload: dict[str, object],
+    access_token: str = "",
+    timeout: int = 30,
+) -> tuple[object | None, str | None]:
+    headers = {
+        "User-Agent": _REQUEST_USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Referer": "https://online.meyerdistributing.com/",
+    }
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return None, f"Meyer API returned HTTP {exc.code}."
+    except Exception as exc:
+        return None, f"Meyer API request failed: {exc}"
+    parsed = _parse_json_with_fallbacks(body)
+    if parsed is None:
+        return None, "Meyer API returned an unrecognized response."
+    return parsed, None
+
+
+def _meyer_login_access_token() -> tuple[str, str | None]:
+    from product_prospector.core.wholesale_distributors import load_distributor_credentials
+
+    username, password, credential_error = load_distributor_credentials("meyer")
+    if credential_error:
+        return "", credential_error
+    response, login_error = _meyer_post_json(
+        "https://online.meyerdistributing.com/api/user/login",
+        {
+            "userID": username,
+            "password": password,
+            "usingNativeApp": False,
+        },
+    )
+    if login_error:
+        return "", login_error
+    tokens = response.get("tokens") if isinstance(response, dict) else None
+    access = tokens.get("accessToken") if isinstance(tokens, dict) else None
+    token = _clean_text(access.get("token", "")) if isinstance(access, dict) else ""
+    if not token:
+        return "", "Meyer login succeeded without returning an access token."
+    return token, None
+
+
+def _select_meyer_part(
+    payload: object,
+    search_term: str,
+    vendor_name: str,
+    required_root: Path | None,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    search_results = payload.get("searchResults")
+    parts = search_results.get("parts") if isinstance(search_results, dict) else None
+    if not isinstance(parts, list):
+        return {}
+    target = _compact_sku(search_term)
+    if not target:
+        return {}
+    vendor_keys = _apg_vendor_match_keys(vendor_name, required_root)
+    candidates: list[tuple[int, dict[str, object]]] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if _compact_sku(_clean_text(part.get("mfgPart", ""))) != target:
+            continue
+        manufacturer_keys = {
+            _compact_sku(_clean_text(part.get("mfgID", ""))),
+            _compact_sku(_clean_text(part.get("mfgName", ""))),
+        }
+        manufacturer_keys.discard("")
+        score = 100 if manufacturer_keys.intersection(vendor_keys) else 0
+        candidates.append((score, part))
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda entry: entry[0], reverse=True)
+    return dict(candidates[0][1])
+
+
+def _meyer_payload_from_part(
+    part: dict[str, object],
+    search_url: str,
+    vendor_name: str,
+) -> dict[str, str]:
+    manufacturer = _clean_text(part.get("mfgName", ""))
+    mfg_part = _clean_text(part.get("mfgPart", ""))
+    description = _clean_text(part.get("itemDesc", ""))
+    title = re.sub(r"\s+", " ", " ".join(value for value in (manufacturer, mfg_part, description) if value)).strip()
+    price = _format_shopify_price(
+        part.get("customerPriceWithoutExtraFees")
+        or part.get("customerPrice")
+    )
+    image_url = urllib.parse.urljoin(
+        "https://online.meyerdistributing.com/",
+        _clean_text(part.get("imageUrl", "")),
+    )
+    payload = {
+        "title": title,
+        "description_html": description,
+        "vendor": _clean_text(vendor_name) or manufacturer,
+        "type": _clean_text(part.get("category", "")),
+        "price": price,
+        "media_urls": image_url,
+        "search_url": search_url,
+        "product_url": search_url,
+        "source_url": search_url,
+        "search_provider": "meyer_authenticated_search_json",
+        "detail_fetch_provider": "meyer_authenticated_search_json",
+    }
+    return {key: value for key, value in payload.items() if _clean_text(value)}
+
+
+def _scrape_meyer_records(
+    sku_values: list[str],
+    vendor_name: str,
+    workers: int,
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+    required_root: Path | None,
+    search_terms_by_sku: dict[str, str],
+) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
+    requested = _normalize_requested_scrape_fields(requested_fields)
+    access_token, login_error = _meyer_login_access_token()
+    if login_error:
+        return {}, {sku: login_error for sku in sku_values}, ["Meyer backend login failed; no SKUs were attempted."]
+
+    def scrape_one(sku: str) -> tuple[str, dict[str, str], str | None]:
+        search_term = search_terms_by_sku.get(sku, sku)
+        search_url = (
+            "https://online.meyerdistributing.com/parts/search;"
+            f"search={urllib.parse.quote(search_term)};search_within={urllib.parse.quote(search_term)}"
+        )
+        response, search_error = _meyer_post_json(
+            "https://online.meyerdistributing.com/api/search/all?"
+            + urllib.parse.urlencode({"search": search_term}),
+            {
+                "searchWithin": search_term,
+                "inStockOnly": False,
+                "showDeliveryDate": False,
+                "canadaOnlyVendorsFirst": False,
+                "mfgCategory": 0,
+                "page": 1,
+                "numberPerPage": 12,
+                "sortType": 0,
+                "sortDescending": False,
+                "vin": "",
+                "year": 0,
+                "make": "",
+                "model": "",
+                "includeUniversal": False,
+                "vehicleFitment": None,
+                "qualifierIDs": None,
+            },
+            access_token=access_token,
+        )
+        if search_error:
+            return sku, {}, search_error
+        exact_part = _select_meyer_part(
+            response,
+            search_term,
+            vendor_name,
+            required_root,
+        )
+        if not exact_part:
+            return sku, {}, f"No exact Meyer product match found for {search_term}."
+        payload = _meyer_payload_from_part(exact_part, search_url, vendor_name)
+        if not _payload_has_requested_product_data(payload, requested):
+            return sku, {}, f"No Meyer product data found for {search_term}."
+        if normalize_sku(search_term) != normalize_sku(sku):
+            payload["search_term"] = normalize_sku(search_term)
+        return sku, _filter_requested_scrape_payload(payload, requested), None
+
+    results: dict[str, dict[str, str]] = {}
+    errors: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(int(workers or 1), 5))) as executor:
+        futures = {executor.submit(scrape_one, sku): sku for sku in sku_values}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                sku, payload, error = future.result()
+            except Exception as exc:
+                errors[futures[future]] = str(exc)
+                continue
+            if payload:
+                results[sku] = payload
+            if error:
+                errors[sku] = error
+    return results, errors, []
+
+
+class _Turn14HtmlNode:
+    __slots__ = ("tag", "attrs", "parent", "children", "text_chunks", "content")
+
+    def __init__(
+        self,
+        tag: str,
+        attrs: dict[str, str] | None = None,
+        parent: "_Turn14HtmlNode | None" = None,
+    ) -> None:
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.parent = parent
+        self.children: list[_Turn14HtmlNode] = []
+        self.text_chunks: list[str] = []
+        self.content: list[str | _Turn14HtmlNode] = []
+
+
+class _Turn14HtmlTreeParser(HTMLParser):
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = _Turn14HtmlNode("document")
+        self.stack = [self.root]
+        self.nodes = [self.root]
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        parent = self.stack[-1]
+        node = _Turn14HtmlNode(
+            tag.lower(),
+            {str(key).lower(): _clean_text(value) for key, value in attrs},
+            parent,
+        )
+        parent.children.append(node)
+        parent.content.append(node)
+        self.nodes.append(node)
+        if node.tag not in self._VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if self.stack[-1].tag == tag.lower():
+            self.stack.pop()
+
+    def handle_endtag(self, tag: str) -> None:
+        target = tag.lower()
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == target:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        if any(node.tag in {"script", "style", "template"} for node in self.stack[-2:]):
+            return
+        cleaned = re.sub(r"\s+", " ", unescape(data or "")).strip()
+        if cleaned:
+            self.stack[-1].text_chunks.append(cleaned)
+            self.stack[-1].content.append(cleaned)
+
+
+def _turn14_node_text(
+    node: _Turn14HtmlNode,
+    cache: dict[int, str],
+) -> str:
+    cache_key = id(node)
+    if cache_key in cache:
+        return cache[cache_key]
+    pieces: list[str] = []
+    for item in node.content:
+        if isinstance(item, str):
+            pieces.append(item)
+            continue
+        child_text = _turn14_node_text(item, cache)
+        if child_text:
+            pieces.append(child_text)
+    text = re.sub(r"\s+", " ", " ".join(pieces)).strip()
+    cache[cache_key] = text
+    return text
+
+
+def _turn14_descendant_text_chunks(
+    node: _Turn14HtmlNode,
+) -> list[tuple[_Turn14HtmlNode, str]]:
+    output: list[tuple[_Turn14HtmlNode, str]] = []
+
+    def visit(current: _Turn14HtmlNode) -> None:
+        for item in current.content:
+            if isinstance(item, str):
+                if item:
+                    output.append((current, item))
+            else:
+                visit(item)
+
+    visit(node)
+    return output
+
+
+def _turn14_price_from_card(card: _Turn14HtmlNode) -> str:
+    money_pattern = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)")
+    labeled_price_pattern = re.compile(r"\b(?:map|jobber|retail|msrp|list)\s*:?[\s$]*$", re.IGNORECASE)
+    chunks = _turn14_descendant_text_chunks(card)
+    candidates: list[tuple[int, int, str]] = []
+
+    for chunk_index, (node, text) in enumerate(chunks):
+        previous = " ".join(value for _, value in chunks[max(0, chunk_index - 3):chunk_index])
+        attr_blob = " ".join(
+            [node.tag, *node.attrs.keys(), *node.attrs.values()]
+        ).lower()
+        for match_index, match in enumerate(money_pattern.finditer(text)):
+            leading_context = f"{previous} {text[:match.start()]}".strip()
+            is_labeled = bool(labeled_price_pattern.search(leading_context))
+            score = 0
+            if "orange" in attr_blob or "warning" in attr_blob:
+                score += 80
+            if any(token in attr_blob for token in ("customer", "your-price", "sell-price", "net-price", "final-price")):
+                score += 55
+            if "price" in attr_blob:
+                score += 18
+            if node.tag in {"strong", "b", "h1", "h2", "h3", "h4", "h5"} or "fw-bold" in attr_blob:
+                score += 8
+            if is_labeled:
+                score -= 100
+            if any(token in attr_blob for token in ("map-price", "retail-price", "msrp", "list-price")):
+                score -= 80
+            amount = match.group(1).replace(",", "")
+            candidates.append((score, (chunk_index * 100) + match_index, amount))
+
+    if not candidates:
+        return ""
+    # The customer/jobber purchase price is visually highlighted and normally
+    # follows the labeled MAP/Jobber/Retail reference prices. Later DOM order is
+    # therefore the deterministic fallback when Turn 14 changes CSS class names.
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def _turn14_card_field(card_text: str, label: str, following_labels: tuple[str, ...]) -> str:
+    stops = "|".join(re.escape(value) for value in following_labels)
+    pattern = rf"\b{re.escape(label)}\s*:?\s*(.+?)(?=\s+(?:{stops})\s*:?\s|$)"
+    match = re.search(pattern, card_text, re.IGNORECASE)
+    return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
+
+def _extract_turn14_search_card(
+    html: str,
+    requested_part: str,
+    page_url: str,
+    vendor_name: str = "",
+) -> dict[str, str]:
+    if not html or not _compact_sku(requested_part):
+        return {}
+
+    parser = _Turn14HtmlTreeParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return {}
+
+    target = _compact_sku(requested_part)
+    part_pattern = re.compile(r"\bPart\s*#\s*:?\s*([A-Z0-9][A-Z0-9._/\-]*)", re.IGNORECASE)
+    text_cache: dict[int, str] = {}
+    card_candidates: list[tuple[int, _Turn14HtmlNode, str]] = []
+
+    for node in parser.nodes:
+        if node.tag not in {"a", "article", "div", "li", "section", "td", "tr"}:
+            continue
+        node_text = _turn14_node_text(node, text_cache)
+        part_matches = [match.group(1) for match in part_pattern.finditer(node_text)]
+        if not any(_compact_sku(value) == target for value in part_matches):
+            continue
+
+        card = node
+        while card.parent is not None and not re.search(r"\$\s*[0-9]", _turn14_node_text(card, text_cache)):
+            card = card.parent
+        card_text = _turn14_node_text(card, text_cache)
+        if not re.search(r"\$\s*[0-9]", card_text):
+            continue
+        card_candidates.append((len(card_text), card, card_text))
+
+    if not card_candidates:
+        return {}
+
+    _, card, card_text = min(card_candidates, key=lambda item: item[0])
+    price = _turn14_price_from_card(card)
+    if not price:
+        return {}
+
+    manufacturer = _turn14_card_field(
+        card_text,
+        "Manufacturer",
+        ("Pricing Group", "Description", "Product Name", "Box", "Born On Date"),
+    )
+    title = _turn14_card_field(
+        card_text,
+        "Product Name",
+        ("Box", "Born On Date", "MAP", "Jobber", "Retail"),
+    )
+    description = _turn14_card_field(
+        card_text,
+        "Description",
+        ("Product Name", "Box", "Born On Date", "MAP", "Jobber", "Retail"),
+    )
+    payload = {
+        "price": price,
+        "vendor": _clean_text(vendor_name) or manufacturer,
+        "title": title,
+        "description_html": description,
+        "search_url": page_url,
+        "product_url": page_url,
+        "source_url": page_url,
+        "search_provider": "turn14_search_card_dom",
+    }
+    return {key: value for key, value in payload.items() if _clean_text(value)}
+
+
+def _turn14_search_part(
+    sku: str,
+    search_term: str,
+    vendor_name: str,
+    required_root: Path | None,
+) -> str:
+    original = normalize_sku(sku)
+    candidate = normalize_sku(search_term) or original
+    profile = resolve_vendor_profile(vendor_name, required_root=required_root)
+    prefix = normalize_sku(getattr(profile, "sku_prefix", "")) if profile is not None else ""
+    compact_prefix = _compact_sku(prefix)
+    if compact_prefix:
+        compact_original = _compact_sku(original)
+        compact_candidate = _compact_sku(candidate)
+        if compact_original.startswith(compact_prefix) and len(compact_original) > len(compact_prefix):
+            return original
+        if compact_candidate.startswith(compact_prefix) and len(compact_candidate) > len(compact_prefix):
+            return candidate
+        return f"{prefix.rstrip('-_ ')}-{candidate.lstrip('-_ ')}"
+    return original or candidate
+
+
+def _turn14_login_page(html: str) -> bool:
+    lower_html = (html or "").lower()
+    return (
+        ('action="https://turn14.com/user/login"' in lower_html or "action='/user/login'" in lower_html)
+        and "logout" not in lower_html
+    )
+
+
+def _scrape_turn14_records(
+    sku_values: list[str],
+    vendor_name: str,
+    delay_seconds: float,
+    requested_fields: set[str] | list[str] | tuple[str, ...] | None,
+    required_root: Path | None,
+    cookies: list[dict[str, object]] | None,
+    search_terms_by_sku: dict[str, str],
+) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
+    requested = _normalize_requested_scrape_fields(requested_fields)
+    results: dict[str, dict[str, str]] = {}
+    errors: dict[str, str] = {}
+    warnings: list[str] = []
+
+    for index, sku in enumerate(sku_values):
+        search_part = _turn14_search_part(
+            sku,
+            search_terms_by_sku.get(sku, sku),
+            vendor_name,
+            required_root,
+        )
+        search_url = "https://turn14.com/search/index.php?" + urllib.parse.urlencode({"vmmPart": search_part})
+        _seed_runtime_cookies_for_url(search_url, cookies)
+        html, fetch_error = _fetch_html(search_url)
+        fetch_provider = "turn14_authenticated_http_dom"
+
+        if not html or _turn14_login_page(html) or _looks_like_bot_challenge(html):
+            final_url, browser_html, _, browser_error = _fetch_html_with_real_chrome(search_url, cookies=cookies)
+            if browser_html:
+                html = browser_html
+                search_url = final_url or search_url
+                fetch_provider = "turn14_authenticated_chrome_dom"
+            else:
+                errors[sku] = browser_error or fetch_error or "Turn 14 returned an empty response."
+                continue
+
+        if _turn14_login_page(html):
+            errors[sku] = (
+                "Turn 14 saved Chrome session is no longer valid. Its PHP session can expire "
+                "independently of the login credentials; export the current logged-in Chrome cookies."
+            )
+            for remaining_sku in sku_values[index + 1:]:
+                errors.setdefault(remaining_sku, "Turn 14 run stopped because the saved session expired.")
+            warnings.append("Turn 14 authentication expired; remaining SKUs were not attempted.")
+            break
+        if _looks_like_bot_challenge(html):
+            errors[sku] = "Turn 14 returned an access-control challenge."
+            continue
+
+        payload = _extract_turn14_search_card(
+            html=html,
+            requested_part=search_part,
+            page_url=search_url,
+            vendor_name=vendor_name,
+        )
+        if not _payload_has_requested_product_data(payload, requested):
+            errors[sku] = f"No exact Turn 14 product match found for {search_part}."
+            continue
+        payload["detail_fetch_provider"] = fetch_provider
+        if normalize_sku(search_part) != normalize_sku(sku):
+            payload["search_term"] = normalize_sku(search_part)
+        results[sku] = _filter_requested_scrape_payload(payload, requested)
+
+        if delay_seconds and index + 1 < len(sku_values):
+            time.sleep(max(0.0, float(delay_seconds)))
+
+    return results, errors, warnings
+
+
 def scrape_vendor_records(
     vendor_search_url: str,
     skus: list[str],
@@ -6865,6 +8647,7 @@ def scrape_vendor_records(
     requested_fields: set[str] | list[str] | tuple[str, ...] | None = None,
     required_root: Path | None = None,
     cookies: list[dict[str, object]] | None = None,
+    vendor_name: str = "",
 ) -> tuple[dict[str, dict[str, str]], dict[str, str], list[str]]:
     sku_values = [normalize_sku(sku) for sku in skus if normalize_sku(sku)]
     if not vendor_search_url or not sku_values:
@@ -6877,6 +8660,101 @@ def scrape_vendor_records(
     }
 
     vendor_search_url, resolver_profile = resolve_canonical_search_url(vendor_search_url, required_root=required_root)
+
+    fallback_terms_by_sku = {
+        sku: _search_term_fallbacks(
+            sku=sku,
+            primary_search_term=search_term_lookup.get(sku, sku),
+            vendor_name=vendor_name,
+            required_root=required_root,
+        )
+        for sku in sku_values
+    }
+
+    def run_dedicated_with_fallbacks(runner):
+        combined_results: dict[str, dict[str, str]] = {}
+        combined_errors: dict[str, str] = {}
+        combined_warnings: list[str] = []
+        max_attempts = max((len(values) for values in fallback_terms_by_sku.values()), default=1)
+        for attempt_index in range(max_attempts):
+            attempt_skus = [
+                sku
+                for sku in sku_values
+                if sku not in combined_results
+                and attempt_index < len(fallback_terms_by_sku.get(sku, []))
+                and (attempt_index == 0 or _is_search_miss_error(combined_errors.get(sku, "")))
+            ]
+            if not attempt_skus:
+                break
+            attempt_terms = {
+                sku: fallback_terms_by_sku[sku][attempt_index]
+                for sku in attempt_skus
+            }
+            run_results, run_errors, run_warnings = runner(attempt_skus, attempt_terms)
+            for warning in run_warnings:
+                if warning not in combined_warnings:
+                    combined_warnings.append(warning)
+            for sku in attempt_skus:
+                payload = run_results.get(sku)
+                if payload:
+                    combined_results[sku] = payload
+                    combined_errors.pop(sku, None)
+                elif sku in run_errors:
+                    combined_errors[sku] = run_errors[sku]
+        return combined_results, combined_errors, combined_warnings
+
+    if _is_keystone_url(vendor_search_url):
+        return run_dedicated_with_fallbacks(
+            lambda attempt_skus, attempt_terms: _scrape_keystone_records(
+                sku_values=attempt_skus,
+                vendor_name=vendor_name,
+                delay_seconds=delay_seconds,
+                scrape_images=scrape_images,
+                image_output_root=image_output_root,
+                requested_fields=requested_fields,
+                required_root=required_root,
+                cookies=cookies,
+                search_terms_by_sku=attempt_terms,
+            )
+        )
+
+    if _is_apg_wholesale_url(vendor_search_url):
+        return run_dedicated_with_fallbacks(
+            lambda attempt_skus, attempt_terms: _scrape_apg_records(
+                sku_values=attempt_skus,
+                vendor_name=vendor_name,
+                workers=workers,
+                requested_fields=requested_fields,
+                required_root=required_root,
+                cookies=cookies,
+                search_terms_by_sku=attempt_terms,
+            )
+        )
+
+    if _is_meyer_distributing_url(vendor_search_url):
+        return run_dedicated_with_fallbacks(
+            lambda attempt_skus, attempt_terms: _scrape_meyer_records(
+                sku_values=attempt_skus,
+                vendor_name=vendor_name,
+                workers=workers,
+                requested_fields=requested_fields,
+                required_root=required_root,
+                search_terms_by_sku=attempt_terms,
+            )
+        )
+
+    if _is_turn14_url(vendor_search_url):
+        return run_dedicated_with_fallbacks(
+            lambda attempt_skus, attempt_terms: _scrape_turn14_records(
+                sku_values=attempt_skus,
+                vendor_name=vendor_name,
+                delay_seconds=delay_seconds,
+                requested_fields=requested_fields,
+                required_root=required_root,
+                cookies=cookies,
+                search_terms_by_sku=attempt_terms,
+            )
+        )
 
     unresolved_vendor = _match_unresolved_vendor(vendor_search_url)
     if unresolved_vendor is not None:
@@ -6959,10 +8837,12 @@ def scrape_vendor_records(
         except Exception:
             output_root = None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                _scrape_single_sku,
+    def scrape_one_with_term_fallbacks(sku: str) -> tuple[str, dict[str, str], str | None]:
+        last_payload: dict[str, str] = {}
+        last_error: str | None = None
+        candidates = fallback_terms_by_sku.get(sku) or [search_term_lookup.get(sku, sku)]
+        for candidate_index, candidate_term in enumerate(candidates):
+            result_sku, payload, error = _scrape_single_sku(
                 sku=sku,
                 base_url=vendor_search_url,
                 resolver_profile=resolver_profile,
@@ -6970,9 +8850,27 @@ def scrape_vendor_records(
                 delay_seconds=effective_delay,
                 scrape_images=effective_scrape_images,
                 image_output_root=output_root,
-                search_term=search_term_lookup.get(sku, sku),
+                search_term=candidate_term,
                 requested_fields=normalized_requested_fields,
                 cookies=cookies,
+            )
+            if payload:
+                return result_sku, payload, None
+            last_payload = payload
+            last_error = error
+            if candidate_index + 1 >= len(candidates):
+                break
+            # Searchspring-backed WD searches can safely try the next spelling
+            # even when the protected HTML search page reports a challenge.
+            if not direct_searchspring_site_ids and not _is_search_miss_error(error):
+                break
+        return sku, last_payload, last_error
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                scrape_one_with_term_fallbacks,
+                sku,
             )
             for sku in ordered_skus
         ]

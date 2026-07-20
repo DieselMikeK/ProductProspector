@@ -13,6 +13,7 @@ RUN_MODE_UPDATE = "Update Existing"
 RUN_MODE_CREATE = "Create New"
 RUN_MODE_UPSERT = "Upsert"
 RUN_MODE_IMAGE_CAPTURE = "Image Capture"
+RUN_MODE_AUDIT = "Audit"
 
 
 @dataclass

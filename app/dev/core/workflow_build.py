@@ -18,7 +18,7 @@ from product_prospector.core.pricing_priority_rules import (
 )
 from product_prospector.core.product_model import Product, has_shopify_collective_tag
 from product_prospector.core.processing import normalize_sku
-from product_prospector.core.session_state import MODE_NEW, MODE_UPDATE, AppSession
+from product_prospector.core.session_state import MODE_AUDIT, MODE_NEW, MODE_UPDATE, AppSession
 from product_prospector.core.vendor_profiles import resolve_vendor_profile
 from product_prospector.core.vendor_normalization import normalize_vendor_name as normalize_vendor_from_rules
 
@@ -475,7 +475,7 @@ def _can_infer_cost_for_sku_rows(
 
 def detect_missing_required_fields(session: AppSession, required_root: Path | None = None) -> list[str]:
     required: list[str] = []
-    if session.mode == MODE_UPDATE:
+    if session.mode in {MODE_UPDATE, MODE_AUDIT}:
         selected = _effective_update_fields(session)
         if "title" in selected:
             required.append("title")
@@ -878,7 +878,7 @@ def build_products_from_session(
         if session.mode == MODE_NEW:
             for field_name, value in spreadsheet_values.items():
                 _set_if_present(product, field_name, value, "spreadsheet")
-        elif session.mode == MODE_UPDATE:
+        elif session.mode in {MODE_UPDATE, MODE_AUDIT}:
             selected = _effective_update_fields(session)
             if "price" in selected:
                 selected.update({"map_price", "msrp_price", "jobber_price"})
@@ -974,7 +974,7 @@ def build_products_from_session(
                     elif _clean_text(existing_attr):
                         continue
                     _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
-            elif session.mode == MODE_UPDATE:
+            elif session.mode in {MODE_UPDATE, MODE_AUDIT}:
                 selected = _effective_update_fields(session)
                 if "price" in selected:
                     selected.update({"map_price", "msrp_price", "jobber_price"})
@@ -996,6 +996,9 @@ def build_products_from_session(
                 if scraped_product_url:
                     _set_if_present(product, "product_url", scraped_product_url, "scraper")
                 for field_name in selected:
+                    if session.mode == MODE_AUDIT:
+                        _set_if_present(product, field_name, scraped_values.get(field_name, ""), "scraper")
+                        continue
                     existing_attr = getattr(product, field_name, None)
                     if isinstance(existing_attr, list):
                         if existing_attr:
@@ -1034,6 +1037,8 @@ def merge_mode_label(mode: str) -> str:
         return "Create New Product"
     if mode == MODE_UPDATE:
         return "Update Existing Product"
+    if mode == MODE_AUDIT:
+        return "Audit Products"
     return "Not Selected"
 
 

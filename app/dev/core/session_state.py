@@ -9,6 +9,10 @@ from product_prospector.core.product_model import Product
 
 MODE_NEW = "new"
 MODE_UPDATE = "update"
+MODE_AUDIT = "audit"
+
+AUDIT_SEARCH_VENDOR = "vendor"
+AUDIT_SEARCH_WD = "wd"
 
 
 @dataclass
@@ -47,6 +51,8 @@ class ScrapeSettings:
 class AppSession:
     mode: str = ""
     lookup_vendor: str = ""
+    audit_search_type: str = AUDIT_SEARCH_VENDOR
+    audit_distributors: list[str] = field(default_factory=list)
     vendor_df: pd.DataFrame | None = None
     source_mapping: SourceMapping = field(default_factory=SourceMapping)
     pasted_skus: list[str] = field(default_factory=list)
@@ -63,6 +69,8 @@ class AppSession:
 
     def reset_for_new_run(self) -> None:
         self.lookup_vendor = ""
+        self.audit_search_type = AUDIT_SEARCH_VENDOR
+        self.audit_distributors = []
         self.vendor_df = None
         self.source_mapping = SourceMapping()
         self.pasted_skus = []

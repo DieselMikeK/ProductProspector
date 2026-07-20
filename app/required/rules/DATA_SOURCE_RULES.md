@@ -1,5 +1,26 @@
 # Data Source Rules
 
+## External Site Resolver Source Priority
+
+For every vendor and wholesale-distributor resolver, use the least expensive,
+most structured authorized source that reliably returns the requested fields.
+The mandatory discovery and runtime order is:
+
+1. Documented/approved API or an authenticated JSON/XHR endpoint observed in the site's normal workflow.
+2. Structured page data such as JSON-LD, schema.org markup, or embedded application state.
+3. A direct HTTP response parsed with a narrow, product-scoped HTML parser.
+4. Browser-assisted navigation only for work that cannot be reproduced over HTTP, such as establishing an approved session or discovering a session-bound product link; return to HTTP parsing immediately afterward when possible.
+5. Full Playwright page rendering and DOM extraction only as the last fallback.
+
+Validation and safety rules:
+
+1. Do not promote a resolver from discovery until it succeeds against a SKU known to exist and handles a known-missing SKU without returning an unrelated product.
+2. Record which provider produced each result (`search_provider` and `detail_fetch_provider`) so fallbacks are auditable.
+3. Never treat analytics, notification, recommendation, anti-bot, or session-maintenance endpoints as authoritative product sources.
+4. Reuse only endpoints reached through the site's normal authorized workflow; do not bypass access controls.
+5. On 403, 429, bot-challenge, or repeated connection-close responses, stop retrying that host, reduce concurrency, and surface a clear error. Do not create retry storms.
+6. Prefer one authenticated HTTP request per product over loading a complete browser page when the initial HTML already contains the required fields.
+
 ## Price Selection Rules
 
 Source file:

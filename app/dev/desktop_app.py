@@ -20,7 +20,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import urllib.parse
 import webbrowser
-from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
+from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, simpledialog, ttk
 
 # Avoid Python 3.14's Windows WMI path during startup. Pandas calls
 # platform.machine() at import time, and WMI can hang on this machine.
@@ -51,6 +51,7 @@ from product_prospector.core.pricing_rules import (
 from product_prospector.core.product_model import PRODUCT_EXPORT_COLUMNS, Product, calculate_ad_words_spend, has_shopify_collective_tag
 from product_prospector.core.processing import (
     PlanningConfig,
+    RUN_MODE_AUDIT,
     RUN_MODE_CREATE,
     RUN_MODE_IMAGE_CAPTURE,
     RUN_MODE_UPDATE,
@@ -60,7 +61,14 @@ from product_prospector.core.processing import (
     stitch_rows_by_sku,
 )
 from product_prospector.core.create_product_output import build_create_product_output
-from product_prospector.core.session_state import AppSession, MODE_NEW, MODE_UPDATE
+from product_prospector.core.session_state import (
+    AUDIT_SEARCH_VENDOR,
+    AUDIT_SEARCH_WD,
+    AppSession,
+    MODE_AUDIT,
+    MODE_NEW,
+    MODE_UPDATE,
+)
 from product_prospector.core.shopify_catalog import fetch_shopify_catalog_dataframe
 from product_prospector.core.shopify_catalog import fetch_shopify_catalog_for_skus
 from product_prospector.core.shopify_collections import load_collection_records, resolve_collection_assignments
@@ -106,6 +114,25 @@ from product_prospector.core.workflow_build import (
 )
 from product_prospector.core.years import format_years_compact, parse_years_from_many, replace_years_in_text
 from product_prospector.core.scraper_engine import scrape_direct_product_record, scrape_product_page_images, scrape_vendor_records
+from product_prospector.core.stock_bridge import (
+    StockBridgeError,
+    assess_price_review,
+    load_stock_bridge_api_key,
+    preview_wd_prices,
+    save_stock_bridge_api_key,
+    stage_wd_prices,
+)
+from product_prospector.core.wholesale_distributors import (
+    WHOLESALE_DISTRIBUTOR_BY_KEY,
+    WHOLESALE_DISTRIBUTORS,
+    append_distributor_error_report,
+    compact_distributor_error,
+    distributor_supports_vendor,
+    load_distributor_cookies,
+    processing_distributors,
+    save_distributor_cookies,
+    selected_distributors,
+)
 from update_utils import (
     MAIN_EXECUTABLE_NAME,
     fetch_release_manifest,
@@ -137,6 +164,7 @@ INVENTORY_OWNER_VALUES = [
     "Silver-Rock Alondra Knox",
     "Big-Strike Mike Wild",
     "Pay-Streak Michael Vee",
+    "Claim-Stake Cade McQuade",
 ]
 INVENTORY_BY_OWNER = {
     "Sure-Shot Josh McGosh": 5_000_000,
@@ -144,6 +172,7 @@ INVENTORY_BY_OWNER = {
     "Silver-Rock Alondra Knox": 2_000_000,
     "Big-Strike Mike Wild": 3_000_000,
     "Pay-Streak Michael Vee": 4_000_000,
+    "Claim-Stake Cade McQuade": 6_000_000,
 }
 OWNER_TAG_BY_OWNER = {
     "Sure-Shot Josh McGosh": "Josh",
@@ -151,6 +180,7 @@ OWNER_TAG_BY_OWNER = {
     "Silver-Rock Alondra Knox": "Alondra",
     "Big-Strike Mike Wild": "Mike K",
     "Pay-Streak Michael Vee": "Michael V",
+    "Claim-Stake Cade McQuade": "Cade",
 }
 LEGACY_OWNER_NAME_MAP = {
     "Gravel Gus": "Sure-Shot Josh McGosh",
@@ -159,6 +189,8 @@ LEGACY_OWNER_NAME_MAP = {
     "Alondra": "Silver-Rock Alondra Knox",
     "Mike K": "Big-Strike Mike Wild",
     "Michael V": "Pay-Streak Michael Vee",
+    "Cade": "Claim-Stake Cade McQuade",
+    "Claim Stake Cade McQuade": "Claim-Stake Cade McQuade",
 }
 DEFAULT_INVENTORY_OWNER = "Sure-Shot Josh McGosh"
 SEARCH_TERM_MARKER_RULES = (
@@ -271,6 +303,98 @@ def _open_url_in_chrome(url: str) -> bool:
         return False
 
 
+def _open_url_in_firefox(url: str) -> bool:
+    target = _normalize_url_for_open(url)
+    if not target:
+        return False
+
+    if sys.platform == "win32":
+        program_files = Path("C:/Program Files")
+        program_files_x86 = Path("C:/Program Files (x86)")
+        local_app_data = Path(str(Path.home() / "AppData" / "Local"))
+        candidates = [
+            program_files / "Mozilla Firefox/firefox.exe",
+            program_files_x86 / "Mozilla Firefox/firefox.exe",
+            local_app_data / "Mozilla Firefox/firefox.exe",
+        ]
+        for firefox_path in candidates:
+            if firefox_path.exists():
+                try:
+                    subprocess.Popen([str(firefox_path), target])
+                    return True
+                except Exception:
+                    continue
+        try:
+            subprocess.Popen(["firefox", target])
+            return True
+        except Exception:
+            pass
+
+    for binary in ["firefox", "mozilla-firefox"]:
+        try:
+            subprocess.Popen([binary, target])
+            return True
+        except Exception:
+            continue
+
+    try:
+        return bool(webbrowser.open(target, new=1, autoraise=True))
+    except Exception:
+        return False
+
+
+def _audit_wd_source_url(payload: dict[str, object] | None) -> str:
+    values = payload if isinstance(payload, dict) else {}
+    for key in ("product_url", "source_url", "search_url"):
+        url = _normalize_url_for_open(str(values.get(key, "") or ""))
+        if url:
+            return url
+    return ""
+
+
+def _audit_money_value(value: object) -> float | None:
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", text)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def _audit_margin_percent(shopify_selling_price: object, scraped_cost: object) -> float | None:
+    selling_price = _audit_money_value(shopify_selling_price)
+    cost = _audit_money_value(scraped_cost)
+    if selling_price is None or selling_price <= 0 or cost is None:
+        return None
+    return ((selling_price - cost) / selling_price) * 100.0
+
+
+def _audit_margin_text(shopify_selling_price: object, scraped_cost: object) -> str:
+    margin = _audit_margin_percent(shopify_selling_price, scraped_cost)
+    if margin is None or abs(margin) < 0.05:
+        return "Margin: 0%"
+    rounded = round(margin, 1)
+    number = f"{rounded:.0f}" if rounded.is_integer() else f"{rounded:.1f}"
+    prefix = "+" if rounded > 0 else ""
+    return f"Margin: {prefix}{number}%"
+
+
+def _shopify_selling_price_index(catalog_df: pd.DataFrame | None) -> dict[str, str]:
+    if catalog_df is None or catalog_df.empty or "sku" not in catalog_df.columns or "price" not in catalog_df.columns:
+        return {}
+    output: dict[str, str] = {}
+    for _, row in catalog_df.iterrows():
+        sku = normalize_sku(row.get("sku", ""))
+        price = str(row.get("price", "") or "").strip()
+        if sku and _audit_money_value(price) is not None:
+            output.setdefault(sku, price)
+    return output
+
+
 def _resolve_runtime_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -345,6 +469,26 @@ def _fixed_vendor_mapping_value(vendor_name: str) -> str:
     if not vendor:
         return ""
     return f"{FIXED_VENDOR_MAPPING_PREFIX}{vendor}"
+
+
+def _filter_vendor_autocomplete_choices(query: str, choices: list[str] | tuple[str, ...]) -> list[str]:
+    """Rank vendor choices by prefix, word-prefix, then substring matches."""
+    needle = str(query or "").strip().casefold()
+    unique = list(dict.fromkeys(str(value or "").strip() for value in choices if str(value or "").strip()))
+    if not needle:
+        return unique
+    prefix = [value for value in unique if value.casefold().startswith(needle)]
+    word_prefix = [
+        value
+        for value in unique
+        if value not in prefix and any(word.startswith(needle) for word in re.findall(r"[a-z0-9]+", value.casefold()))
+    ]
+    contains = [
+        value
+        for value in unique
+        if value not in prefix and value not in word_prefix and needle in value.casefold()
+    ]
+    return [*prefix, *word_prefix, *contains]
 
 
 def _parse_fixed_vendor_mapping_value(value: str) -> str:
@@ -509,12 +653,16 @@ class ProductProspectorDesktopApp:
         self.sku_text_status = StringVar(value="")
         self.mpn_text_status = StringVar(value="")
         self.product_id_text_status = StringVar(value="")
+        self.audit_sku_text_status = StringVar(value="")
+        self.audit_status_text = StringVar(value="Choose Vendor Search or WD Search, paste SKUs/MPNs, and select the fields to audit.")
+        self.wd_processing_summary_text = StringVar(value="")
         self.source_status_text = StringVar(value="")
         self.vendor_input_loaded_text = StringVar(value="")
         self.duplicate_check_text = StringVar(value="")
         self.setup_status_text = StringVar(value="Select a Run Mode to begin.")
         self.processing_status_text = StringVar(value="")
         self.review_status_text = StringVar(value="")
+        self.audit_wd_review_status_text = StringVar(value="")
 
         self.shopify_connected = False
         self.shopify_connecting = False
@@ -534,6 +682,13 @@ class ProductProspectorDesktopApp:
         self.run_mode_locked = BooleanVar(value=False)
         self.run_mode_summary_text = StringVar(value="")
         self.update_lookup_vendor = StringVar(value="")
+        self.audit_vendor = StringVar(value="")
+        self.audit_input_is_mpn = BooleanVar(value=False)
+        self.audit_search_type = StringVar(value=AUDIT_SEARCH_VENDOR)
+        self.audit_distributor_vars: dict[str, BooleanVar] = {
+            distributor.key: BooleanVar(value=True)
+            for distributor in WHOLESALE_DISTRIBUTORS
+        }
         self.inventory_owner = StringVar(value=DEFAULT_INVENTORY_OWNER)
         self.inventory_owner_inventory_text = StringVar(value=f"Inventory default: {_inventory_for_owner(DEFAULT_INVENTORY_OWNER):,}")
         self.shopify_cache_inline_text = StringVar(value="Shopify SKU cache: not ready")
@@ -555,6 +710,7 @@ class ProductProspectorDesktopApp:
         self.vendor_weight_column = StringVar(value="")
         self.vendor_vendor_column = StringVar(value="")
         self.update_lookup_vendor.trace_add("write", lambda *_args: self._on_lookup_vendor_changed())
+        self.audit_vendor.trace_add("write", lambda *_args: self._on_audit_vendor_changed())
         self._vendor_mapping_trace_ready = False
         self._vendor_mapping_enforce_inflight = False
         self._vendor_mapping_enforcement_suspended = 0
@@ -576,6 +732,19 @@ class ProductProspectorDesktopApp:
         self.update_application = BooleanVar(value=False)
         self.push_fitment_vehicles = BooleanVar(value=False)
 
+        self.audit_field_vars: dict[str, BooleanVar] = {
+            "sku": BooleanVar(value=True),
+            "title": BooleanVar(value=False),
+            "price": BooleanVar(value=True),
+            "cost": BooleanVar(value=False),
+            "description_html": BooleanVar(value=False),
+            "media_urls": BooleanVar(value=False),
+            "vendor": BooleanVar(value=False),
+            "weight": BooleanVar(value=False),
+            "barcode": BooleanVar(value=False),
+            "application": BooleanVar(value=False),
+        }
+
         self.image_capture_url = StringVar(value="")
         self.image_capture_status = StringVar(value="")
         self.image_capture_inflight = False
@@ -587,10 +756,18 @@ class ProductProspectorDesktopApp:
         self._scrape_search_url_auto_vendor_key = ""
         self._scrape_search_url_inferred_vendor = ""
         self.scrape_search_url_entry: ttk.Entry | None = None
+        self.scrape_search_url_label: ttk.Label | None = None
+        self.wd_search_urls_frame: ttk.Frame | None = None
+        self.wd_search_url_vars: dict[str, StringVar] = {}
         self.scrape_product_url_label: ttk.Label | None = None
         self.scrape_product_url_entry: ttk.Entry | None = None
         self.scrape_product_url_note: ttk.Label | None = None
         self.scrape_cookie_text: tk.Text | None = None
+        self.scrape_cookie_label: ttk.Label | None = None
+        self.scrape_cookie_note: ttk.Label | None = None
+        self.turn14_cookie_text: tk.Text | None = None
+        self.turn14_cookie_label: ttk.Label | None = None
+        self.turn14_cookie_note: ttk.Label | None = None
         self.scrape_workers_combo: ttk.Combobox | None = None
         self.scrape_workers = StringVar(value="3")
         self.scrape_worker_options = tuple(str(value) for value in range(1, 11))
@@ -682,6 +859,7 @@ class ProductProspectorDesktopApp:
         self.review_field_widgets: dict[str, tuple[tk.Widget, tk.Widget]] = {}
         self.review_variant_field_widgets: dict[str, tk.Widget] = {}
         self.review_field_layouts: dict[str, tuple[int, int]] = {}
+        self.audit_wd_review_vars: dict[tuple[str, str], StringVar] = {}
         self.review_cost_options_loaded_for_sku: str = ""
         self.review_collective_note_text = StringVar(value="")
         self.review_busy_spinner_job: str | None = None
@@ -702,6 +880,7 @@ class ProductProspectorDesktopApp:
         self._duplicate_check_pending_scope: tuple[str, ...] = ()
         self._duplicate_check_started_at = 0.0
         self.shopify_push_inflight = False
+        self.stock_bridge_push_inflight = False
         self.push_selected_skus: set[str] = set()
         self.variant_selected_keys: set[str] = set()
         self.review_table_row_index_map: dict[str, int] = {}
@@ -844,6 +1023,7 @@ class ProductProspectorDesktopApp:
                 self.processing_inflight,
                 self.image_capture_inflight,
                 self.shopify_push_inflight,
+                self.stock_bridge_push_inflight,
                 self.shopify_connecting,
                 self._background_connect_running,
                 self.review_busy_active,
@@ -1560,6 +1740,12 @@ class ProductProspectorDesktopApp:
             variable=self.run_mode,
             value=RUN_MODE_IMAGE_CAPTURE,
         ).pack(anchor=W, pady=2)
+        ttk.Radiobutton(
+            self.mode_options_wrap,
+            text="Audit",
+            variable=self.run_mode,
+            value=RUN_MODE_AUDIT,
+        ).pack(anchor=W, pady=2)
 
         self.mode_summary_wrap = ttk.Frame(self.mode_selector_wrap, padding=(0, 10, 0, 0))
         ttk.Label(self.mode_summary_wrap, textvariable=self.run_mode_summary_text, font=("Segoe UI", 13, "bold")).pack(
@@ -1588,7 +1774,170 @@ class ProductProspectorDesktopApp:
         self.image_capture_progress.pack(side=LEFT, padx=(12, 0))
         ttk.Label(ic, textvariable=self.image_capture_status, foreground="#1f4e79", wraplength=600, justify=LEFT).pack(anchor=W, pady=(8, 0))
 
+        # === Audit panel ===
+        self.audit_wrap = ttk.Frame(self.setup_workflow_wrap, padding=8)
+
+        audit_intro = ttk.LabelFrame(self.audit_wrap, text="Audit Products", padding=12)
+        audit_intro.pack(fill=X, pady=(0, 10))
+        ttk.Label(
+            audit_intro,
+            text="Paste a large SKU/MPN batch, choose a vendor-site search or a wholesale-distributor search, then select the fields to verify.",
+            foreground="#1f4e79",
+            wraplength=1050,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 10))
+
+        audit_input_grid = ttk.Frame(audit_intro)
+        audit_input_grid.pack(fill=X)
+        audit_input_grid.columnconfigure(0, weight=0, minsize=330)
+        audit_input_grid.columnconfigure(1, weight=1)
+
+        audit_vendor_frame = ttk.LabelFrame(audit_input_grid, text="1. Vendor / Brand Context", padding=10)
+        audit_vendor_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Label(
+            audit_vendor_frame,
+            text="Choose the brand whose SKUs you are checking.",
+            wraplength=285,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 6))
+        self.audit_vendor_combo = ttk.Combobox(
+            audit_vendor_frame,
+            textvariable=self.audit_vendor,
+            values=self.vendor_profile_choices,
+            state="normal",
+            width=42,
+            height=18,
+        )
+        self.audit_vendor_combo.pack(fill=X)
+        self._enable_vendor_autocomplete(self.audit_vendor_combo)
+        ttk.Label(
+            audit_vendor_frame,
+            text="Used for SKU-prefix rules and known vendor/brand metadata. Vendor Search also uses it to prefill the scraper URL.",
+            foreground="#666666",
+            wraplength=285,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(8, 0))
+
+        audit_sku_frame = ttk.LabelFrame(audit_input_grid, text="2. SKU / MPN", padding=10)
+        audit_sku_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        audit_input_mode_row = ttk.Frame(audit_sku_frame)
+        audit_input_mode_row.pack(fill=X)
+        ttk.Label(
+            audit_input_mode_row,
+            text="Paste hundreds at once using line breaks, commas, semicolons, or | separators.",
+        ).pack(side=LEFT)
+        self.audit_mpn_check = ttk.Checkbutton(
+            audit_input_mode_row,
+            text="MPN? Search full value",
+            variable=self.audit_input_is_mpn,
+            command=self._on_audit_search_mode_changed,
+        )
+        self.audit_mpn_check.pack(side=RIGHT, padx=(12, 0))
+        self.audit_sku_text_widget = tk.Text(audit_sku_frame, height=8, wrap="word")
+        self.audit_sku_text_widget.pack(fill=X, pady=(6, 6))
+        audit_sku_actions = ttk.Frame(audit_sku_frame)
+        audit_sku_actions.pack(fill=X)
+        self.audit_load_skus_btn = ttk.Button(
+            audit_sku_actions,
+            text="Load SKU Batch",
+            command=self._load_audit_skus,
+        )
+        self.audit_load_skus_btn.pack(side=LEFT)
+        self.audit_clear_skus_btn = ttk.Button(
+            audit_sku_actions,
+            text="Clear",
+            command=self._clear_audit_skus,
+        )
+        self.audit_clear_skus_btn.pack(side=LEFT, padx=(8, 0))
+        ttk.Label(audit_sku_actions, textvariable=self.audit_sku_text_status, foreground="#1f4e79").pack(
+            side=LEFT,
+            padx=(12, 0),
+        )
+
+        audit_source_wrap = ttk.LabelFrame(self.audit_wrap, text="3. Search Source", padding=12)
+        audit_source_wrap.pack(fill=X, pady=(0, 10))
+        source_mode_row = ttk.Frame(audit_source_wrap)
+        source_mode_row.pack(fill=X, pady=(0, 8))
+        self.audit_vendor_search_radio = ttk.Radiobutton(
+            source_mode_row,
+            text="Vendor Search",
+            variable=self.audit_search_type,
+            value=AUDIT_SEARCH_VENDOR,
+            command=self._on_audit_search_type_changed,
+        )
+        self.audit_vendor_search_radio.pack(side=LEFT)
+        self.audit_wd_search_radio = ttk.Radiobutton(
+            source_mode_row,
+            text="WD Search",
+            variable=self.audit_search_type,
+            value=AUDIT_SEARCH_WD,
+            command=self._on_audit_search_type_changed,
+        )
+        self.audit_wd_search_radio.pack(side=LEFT, padx=(18, 0))
+        ttk.Label(
+            source_mode_row,
+            text="Both modes use the selected brand as product context. WD Search checks every SKU/MPN at each selected distributor.",
+            foreground="#1f4e79",
+        ).pack(side=LEFT, padx=(18, 0))
+
+        self.audit_distributor_grid = ttk.Frame(audit_source_wrap)
+        self.audit_distributor_grid.pack(fill=X)
+        for column in range(3):
+            self.audit_distributor_grid.columnconfigure(column, weight=1)
+        self.audit_distributor_checks: list[ttk.Checkbutton] = []
+        for index, distributor in enumerate(WHOLESALE_DISTRIBUTORS):
+            option = ttk.Checkbutton(
+                self.audit_distributor_grid,
+                text=f"{distributor.label}  ({distributor.search_url.split('/')[2]})",
+                variable=self.audit_distributor_vars[distributor.key],
+                command=self._on_audit_distributor_selection_changed,
+                style="WideUpdate.TCheckbutton",
+            )
+            option.grid(row=index // 3, column=index % 3, sticky=W, padx=(0, 18), pady=4)
+            self.audit_distributor_checks.append(option)
+
+        audit_fields_wrap = ttk.LabelFrame(self.audit_wrap, text="4. Fields To Audit", padding=12)
+        audit_fields_wrap.pack(fill=X, pady=(0, 10))
+        ttk.Label(
+            audit_fields_wrap,
+            text="Only checked fields will be requested from the scraper and shown as audit targets. Price is selected by default.",
+            foreground="#1f4e79",
+        ).pack(anchor=W, pady=(0, 8))
+        audit_fields_grid = ttk.Frame(audit_fields_wrap)
+        audit_fields_grid.pack(fill=X)
+        for column in range(5):
+            audit_fields_grid.columnconfigure(column, weight=1)
+        audit_field_options = [
+            ("sku", "SKU", 0, 0),
+            ("price", "Price", 0, 1),
+            ("cost", "Cost", 0, 2),
+            ("title", "Title", 0, 3),
+            ("vendor", "Vendor", 0, 4),
+            ("description_html", "Description", 1, 0),
+            ("media_urls", "Images", 1, 1),
+            ("weight", "Weight", 1, 2),
+            ("barcode", "Barcode", 1, 3),
+            ("application", "Application", 1, 4),
+        ]
+        for field_name, label, row, column in audit_field_options:
+            ttk.Checkbutton(
+                audit_fields_grid,
+                text=label,
+                variable=self.audit_field_vars[field_name],
+                state="disabled" if field_name == "sku" else "normal",
+                style="WideUpdate.TCheckbutton",
+            ).grid(row=row, column=column, sticky=W, padx=(0, 16), pady=4)
+
+        ttk.Label(
+            self.audit_wrap,
+            textvariable=self.audit_status_text,
+            foreground="#1f4e79",
+            wraplength=1050,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 8))
+
         input_box = ttk.Frame(self.setup_workflow_wrap, padding=8)
+        self.standard_setup_input_wrap = input_box
         input_box.pack(fill=X, pady=(0, 8))
 
         self.text_input_wrap = ttk.Frame(input_box)
@@ -1627,10 +1976,11 @@ class ProductProspectorDesktopApp:
             self.mpn_scope_frame,
             textvariable=self.update_lookup_vendor,
             values=self.vendor_profile_choices,
-            state="readonly",
+            state="normal",
             width=34,
         )
         self.update_lookup_vendor_combo.pack(fill=X, pady=(6, 6))
+        self._enable_vendor_autocomplete(self.update_lookup_vendor_combo)
         self.mpn_text_widget = tk.Text(self.mpn_scope_frame, height=4, wrap="word")
         self.mpn_text_widget.pack(fill=X, pady=(0, 6))
         mpn_btn_row = ttk.Frame(self.mpn_scope_frame)
@@ -1812,6 +2162,12 @@ class ProductProspectorDesktopApp:
             self.vendor_fitment_combo,
             self.setup_continue_btn,
             self.setup_skip_review_btn,
+            self.audit_vendor_combo,
+            self.audit_load_skus_btn,
+            self.audit_clear_skus_btn,
+            self.audit_mpn_check,
+            self.audit_vendor_search_radio,
+            self.audit_wd_search_radio,
         ]
         self._refresh_sku_action_labels()
         self._set_duplicate_check_busy(False)
@@ -1882,6 +2238,7 @@ class ProductProspectorDesktopApp:
         if not hasattr(self, "setup_workflow_wrap"):
             return
         is_image_capture = self.run_mode.get() == RUN_MODE_IMAGE_CAPTURE
+        is_audit = self.run_mode.get() == RUN_MODE_AUDIT
         if hasattr(self, "image_capture_wrap"):
             if visible and is_image_capture:
                 self.image_capture_wrap.pack(fill=X, pady=(0, 8))
@@ -1890,7 +2247,18 @@ class ProductProspectorDesktopApp:
         if visible and not is_image_capture:
             if not self.setup_workflow_wrap.winfo_manager():
                 self.setup_workflow_wrap.pack(fill=X)
+            if hasattr(self, "audit_wrap") and hasattr(self, "standard_setup_input_wrap"):
+                if is_audit:
+                    self.standard_setup_input_wrap.pack_forget()
+                    if not self.audit_wrap.winfo_manager():
+                        self.audit_wrap.pack(fill=X, before=self.setup_footer_wrap)
+                else:
+                    self.audit_wrap.pack_forget()
+                    if not self.standard_setup_input_wrap.winfo_manager():
+                        self.standard_setup_input_wrap.pack(fill=X, pady=(0, 8), before=self.setup_footer_wrap)
             return
+        if hasattr(self, "audit_wrap"):
+            self.audit_wrap.pack_forget()
         self.setup_workflow_wrap.pack_forget()
 
     def _on_setup_status_rows_changed(self, *_args) -> None:
@@ -2176,6 +2544,8 @@ class ProductProspectorDesktopApp:
     def _is_push_eligible(self, product) -> bool:
         if product is None:
             return False
+        if self.session.mode == MODE_AUDIT:
+            return False
         if bool(getattr(product, "excluded", False)) or bool(getattr(product, "remove_marked", False)):
             return False
         if self.session.mode == MODE_UPDATE:
@@ -2323,8 +2693,8 @@ class ProductProspectorDesktopApp:
         self._refresh_mode_lock_ui()
 
     def _reset_application_state(self) -> None:
-        if self.processing_inflight or self.shopify_push_inflight:
-            messagebox.showwarning(APP_TITLE, "Wait for active processing or Shopify push to finish before resetting.")
+        if self.processing_inflight or self.shopify_push_inflight or self.stock_bridge_push_inflight:
+            messagebox.showwarning(APP_TITLE, "Wait for active processing or push to finish before resetting.")
             return
 
         self._unlock_run_mode()
@@ -2339,6 +2709,8 @@ class ProductProspectorDesktopApp:
         self.sku_text_status.set("")
         self.mpn_text_status.set("")
         self.product_id_text_status.set("")
+        self.audit_sku_text_status.set("")
+        self.audit_status_text.set("Choose Vendor Search or WD Search, paste SKUs/MPNs, and select the fields to audit.")
         self.duplicate_check_text.set("")
         self.rules_status.configure(text="")
         self.setup_status_text.set("Application reset. Select a Run Mode to begin.")
@@ -2351,6 +2723,16 @@ class ProductProspectorDesktopApp:
             self.mpn_text_widget.configure(state="normal")
             self.mpn_text_widget.delete("1.0", END)
         self.update_lookup_vendor.set("")
+        self.audit_vendor.set("")
+        self.audit_input_is_mpn.set(False)
+        self.audit_search_type.set(AUDIT_SEARCH_VENDOR)
+        for variable in self.audit_distributor_vars.values():
+            variable.set(True)
+        if hasattr(self, "audit_sku_text_widget"):
+            self.audit_sku_text_widget.configure(state="normal")
+            self.audit_sku_text_widget.delete("1.0", END)
+        for field_name, variable in self.audit_field_vars.items():
+            variable.set(field_name in {"sku", "price"})
         self.product_id_text_widget.configure(state="normal")
         self.product_id_text_widget.delete("1.0", END)
 
@@ -2361,6 +2743,8 @@ class ProductProspectorDesktopApp:
         self._scrape_search_url_inferred_vendor = ""
         if self.scrape_cookie_text is not None:
             self.scrape_cookie_text.delete("1.0", END)
+        if self.turn14_cookie_text is not None:
+            self.turn14_cookie_text.delete("1.0", END)
         self.scrape_workers.set("3")
         self.scrape_delay.set("0.35")
         self.scrape_retries.set("2")
@@ -2432,6 +2816,7 @@ class ProductProspectorDesktopApp:
         display_mode_map = {
             RUN_MODE_UPDATE: "Update Existing Products",
             RUN_MODE_CREATE: "Create New Product",
+            RUN_MODE_AUDIT: "Audit Products",
         }
         display_mode = display_mode_map.get(mode_name, "Not Selected")
         self.run_mode_summary_text.set(display_mode)
@@ -2463,9 +2848,14 @@ class ProductProspectorDesktopApp:
         settings_wrap = ttk.LabelFrame(self.preview_inner, text="Scraper Settings", padding=8)
         settings_wrap.pack(fill=X, pady=(0, 8))
 
-        ttk.Label(settings_wrap, text="Vendor Search URL", width=24).grid(row=0, column=0, sticky=W, padx=(0, 8), pady=3)
+        self.scrape_search_url_label = ttk.Label(settings_wrap, text="Vendor Search URL", width=24)
+        self.scrape_search_url_label.grid(row=0, column=0, sticky=W, padx=(0, 8), pady=3)
         self.scrape_search_url_entry = ttk.Entry(settings_wrap, textvariable=self.scrape_search_url)
         self.scrape_search_url_entry.grid(row=0, column=1, sticky="ew", pady=3)
+        self.wd_search_urls_frame = ttk.Frame(settings_wrap)
+        self.wd_search_urls_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.wd_search_urls_frame.columnconfigure(1, weight=1)
+        self.wd_search_urls_frame.grid_remove()
         self.scrape_product_url_label = ttk.Label(settings_wrap, text="Direct Product URL", width=24)
         self.scrape_product_url_label.grid(row=1, column=0, sticky=W, padx=(0, 8), pady=3)
         self.scrape_product_url_entry = ttk.Entry(settings_wrap, textvariable=self.scrape_product_url)
@@ -2476,18 +2866,42 @@ class ProductProspectorDesktopApp:
             foreground="#1f4e79",
         )
         self.scrape_product_url_note.grid(row=2, column=1, sticky=W, pady=(0, 3))
-        ttk.Label(
+        self.scrape_cookie_label = ttk.Label(
             settings_wrap,
             text="Cookies (optional)",
             width=24,
-        ).grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=3)
+        )
+        self.scrape_cookie_label.grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=3)
         self.scrape_cookie_text = tk.Text(settings_wrap, height=4, wrap="none", font=("Courier", 9))
         self.scrape_cookie_text.grid(row=3, column=1, sticky="ew", pady=3)
-        ttk.Label(
+        self.scrape_cookie_note = ttk.Label(
             settings_wrap,
             text="Paste JSON from EditThisCookie to access login-protected pages.",
             foreground="#1f4e79",
-        ).grid(row=4, column=1, sticky=W, pady=(0, 3))
+        )
+        self.scrape_cookie_note.grid(row=4, column=1, sticky=W, pady=(0, 3))
+        self.turn14_cookie_label = ttk.Label(
+            settings_wrap,
+            text="Turn 14 Cookies (optional)",
+            width=24,
+        )
+        self.turn14_cookie_label.grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=3)
+        self.turn14_cookie_text = tk.Text(settings_wrap, height=4, wrap="none", font=("Courier", 9))
+        self.turn14_cookie_text.grid(row=3, column=1, sticky="ew", pady=3)
+        self.turn14_cookie_note = ttk.Label(
+            settings_wrap,
+            text=(
+                "Only needed when Turn 14 is not connecting. Paste fresh EditThisCookie JSON "
+                "from a logged-in Chrome session; it is saved privately and used only for Turn 14."
+            ),
+            foreground="#1f4e79",
+            wraplength=980,
+            justify=LEFT,
+        )
+        self.turn14_cookie_note.grid(row=4, column=1, sticky=W, pady=(0, 3))
+        self.turn14_cookie_label.grid_remove()
+        self.turn14_cookie_text.grid_remove()
+        self.turn14_cookie_note.grid_remove()
         ttk.Label(settings_wrap, text="Workers", width=24).grid(row=5, column=0, sticky=W, padx=(0, 8), pady=3)
         self.scrape_workers_combo = ttk.Combobox(
             settings_wrap,
@@ -2501,6 +2915,14 @@ class ProductProspectorDesktopApp:
         ttk.Entry(settings_wrap, textvariable=self.scrape_delay, width=12).grid(row=6, column=1, sticky=W, pady=3)
         ttk.Label(settings_wrap, text="Retry Count", width=24).grid(row=7, column=0, sticky=W, padx=(0, 8), pady=3)
         ttk.Entry(settings_wrap, textvariable=self.scrape_retries, width=12).grid(row=7, column=1, sticky=W, pady=3)
+        self.wd_processing_summary_label = ttk.Label(
+            settings_wrap,
+            textvariable=self.wd_processing_summary_text,
+            foreground="#1f4e79",
+            wraplength=1050,
+            justify=LEFT,
+        )
+        self.wd_processing_summary_label.grid(row=8, column=0, columnspan=2, sticky=W, pady=(8, 3))
         settings_wrap.columnconfigure(1, weight=1)
         self._refresh_scrape_source_inputs()
 
@@ -2588,6 +3010,23 @@ class ProductProspectorDesktopApp:
         self._review_entry_row(form_grid, "Core Charge Code", "core_charge_product_code", 8, 2)
         self._review_tags_row(form_grid, 9, 2)
 
+        self.audit_wd_review_wrap = ttk.LabelFrame(
+            self.export_inner,
+            text="Wholesale Distributor Audit Results",
+            padding=8,
+        )
+        self.audit_wd_review_wrap.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            self.audit_wd_review_wrap,
+            textvariable=self.audit_wd_review_status_text,
+            foreground="#1f4e79",
+            wraplength=1120,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 6))
+        self.audit_wd_review_grid = ttk.Frame(self.audit_wd_review_wrap)
+        self.audit_wd_review_grid.pack(fill=X)
+        self.audit_wd_review_wrap.pack_forget()
+
         self.variant_form_wrap = ttk.LabelFrame(self.export_inner, text="Variant Review", padding=8)
         self.variant_form_wrap.pack(fill=X, pady=(0, 8))
         variant_grid = ttk.Frame(self.variant_form_wrap)
@@ -2673,9 +3112,16 @@ class ProductProspectorDesktopApp:
         export_row = ttk.Frame(self.export_inner)
         export_row.pack(fill=X, pady=(8, 0))
         ttk.Button(export_row, text="Save Current", command=self._save_current_review_product).pack(side=LEFT)
-        ttk.Button(export_row, text="Generate CSV", command=self._export_review_products).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(export_row, text="Save CSV / XLSX", command=self._export_review_products).pack(side=LEFT, padx=(8, 0))
         self.push_shopify_btn = ttk.Button(export_row, text="Push to Shopify", command=self._push_to_shopify_clicked)
         self.push_shopify_btn.pack(side=LEFT, padx=(8, 0))
+        self.push_stock_bridge_btn = ttk.Button(
+            export_row,
+            text="Push to Stock Bridge",
+            command=self._push_to_stock_bridge_clicked,
+            state="disabled",
+        )
+        self.push_stock_bridge_btn.pack(side=LEFT, padx=(8, 0))
         self._refresh_push_button_state()
 
         # Review overlay blocks interaction during remap/reprocess and shows spinner progress state.
@@ -2726,6 +3172,60 @@ class ProductProspectorDesktopApp:
         combo = ttk.Combobox(frame, textvariable=variable, state="readonly", width=44)
         combo.pack(side=LEFT, fill=X, expand=True)
         return combo
+
+    def _enable_vendor_autocomplete(self, combo: ttk.Combobox) -> None:
+        choices = tuple(self.vendor_profile_choices)
+        state = {"busy": False}
+
+        def restore_values(_event=None) -> None:
+            try:
+                combo.configure(values=choices)
+            except Exception:
+                pass
+
+        def choose_best(event=None):
+            if state["busy"]:
+                return None
+            typed = str(combo.get() or "").strip()
+            matches = _filter_vendor_autocomplete_choices(typed, choices)
+            exact = next((value for value in matches if value.casefold() == typed.casefold()), "")
+            selected = exact or (matches[0] if len(matches) == 1 else "")
+            if selected:
+                state["busy"] = True
+                try:
+                    combo.set(selected)
+                    combo.icursor(END)
+                    combo.selection_clear()
+                finally:
+                    state["busy"] = False
+            restore_values()
+            return "break" if getattr(event, "keysym", "") == "Return" else None
+
+        def on_key_release(event) -> None:
+            if state["busy"] or str(combo.cget("state")) == "disabled":
+                return
+            if event.keysym in {"Up", "Down", "Left", "Right", "Home", "End", "Tab", "Return", "Escape"}:
+                return
+            typed = str(combo.get() or "")
+            matches = _filter_vendor_autocomplete_choices(typed, choices)
+            combo.configure(values=matches or choices)
+            if not typed or event.keysym in {"BackSpace", "Delete"} or not matches:
+                return
+            suggestion = matches[0]
+            if not suggestion.casefold().startswith(typed.casefold()) or suggestion.casefold() == typed.casefold():
+                return
+            state["busy"] = True
+            try:
+                combo.set(suggestion)
+                combo.icursor(len(typed))
+                combo.selection_range(len(typed), END)
+            finally:
+                state["busy"] = False
+
+        combo.bind("<KeyRelease>", on_key_release, add="+")
+        combo.bind("<Return>", choose_best, add="+")
+        combo.bind("<FocusOut>", choose_best, add="+")
+        combo.bind("<<ComboboxSelected>>", restore_values, add="+")
 
     def _toggle_remap_fields(self) -> None:
         self.remap_fields_expanded.set(not bool(self.remap_fields_expanded.get()))
@@ -2783,6 +3283,189 @@ class ProductProspectorDesktopApp:
         )
         self.review_field_widgets[field_name] = (label_widget, entry_widget)
         self.review_field_layouts[field_name] = (row, col_offset)
+
+    @staticmethod
+    def _audit_field_label(field_name: str) -> str:
+        labels = {
+            "description_html": "Description",
+            "media_urls": "Images",
+            "core_charge_product_code": "Core Charge Code",
+        }
+        return labels.get(field_name, field_name.replace("_", " ").title())
+
+    def _refresh_audit_wd_review_fields(self, product=None) -> None:
+        wd_review = (
+            self.session.mode == MODE_AUDIT
+            and self.session.audit_search_type == AUDIT_SEARCH_WD
+            and product is not None
+        )
+        if not wd_review:
+            self.audit_wd_review_vars = {}
+            if hasattr(self, "audit_wd_review_wrap") and self.audit_wd_review_wrap.winfo_manager():
+                self.audit_wd_review_wrap.pack_forget()
+            return
+
+        if not self.audit_wd_review_wrap.winfo_manager():
+            self.audit_wd_review_wrap.pack(fill=X, pady=(0, 8), before=self.review_table_wrap)
+        for child in self.audit_wd_review_grid.winfo_children():
+            child.destroy()
+        self.audit_wd_review_vars = {}
+
+        distributors = selected_distributors(self.session.audit_distributors)
+        requested_fields = [
+            str(field or "").strip()
+            for field in (self.session.update_fields or [])
+            if str(field or "").strip() and str(field or "").strip() != "sku"
+        ]
+        self.audit_wd_review_status_text.set(
+            f"{len(distributors)} distributor(s) checked for this SKU. Values can be corrected before CSV export."
+        )
+        self.audit_wd_review_grid.columnconfigure(0, weight=0, minsize=260)
+        for column in range(1, len(requested_fields) + 1):
+            self.audit_wd_review_grid.columnconfigure(column, weight=1)
+        self.audit_wd_review_grid.columnconfigure(len(requested_fields) + 1, weight=0, minsize=240)
+
+        ttk.Label(self.audit_wd_review_grid, text="Distributor", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky=W, padx=(0, 10), pady=(0, 4)
+        )
+        for column, field_name in enumerate(requested_fields, start=1):
+            ttk.Label(
+                self.audit_wd_review_grid,
+                text=self._audit_field_label(field_name),
+                font=("Segoe UI", 9, "bold"),
+            ).grid(row=0, column=column, sticky=W, padx=(0, 10), pady=(0, 4))
+        ttk.Label(self.audit_wd_review_grid, text="Status", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=len(requested_fields) + 1, sticky=W, pady=(0, 4)
+        )
+
+        result_map = dict(getattr(product, "audit_distributor_results", {}) or {})
+        error_map = dict(getattr(product, "audit_distributor_errors", {}) or {})
+        skip_map = dict(getattr(product, "audit_distributor_skips", {}) or {})
+        self.audit_wd_review_status_text.set(
+            f"{len(distributors)} distributor(s) selected; {len(skip_map)} skipped because the vendor is not carried. "
+            "Available values can be corrected before CSV/XLSX export."
+        )
+        for row_index, distributor in enumerate(distributors, start=1):
+            is_skipped = distributor.key in skip_map
+            ttk.Label(
+                self.audit_wd_review_grid,
+                text=distributor.label,
+                foreground="#6B7280" if is_skipped else "",
+            ).grid(
+                row=row_index, column=0, sticky=W, padx=(0, 10), pady=3
+            )
+            payload = result_map.get(distributor.key)
+            payload = payload if isinstance(payload, dict) else {}
+            source_url = _audit_wd_source_url(payload)
+            shopify_selling_price = str(getattr(product, "audit_shopify_price", "") or "").strip()
+            row_has_value = False
+            for column, field_name in enumerate(requested_fields, start=1):
+                if is_skipped:
+                    field_wrap = ttk.Frame(self.audit_wd_review_grid)
+                    field_wrap.grid(row=row_index, column=column, sticky="ew", padx=(0, 10), pady=3)
+                    unavailable_wrap = tk.Frame(field_wrap, bg="#D1D5DB", height=24)
+                    unavailable_wrap.pack(fill=X)
+                    unavailable_wrap.pack_propagate(False)
+                    unavailable_entry = tk.Entry(
+                        unavailable_wrap,
+                        state="disabled",
+                        disabledbackground="#E5E7EB",
+                        disabledforeground="#6B7280",
+                        relief="solid",
+                        bd=1,
+                    )
+                    unavailable_entry.pack(fill=BOTH, expand=True)
+                    tk.Label(
+                        unavailable_wrap,
+                        text="Vendor Doesn't Exist",
+                        bg="#D1D5DB",
+                        fg="#6B7280",
+                    ).place(relx=0, rely=0, relwidth=1, relheight=1)
+                    metadata_line = ttk.Frame(field_wrap, height=20)
+                    metadata_line.pack(fill=X, pady=(2, 0))
+                    metadata_line.pack_propagate(False)
+                    if field_name == "price":
+                        ttk.Label(metadata_line, text="Margin: 0%").pack(side=RIGHT)
+                    continue
+                raw_value = payload.get(field_name, "")
+                if isinstance(raw_value, (list, tuple, set)):
+                    value = " | ".join(str(item).strip() for item in raw_value if str(item).strip())
+                else:
+                    value = str(raw_value or "").strip()
+                if value:
+                    row_has_value = True
+                variable = StringVar(value=value)
+                self.audit_wd_review_vars[(distributor.key, field_name)] = variable
+                field_wrap = ttk.Frame(self.audit_wd_review_grid)
+                field_wrap.grid(
+                    row=row_index, column=column, sticky="ew", padx=(0, 10), pady=3
+                )
+                ttk.Entry(field_wrap, textvariable=variable).pack(fill=X)
+                metadata_line = ttk.Frame(field_wrap, height=20)
+                metadata_line.pack(fill=X, pady=(2, 0))
+                metadata_line.pack_propagate(False)
+                if source_url:
+                    field_label = self._audit_field_label(field_name)
+                    link_text = f"{field_label} for {distributor.label}"
+                    source_link = tk.Label(
+                        metadata_line,
+                        text=link_text,
+                        fg="#0B57D0",
+                        cursor="hand2",
+                        anchor="w",
+                        justify=LEFT,
+                    )
+                    source_link.pack(side=LEFT, anchor=W)
+                    source_link.bind(
+                        "<Button-1>",
+                        lambda _event, distributor_key=distributor.key, url=source_url: self._open_audit_wd_source_url(
+                            distributor_key,
+                            url,
+                        ),
+                    )
+                if field_name == "price":
+                    margin_variable = StringVar(value=_audit_margin_text(shopify_selling_price, value))
+                    ttk.Label(metadata_line, textvariable=margin_variable).pack(side=RIGHT)
+
+                    def refresh_margin(
+                        *_args,
+                        cost_variable=variable,
+                        margin_text_variable=margin_variable,
+                        selling_price=shopify_selling_price,
+                    ) -> None:
+                        margin_text_variable.set(_audit_margin_text(selling_price, cost_variable.get()))
+
+                    variable.trace_add("write", refresh_margin)
+            if is_skipped:
+                status_text = "Skipped — Vendor Doesn't Exist"
+            else:
+                status_text = "Found" if row_has_value else str(error_map.get(distributor.key, "Not found") or "Not found")
+            ttk.Label(
+                self.audit_wd_review_grid,
+                text=status_text,
+                foreground="#6B7280" if is_skipped else ("#157347" if row_has_value else "#92400E"),
+                wraplength=300,
+                justify=LEFT,
+            ).grid(row=row_index, column=len(requested_fields) + 1, sticky=W, pady=3)
+
+    def _open_audit_wd_source_url(self, distributor_key: str, url: str) -> None:
+        opened = _open_url_in_firefox(url) if distributor_key == "keystone" else _open_url_in_chrome(url)
+        if not opened:
+            messagebox.showerror(APP_TITLE, f"Could not open this source URL:\n{url}")
+
+    def _save_current_audit_wd_values(self, product) -> None:
+        if self.session.mode != MODE_AUDIT or self.session.audit_search_type != AUDIT_SEARCH_WD:
+            return
+        results = dict(getattr(product, "audit_distributor_results", {}) or {})
+        errors = dict(getattr(product, "audit_distributor_errors", {}) or {})
+        for (distributor_key, field_name), variable in self.audit_wd_review_vars.items():
+            payload = dict(results.get(distributor_key, {}) or {})
+            payload[field_name] = variable.get().strip()
+            results[distributor_key] = payload
+            if any(str(value or "").strip() for value in payload.values()):
+                errors.pop(distributor_key, None)
+        product.audit_distributor_results = results
+        product.audit_distributor_errors = errors
 
     def _review_variant_entry_row(self, parent, label: str, field_name: str, row: int, col_offset: int) -> None:
         ttk.Label(parent, text=label, width=18).grid(row=row, column=col_offset, sticky=W, padx=(0, 6), pady=2)
@@ -4176,11 +4859,12 @@ class ProductProspectorDesktopApp:
             messagebox.showerror(APP_TITLE, "Invalid scraper settings. Use numeric values for workers/delay/retries.")
             return False
 
+        wd_search = self.session.mode == MODE_AUDIT and self.session.audit_search_type == AUDIT_SEARCH_WD
         direct_product_url_visible = self._should_show_scrape_product_url_input()
-        direct_product_url_raw = self.scrape_product_url.get().strip() if direct_product_url_visible else ""
-        direct_product_url = self._effective_scrape_product_url()
-        vendor_search_url_raw = self.scrape_search_url.get().strip()
-        vendor_search_url = _normalize_url_for_open(vendor_search_url_raw) or vendor_search_url_raw
+        direct_product_url_raw = self.scrape_product_url.get().strip() if direct_product_url_visible and not wd_search else ""
+        direct_product_url = "" if wd_search else self._effective_scrape_product_url()
+        vendor_search_url_raw = "" if wd_search else self.scrape_search_url.get().strip()
+        vendor_search_url = "" if wd_search else (_normalize_url_for_open(vendor_search_url_raw) or vendor_search_url_raw)
         if not direct_product_url and _looks_like_product_page_url(vendor_search_url):
             direct_product_url = _normalize_url_for_open(vendor_search_url)
             vendor_search_url = ""
@@ -4190,12 +4874,26 @@ class ProductProspectorDesktopApp:
         if direct_product_url:
             workers = 1
             self.scrape_workers.set("1")
-        scrape_cookies, cookie_error = self._parse_edit_this_cookie_json(
-            self.scrape_cookie_text.get("1.0", "end") if self.scrape_cookie_text is not None else ""
-        )
+        scrape_cookies, cookie_error = ([], None)
+        selected_wd_keys = set(self._selected_audit_distributor_keys()) if wd_search else set()
+        if wd_search and "turn14" in selected_wd_keys:
+            scrape_cookies, cookie_error = self._parse_edit_this_cookie_json(
+                self.turn14_cookie_text.get("1.0", "end") if self.turn14_cookie_text is not None else ""
+            )
+        elif not wd_search:
+            scrape_cookies, cookie_error = self._parse_edit_this_cookie_json(
+                self.scrape_cookie_text.get("1.0", "end") if self.scrape_cookie_text is not None else ""
+            )
         if cookie_error:
             messagebox.showwarning(APP_TITLE, cookie_error)
             return False
+        if wd_search and "turn14" in selected_wd_keys and scrape_cookies:
+            save_error = save_distributor_cookies("turn14", scrape_cookies)
+            if save_error:
+                messagebox.showwarning(APP_TITLE, save_error)
+                return False
+            if self.turn14_cookie_text is not None:
+                self.turn14_cookie_text.delete("1.0", "end")
         self.session.scrape_settings.product_url = direct_product_url
         self.session.scrape_settings.vendor_search_url = "" if direct_product_url else vendor_search_url
         self.session.scrape_settings.cookies = list(scrape_cookies or [])
@@ -4223,10 +4921,10 @@ class ProductProspectorDesktopApp:
                 )
             messagebox.showwarning(APP_TITLE, "No valid SKUs found in the current scope.")
             return False
-        if direct_product_url and self.session.mode not in {MODE_NEW, MODE_UPDATE}:
+        if direct_product_url and self.session.mode not in {MODE_NEW, MODE_UPDATE, MODE_AUDIT}:
             messagebox.showwarning(
                 APP_TITLE,
-                "Direct Product URL only works for Create/Update runs.",
+                "Direct Product URL only works for Create, Update, or Audit runs.",
             )
             return False
 
@@ -4234,6 +4932,7 @@ class ProductProspectorDesktopApp:
             self.session.missing_fields
             and not self.session.scrape_settings.vendor_search_url
             and not self.session.scrape_settings.product_url
+            and not wd_search
             and not allow_missing_without_scrape
         ):
             messagebox.showwarning(
@@ -4247,10 +4946,17 @@ class ProductProspectorDesktopApp:
         self._auto_open_review_after_processing = bool(auto_open_review)
         self.review_tab_unlocked = False
         self._update_tab_access()
-        if self.session.scrape_settings.vendor_search_url or self.session.scrape_settings.product_url:
+        if wd_search or self.session.scrape_settings.vendor_search_url or self.session.scrape_settings.product_url:
             self._play_header_logo_animation()
         self._set_processing_busy(True)
-        self.processing_status_text.set(f"Processing {len(target_skus)} SKU(s) in background...")
+        if wd_search:
+            total_lookups = len(target_skus) * len(self.session.audit_distributors)
+            self.processing_status_text.set(
+                f"Processing {len(target_skus)} SKU(s) across {len(self.session.audit_distributors)} WD site(s) "
+                f"({total_lookups} lookups) in background..."
+            )
+        else:
+            self.processing_status_text.set(f"Processing {len(target_skus)} SKU(s) in background...")
         try:
             if hasattr(self, "preview_canvas"):
                 self.preview_canvas.yview_moveto(0)
@@ -4306,6 +5012,22 @@ class ProductProspectorDesktopApp:
         if error:
             return None, error
         return df if df is not None else pd.DataFrame(), None
+
+    def _load_shopify_selling_prices_for_audit(self, target_skus: list[str]) -> tuple[dict[str, str], str | None]:
+        config = load_shopify_config()
+        if config is None:
+            return {}, "Invalid config/shopify.json."
+        access_token, token_error = self._load_valid_shopify_access_token(config=config, allow_handshake=False)
+        if not access_token:
+            return {}, token_error or "Shopify is not connected."
+        catalog_df, error = fetch_shopify_catalog_for_skus(
+            config=config,
+            access_token=access_token,
+            skus=target_skus,
+        )
+        if error:
+            return {}, error
+        return _shopify_selling_price_index(catalog_df), None
 
     def _load_valid_shopify_access_token(self, config=None, allow_handshake: bool = False) -> tuple[str | None, str | None]:
         config = config or load_shopify_config()
@@ -4376,6 +5098,93 @@ class ProductProspectorDesktopApp:
         except Exception:
             return True
 
+    def _run_wd_audit_scrapes(
+        self,
+        target_skus: list[str],
+        requested_scrape_fields: set[str],
+    ) -> tuple[
+        dict[str, dict[str, dict[str, str]]],
+        dict[str, dict[str, str]],
+        dict[str, dict[str, str]],
+        list[str],
+    ]:
+        records_by_sku: dict[str, dict[str, dict[str, str]]] = {}
+        errors_by_sku: dict[str, dict[str, str]] = {}
+        skips_by_sku: dict[str, dict[str, str]] = {}
+        general_warnings: list[str] = []
+        distributors = selected_distributors(self.session.audit_distributors)
+        vendor_profile = resolve_vendor_profile(self.session.lookup_vendor, required_root=self.required_root)
+        context_vendor = (
+            str(vendor_profile.shopify_vendor_value or "").strip()
+            if vendor_profile is not None
+            else ""
+        ) or (
+            str(vendor_profile.canonical_vendor or "").strip()
+            if vendor_profile is not None
+            else ""
+        ) or str(self.session.lookup_vendor or "").strip()
+
+        for site_index, distributor in enumerate(distributors, start=1):
+            vendor_supported = distributor_supports_vendor(
+                distributor.key,
+                self.session.lookup_vendor,
+                self.required_root,
+            )
+            if vendor_supported is False:
+                for raw_sku in target_skus:
+                    sku = normalize_sku(raw_sku)
+                    if sku:
+                        skips_by_sku.setdefault(sku, {})[distributor.key] = "Vendor Doesn't Exist"
+                self._run_on_ui_thread(
+                    self.processing_status_text.set,
+                    f"WD Search {site_index}/{len(distributors)}: skipping {distributor.label} — "
+                    f"{self.session.lookup_vendor} is not carried there.",
+                )
+                continue
+            self._run_on_ui_thread(
+                self.processing_status_text.set,
+                f"WD Search {site_index}/{len(distributors)}: checking {len(target_skus)} SKU(s) at {distributor.label}...",
+            )
+            cookies, cookie_warning = load_distributor_cookies(distributor.key)
+            if cookie_warning:
+                general_warnings.append(f"{distributor.label}: {cookie_warning}")
+
+            site_records, site_errors, site_warnings = scrape_vendor_records(
+                vendor_search_url=distributor.search_url,
+                skus=target_skus,
+                workers=self.session.scrape_settings.chrome_workers,
+                retry_count=self.session.scrape_settings.retry_count,
+                delay_seconds=self.session.scrape_settings.delay_seconds,
+                scrape_images=self.session.scrape_settings.scrape_images,
+                image_output_root=self.runtime_output_root / "images" / "wd" / distributor.key,
+                search_terms_by_sku=dict(self.session.search_terms_by_sku or {}),
+                requested_fields=requested_scrape_fields,
+                required_root=self.required_root,
+                cookies=cookies,
+                vendor_name=self.session.lookup_vendor,
+            )
+            normalized_records = {normalize_sku(key): dict(value or {}) for key, value in site_records.items()}
+            normalized_errors = {normalize_sku(key): str(value or "").strip() for key, value in site_errors.items()}
+            for raw_sku in target_skus:
+                sku = normalize_sku(raw_sku)
+                if not sku:
+                    continue
+                payload = normalized_records.get(sku)
+                if payload:
+                    if "vendor" in requested_scrape_fields and not str(payload.get("vendor", "") or "").strip():
+                        payload["vendor"] = context_vendor
+                    records_by_sku.setdefault(sku, {})[distributor.key] = payload
+                    continue
+                detailed_error = normalized_errors.get(sku) or "No matching product found."
+                append_distributor_error_report(distributor.key, sku, detailed_error)
+                errors_by_sku.setdefault(sku, {})[distributor.key] = compact_distributor_error(detailed_error)
+            for warning in site_warnings:
+                warning_text = str(warning or "").strip()
+                if warning_text:
+                    general_warnings.append(f"{distributor.label}: {warning_text}")
+
+        return records_by_sku, errors_by_sku, skips_by_sku, general_warnings
+
     def _run_processing_worker(self, request_id: int, target_skus: list[str], skip_scrape: bool = False) -> None:
         result_payload: dict[str, object] = {}
         try:
@@ -4391,13 +5200,36 @@ class ProductProspectorDesktopApp:
             scrape_records: dict[str, dict[str, str]] = {}
             scrape_sku_errors: dict[str, str] = {}
             scrape_general_errors: list[str] = []
-            can_scrape = bool((self.session.scrape_settings.vendor_search_url or self.session.scrape_settings.product_url) and target_skus)
+            wd_scrape_records: dict[str, dict[str, dict[str, str]]] = {}
+            wd_scrape_errors: dict[str, dict[str, str]] = {}
+            wd_scrape_skips: dict[str, dict[str, str]] = {}
+            audit_shopify_prices: dict[str, str] = {}
+            audit_shopify_error = ""
+            wd_search = self.session.mode == MODE_AUDIT and self.session.audit_search_type == AUDIT_SEARCH_WD
+            can_scrape = bool(
+                target_skus
+                and (
+                    (wd_search and self.session.audit_distributors)
+                    or self.session.scrape_settings.vendor_search_url
+                    or self.session.scrape_settings.product_url
+                )
+            )
             requested_scrape_fields = self._requested_scrape_fields()
             should_scrape = False
             if not skip_scrape:
                 should_scrape = can_scrape and bool(requested_scrape_fields)
             if should_scrape:
-                if self.session.scrape_settings.product_url:
+                if wd_search:
+                    (
+                        wd_scrape_records,
+                        wd_scrape_errors,
+                        wd_scrape_skips,
+                        scrape_general_errors,
+                    ) = self._run_wd_audit_scrapes(
+                        target_skus=target_skus,
+                        requested_scrape_fields=requested_scrape_fields,
+                    )
+                elif self.session.scrape_settings.product_url:
                     direct_sku = normalize_sku(target_skus[0])
                     direct_search_term = normalize_sku((self.session.search_terms_by_sku or {}).get(direct_sku, direct_sku)) or direct_sku
                     direct_payload, direct_error = scrape_direct_product_record(
@@ -4447,14 +5279,41 @@ class ProductProspectorDesktopApp:
                         requested_fields=requested_scrape_fields,
                         required_root=self.required_root,
                         cookies=self.session.scrape_settings.cookies,
+                        vendor_name=self.session.lookup_vendor,
                     )
+
+            audit_margin_enabled = self.session.mode == MODE_AUDIT and "price" in requested_scrape_fields
+            if should_scrape and audit_margin_enabled:
+                self._run_on_ui_thread(
+                    self.processing_status_text.set,
+                    f"Margin Check: loading Shopify selling prices for {len(target_skus)} SKU(s)...",
+                )
+                audit_shopify_prices, margin_error = self._load_shopify_selling_prices_for_audit(target_skus)
+                audit_shopify_error = str(margin_error or "").strip()
+                if audit_shopify_error:
+                    scrape_general_errors.append(f"Shopify margin check: {audit_shopify_error}")
 
             products, build_stats = build_products_from_session(
                 session=self.session,
                 existing_shopify_index=existing_index,
-                scraped_records=scrape_records,
+                scraped_records={} if wd_search else scrape_records,
                 required_root=self.required_root,
             )
+
+            if wd_search:
+                for product in products:
+                    sku = normalize_sku(getattr(product, "sku", ""))
+                    product.audit_distributor_results = dict(wd_scrape_records.get(sku, {}))
+                    product.audit_distributor_errors = dict(wd_scrape_errors.get(sku, {}))
+                    product.audit_distributor_skips = dict(wd_scrape_skips.get(sku, {}))
+                    product.audit_requested_fields = sorted(requested_scrape_fields)
+                    product.audit_shopify_price = audit_shopify_prices.get(sku, "")
+                    product.audit_shopify_lookup_error = audit_shopify_error
+            elif self.session.mode == MODE_AUDIT:
+                for product in products:
+                    sku = normalize_sku(getattr(product, "sku", ""))
+                    product.audit_shopify_price = audit_shopify_prices.get(sku, "")
+                    product.audit_shopify_lookup_error = audit_shopify_error
 
             mapper = self.type_mapper
             if mapper is None:
@@ -4470,10 +5329,11 @@ class ProductProspectorDesktopApp:
             tag_catalog = list(self.review_tag_options)
             hidden_owner_tags = self._hidden_owner_tag_keys()
             for product in products:
+                normalization_mode = MODE_UPDATE if self.session.mode == MODE_AUDIT else self.session.mode
                 normalized = normalize_product(
                     product=product,
                     required_root=self.required_root,
-                    mode=self.session.mode,
+                    mode=normalization_mode,
                     update_fields=update_scope,
                     default_inventory=default_inventory,
                 )
@@ -4556,13 +5416,19 @@ class ProductProspectorDesktopApp:
             if self.session.mode == MODE_UPDATE:
                 normalized_products = self._inject_workflow_parent_rows(normalized_products)
 
-            self._apply_scrape_diagnostics(
-                products=normalized_products,
-                target_skus=target_skus,
-                should_scrape=should_scrape,
-                scrape_records=scrape_records,
-                scrape_sku_errors=scrape_sku_errors,
-            )
+            if wd_search:
+                self._apply_wd_scrape_diagnostics(
+                    products=normalized_products,
+                    should_scrape=should_scrape,
+                )
+            else:
+                self._apply_scrape_diagnostics(
+                    products=normalized_products,
+                    target_skus=target_skus,
+                    should_scrape=should_scrape,
+                    scrape_records=scrape_records,
+                    scrape_sku_errors=scrape_sku_errors,
+                )
 
             result_payload = {
                 "shopify_df": shopify_df,
@@ -4573,6 +5439,12 @@ class ProductProspectorDesktopApp:
                 "scrape_records": scrape_records,
                 "scrape_sku_errors": scrape_sku_errors,
                 "scrape_general_errors": scrape_general_errors,
+                "wd_search": wd_search,
+                "wd_scrape_records": wd_scrape_records,
+                "wd_scrape_errors": wd_scrape_errors,
+                "wd_scrape_skips": wd_scrape_skips,
+                "audit_shopify_prices": audit_shopify_prices,
+                "audit_shopify_error": audit_shopify_error,
                 "can_scrape": can_scrape,
                 "mapper": mapper,
             }
@@ -4609,6 +5481,12 @@ class ProductProspectorDesktopApp:
             scrape_records = dict(result_payload.get("scrape_records") or {})
             scrape_sku_errors = dict(result_payload.get("scrape_sku_errors") or {})
             scrape_general_errors = list(result_payload.get("scrape_general_errors") or [])
+            wd_search = bool(result_payload.get("wd_search"))
+            wd_scrape_records = dict(result_payload.get("wd_scrape_records") or {})
+            wd_scrape_errors = dict(result_payload.get("wd_scrape_errors") or {})
+            wd_scrape_skips = dict(result_payload.get("wd_scrape_skips") or {})
+            audit_shopify_prices = dict(result_payload.get("audit_shopify_prices") or {})
+            audit_shopify_error = str(result_payload.get("audit_shopify_error") or "").strip()
 
             self.session.products = normalized_products
             self.variant_selected_keys = set()
@@ -4656,14 +5534,38 @@ class ProductProspectorDesktopApp:
             if should_scrape:
                 if requested_scrape_fields:
                     status_parts.append(f"Scrape target fields: {', '.join(requested_scrape_fields)}")
-                status_parts.append(f"Scraped: {len(scrape_records)} SKU hits")
-                if scrape_sku_errors:
-                    status_parts.append(f"Scrape SKU failures: {len(scrape_sku_errors)}")
+                if wd_search:
+                    wd_site_hits = sum(len(site_records) for site_records in wd_scrape_records.values())
+                    wd_site_failures = sum(len(site_errors) for site_errors in wd_scrape_errors.values())
+                    wd_site_skips = sum(len(site_skips) for site_skips in wd_scrape_skips.values())
+                    total_wd_lookups = len(target_skus) * len(self.session.audit_distributors)
+                    status_parts.append(f"WD site hits: {wd_site_hits}/{total_wd_lookups}")
+                    if wd_site_skips:
+                        status_parts.append(f"WD searches skipped (vendor not carried): {wd_site_skips}")
+                    if wd_site_failures:
+                        status_parts.append(f"WD site misses/failures: {wd_site_failures}")
+                    if "price" in requested_scrape_fields:
+                        status_parts.append(
+                            f"Shopify margin prices: {len(audit_shopify_prices)}/{len(target_skus)}"
+                        )
+                        if audit_shopify_error:
+                            status_parts.append("Shopify margin lookup unavailable")
+                else:
+                    status_parts.append(f"Scraped: {len(scrape_records)} SKU hits")
+                    if scrape_sku_errors:
+                        status_parts.append(f"Scrape SKU failures: {len(scrape_sku_errors)}")
                 if scrape_general_errors:
                     status_parts.append(f"Scrape warnings: {len(scrape_general_errors)}")
+                image_records = list(scrape_records.values())
+                if wd_search:
+                    image_records = [
+                        record
+                        for site_records in wd_scrape_records.values()
+                        for record in site_records.values()
+                    ]
                 downloaded_images = sum(
                     len([part for part in re.split(r"[|,\n]+", str(record.get("media_local_files", ""))) if part.strip()])
-                    for record in scrape_records.values()
+                    for record in image_records
                 )
                 if downloaded_images:
                     status_parts.append(f"Downloaded images: {downloaded_images}")
@@ -4677,6 +5579,53 @@ class ProductProspectorDesktopApp:
             self._auto_open_review_after_processing = False
 
         self._run_on_ui_thread(apply)
+
+    def _apply_wd_scrape_diagnostics(self, products, should_scrape: bool) -> None:
+        selected = selected_distributors(self.session.audit_distributors)
+        requested_fields = sorted(self._requested_scrape_fields())
+        for product in products:
+            sku = normalize_sku(getattr(product, "sku", ""))
+            search_term = normalize_sku((self.session.search_terms_by_sku or {}).get(sku, sku)) or sku
+            product.search_term_used = search_term
+            product.audit_requested_fields = list(requested_fields)
+            if not should_scrape:
+                product.scrape_status = "not_run"
+                continue
+
+            site_results = dict(getattr(product, "audit_distributor_results", {}) or {})
+            site_errors = dict(getattr(product, "audit_distributor_errors", {}) or {})
+            site_skips = dict(getattr(product, "audit_distributor_skips", {}) or {})
+            applicable = [item for item in selected if item.key not in site_skips]
+            found_labels: list[str] = []
+            found_fields: list[str] = []
+            for distributor in selected:
+                payload = site_results.get(distributor.key)
+                if not isinstance(payload, dict) or not payload:
+                    continue
+                found_labels.append(distributor.label)
+                for field_name in requested_fields:
+                    value = payload.get(field_name, "")
+                    if isinstance(value, (list, tuple, set)):
+                        has_value = any(str(item or "").strip() for item in value)
+                    else:
+                        has_value = bool(str(value or "").strip())
+                    if has_value:
+                        found_fields.append(f"{distributor.label}: {field_name}")
+
+            if not applicable and selected:
+                product.scrape_status = "skipped"
+            elif len(found_labels) == len(applicable) and applicable:
+                product.scrape_status = "success"
+            elif found_labels:
+                product.scrape_status = "partial"
+            else:
+                product.scrape_status = "failed"
+            product.scrape_fields_found = " | ".join(found_fields)
+            product.scrape_error = " | ".join(
+                f"{WHOLESALE_DISTRIBUTOR_BY_KEY[key].label}: {message}"
+                for key, message in site_errors.items()
+                if key in WHOLESALE_DISTRIBUTOR_BY_KEY and str(message or "").strip()
+            )
 
     def _apply_scrape_diagnostics(
         self,
@@ -4955,6 +5904,7 @@ class ProductProspectorDesktopApp:
         self._apply_review_field_visibility()
         total = len(self.session.products)
         if total == 0:
+            self._refresh_audit_wd_review_fields(None)
             self.push_selected_skus = set()
             self.variant_selected_keys = set()
             self.review_table_row_index_map = {}
@@ -5045,6 +5995,7 @@ class ProductProspectorDesktopApp:
             self._clear_review_variant_fields()
             self._set_variant_form_visible(False)
         self._apply_review_field_visibility()
+        self._refresh_audit_wd_review_fields(product)
         _VARIANT_ONLY_PARENT_FIELDS = {"sku", "barcode", "weight", "price", "map_price", "msrp_price", "jobber_price", "dealer_cost", "inventory", "mpn"}
         _disable_variant_only = has_variant_data or bool(getattr(product, "parent_has_variants", False))
         for _field in _VARIANT_ONLY_PARENT_FIELDS:
@@ -5107,6 +6058,7 @@ class ProductProspectorDesktopApp:
         if not self.session.products:
             return
         product = self.session.products[self.review_index]
+        self._save_current_audit_wd_values(product)
         _record_type_lower = str(getattr(product, "record_type", "") or "").strip().lower()
         _is_parent_with_variants = bool(getattr(product, "parent_has_variants", False)) or _record_type_lower == "variant"
         _collective_locked = self._product_is_shopify_collective_locked(product)
@@ -5181,6 +6133,7 @@ class ProductProspectorDesktopApp:
         self._load_review_product(self.review_index + 1)
 
     def _export_review_products(self) -> None:
+        self._save_current_review_product()
         export_products = [
             product
             for product in (self.session.products or [])
@@ -5193,7 +6146,15 @@ class ProductProspectorDesktopApp:
         for column in PRODUCT_EXPORT_COLUMNS:
             if column not in df.columns:
                 df[column] = ""
-        self._export_dataframe(df[PRODUCT_EXPORT_COLUMNS], "product_prospector_products.csv")
+        export_columns = list(PRODUCT_EXPORT_COLUMNS)
+        if self.session.mode == MODE_AUDIT and self.session.audit_search_type == AUDIT_SEARCH_WD:
+            wd_prefixes = tuple(f"{item.label} - " for item in selected_distributors(self.session.audit_distributors))
+            export_columns.extend(
+                column
+                for column in df.columns
+                if wd_prefixes and str(column).startswith(wd_prefixes) and column not in export_columns
+            )
+        self._export_dataframe(df[export_columns], "product_prospector_products.xlsx")
 
     def _set_shopify_push_busy(self, busy: bool) -> None:
         self.shopify_push_inflight = bool(busy)
@@ -5201,17 +6162,264 @@ class ProductProspectorDesktopApp:
         if not busy:
             self._hide_review_busy_overlay()
 
+    def _set_stock_bridge_push_busy(self, busy: bool) -> None:
+        self.stock_bridge_push_inflight = bool(busy)
+        self._refresh_push_button_state()
+        if not busy:
+            self._hide_review_busy_overlay()
+
     def _refresh_push_button_state(self) -> None:
-        if not hasattr(self, "push_shopify_btn"):
+        if hasattr(self, "push_shopify_btn"):
+            eligible_count = sum(1 for product in (self.session.products or []) if self._is_push_eligible(product))
+            shopify_enabled = not self.shopify_push_inflight and eligible_count > 0
+            self.push_shopify_btn.configure(state="normal" if shopify_enabled else "disabled")
+
+        if hasattr(self, "push_stock_bridge_btn"):
+            stock_bridge_enabled = bool(
+                not self.stock_bridge_push_inflight
+                and self.session.mode == MODE_AUDIT
+                and self.session.audit_search_type == AUDIT_SEARCH_WD
+                and self.session.audit_distributors
+                and self.session.products
+                and 0 <= self.review_index < len(self.session.products)
+            )
+            self.push_stock_bridge_btn.configure(state="normal" if stock_bridge_enabled else "disabled")
+
+    def _build_stock_bridge_price_proposals(self, product) -> list[dict[str, object]]:
+        results = dict(getattr(product, "audit_distributor_results", {}) or {})
+        proposals: list[dict[str, object]] = []
+        for distributor in selected_distributors(self.session.audit_distributors):
+            payload = dict(results.get(distributor.key, {}) or {})
+            proposals.append(
+                {
+                    "distributorKey": distributor.key,
+                    "distributorName": distributor.label,
+                    "newProductCost": _audit_money_value(payload.get("price")),
+                    "sourceUrl": _audit_wd_source_url(payload),
+                }
+            )
+        return proposals
+
+    def _show_stock_bridge_verification(
+        self,
+        product,
+        proposals: list[dict[str, object]],
+        preview: dict[str, object],
+    ) -> list[dict[str, object]]:
+        sku = str(getattr(product, "sku", "") or "").strip()
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Verify StockBridge price push - {sku}")
+        dialog.transient(self.root)
+        dialog.geometry("1260x520")
+        dialog.minsize(960, 420)
+        dialog.grab_set()
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill=BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text="Review the current and proposed WD costs before staging them in StockBridge.",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor=W)
+        ttk.Label(
+            outer,
+            text="Blocked rows will not be sent. Warnings can be confirmed after review. No live cost or SKU Nexus value is changed by this push.",
+            foreground="#6B7280",
+            wraplength=1180,
+        ).pack(anchor=W, pady=(2, 10))
+
+        columns = ("wd", "current", "proposed", "shopify", "margin", "change", "status", "source")
+        tree_wrap = ttk.Frame(outer)
+        tree_wrap.pack(fill=BOTH, expand=True)
+        tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12)
+        headings = {
+            "wd": "Wholesale distributor",
+            "current": "Current cost",
+            "proposed": "New cost",
+            "shopify": "Shopify price",
+            "margin": "Margin",
+            "change": "Cost change",
+            "status": "Checks",
+            "source": "Source URL (double-click)",
+        }
+        widths = {"wd": 155, "current": 85, "proposed": 85, "shopify": 90, "margin": 70, "change": 85, "status": 300, "source": 300}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=65, anchor=W, stretch=column in {"status", "source"})
+        y_scroll = ttk.Scrollbar(tree_wrap, orient=VERTICAL, command=tree.yview)
+        x_scroll = ttk.Scrollbar(tree_wrap, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+        tree.tag_configure("blocked", foreground="#9B1C1C")
+        tree.tag_configure("warning", foreground="#92400E")
+
+        ready_proposals: list[dict[str, object]] = []
+        url_by_item: dict[str, tuple[str, str]] = {}
+        selling_price = _audit_money_value(getattr(product, "audit_shopify_price", ""))
+        preview_results = list(preview.get("results", []) or [])
+        for result in preview_results:
+            if not isinstance(result, dict):
+                continue
+            request_index = int(result.get("requestIndex", -1))
+            proposal = proposals[request_index] if 0 <= request_index < len(proposals) else {}
+            proposed_cost = _audit_money_value(result.get("newProductCost"))
+            current_cost = _audit_money_value(result.get("currentProductCost"))
+            review = assess_price_review(selling_price, current_cost, proposed_cost)
+            margin = review["marginPercent"]
+            change = review["costChangePercent"]
+
+            status = str(result.get("status", "") or "")
+            issues: list[str] = []
+            blocked = status != "ready"
+            if blocked:
+                issues.append(f"BLOCKED: {str(result.get('message', status) or status)}")
+            else:
+                issues.extend(str(value) for value in review["warnings"])
+                ready_proposals.append(proposal)
+            if not issues:
+                issues.append("Ready")
+
+            item_id = tree.insert(
+                "",
+                END,
+                values=(
+                    str(result.get("vendorName") or result.get("distributorName") or proposal.get("distributorName") or ""),
+                    "-" if current_cost is None else f"${current_cost:.2f}",
+                    "-" if proposed_cost is None else f"${proposed_cost:.2f}",
+                    "-" if selling_price is None else f"${selling_price:.2f}",
+                    "-" if margin is None else f"{margin:+.1f}%",
+                    "-" if change is None else f"{change:+.1f}%",
+                    "; ".join(issues),
+                    str(result.get("sourceUrl") or proposal.get("sourceUrl") or ""),
+                ),
+                tags=("blocked" if blocked else ("warning" if issues != ["Ready"] else ""),),
+            )
+            source_url = str(result.get("sourceUrl") or proposal.get("sourceUrl") or "").strip()
+            distributor_key = str(result.get("distributorKey") or proposal.get("distributorKey") or "").strip()
+            if source_url:
+                url_by_item[item_id] = (distributor_key, source_url)
+
+        def open_selected_source(_event=None) -> None:
+            selection = tree.selection()
+            target = url_by_item.get(selection[0]) if selection else None
+            if target:
+                self._open_audit_wd_source_url(target[0], target[1])
+
+        tree.bind("<Double-1>", open_selected_source)
+        confirmed = {"value": False}
+        button_row = ttk.Frame(outer)
+        button_row.pack(fill=X, pady=(12, 0))
+        ttk.Label(button_row, text=f"{len(ready_proposals)} of {len(preview_results)} WD price(s) eligible to stage.").pack(side=LEFT)
+
+        def close_dialog(value: bool) -> None:
+            confirmed["value"] = value
+            dialog.destroy()
+
+        ttk.Button(button_row, text="Cancel", command=lambda: close_dialog(False)).pack(side=RIGHT)
+        confirm_button = ttk.Button(button_row, text="Confirm and Stage", command=lambda: close_dialog(True))
+        confirm_button.pack(side=RIGHT, padx=(0, 8))
+        if not ready_proposals:
+            confirm_button.configure(state="disabled")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog(False))
+        dialog.wait_window()
+        return ready_proposals if confirmed["value"] else []
+
+    def _push_to_stock_bridge_clicked(self) -> None:
+        if self.stock_bridge_push_inflight:
             return
-        if self.shopify_push_inflight:
-            self.push_shopify_btn.configure(state="disabled")
+        if self.session.mode != MODE_AUDIT or self.session.audit_search_type != AUDIT_SEARCH_WD:
+            messagebox.showwarning(APP_TITLE, "StockBridge staging is available for WD price audits.")
             return
-        eligible_count = sum(1 for product in (self.session.products or []) if self._is_push_eligible(product))
-        if eligible_count <= 0:
-            self.push_shopify_btn.configure(state="disabled")
+        if not self.session.products or not (0 <= self.review_index < len(self.session.products)):
+            messagebox.showwarning(APP_TITLE, "No current SKU is available to stage.")
             return
-        self.push_shopify_btn.configure(state="normal")
+
+        self._save_current_review_product()
+        product = self.session.products[self.review_index]
+        sku = normalize_sku(getattr(product, "sku", ""))
+        proposals = self._build_stock_bridge_price_proposals(product)
+        if not sku or not proposals:
+            messagebox.showwarning(APP_TITLE, "The current SKU has no selected WD price rows.")
+            return
+
+        api_key = load_stock_bridge_api_key()
+        if not api_key:
+            api_key = str(
+                simpledialog.askstring(
+                    APP_TITLE,
+                    "Enter the StockBridge integration API key. It will be stored in Windows Credential Manager.",
+                    show="*",
+                    parent=self.root,
+                )
+                or ""
+            ).strip()
+            if not api_key:
+                return
+            save_stock_bridge_api_key(api_key)
+
+        self._show_review_busy_overlay(f"Checking {sku} against StockBridge...")
+        self._set_stock_bridge_push_busy(True)
+
+        def finish_stage(result: dict[str, object], error: str) -> None:
+            self._set_stock_bridge_push_busy(False)
+            if error:
+                messagebox.showerror(APP_TITLE, error)
+                return
+            staged_count = int(result.get("stagedCount", 0) or 0)
+            failures = [
+                str(item.get("message", "") or item.get("status", ""))
+                for item in list(result.get("results", []) or [])
+                if isinstance(item, dict) and item.get("status") != "staged"
+            ]
+            self.review_status_text.set(f"Staged {staged_count} WD price(s) for {sku} in StockBridge.")
+            message = f"Staged {staged_count} WD price(s) for {sku}.\n\nThe live Product Cost and SKU Nexus were not changed."
+            if failures:
+                message += "\n\nNot staged:\n- " + "\n- ".join(failures)
+            messagebox.showinfo(APP_TITLE, message)
+
+        def finish_preview(preview: dict[str, object], error: str) -> None:
+            self._set_stock_bridge_push_busy(False)
+            if error:
+                messagebox.showerror(APP_TITLE, error)
+                return
+            ready = self._show_stock_bridge_verification(product, proposals, preview)
+            if not ready:
+                return
+
+            self._show_review_busy_overlay(f"Staging {len(ready)} WD price(s) for {sku}...")
+            self._set_stock_bridge_push_busy(True)
+
+            def stage_worker() -> None:
+                try:
+                    result = stage_wd_prices(sku, ready, api_key)
+                    stage_error = ""
+                except StockBridgeError as exc:
+                    result = {}
+                    stage_error = str(exc)
+                except Exception as exc:
+                    result = {}
+                    stage_error = f"StockBridge staging failed: {exc}"
+                self._run_on_ui_thread(finish_stage, result, stage_error)
+
+            threading.Thread(target=stage_worker, name="stock-bridge-stage", daemon=True).start()
+
+        def preview_worker() -> None:
+            try:
+                preview = preview_wd_prices(sku, proposals, api_key)
+                error = ""
+            except StockBridgeError as exc:
+                preview = {}
+                error = str(exc)
+            except Exception as exc:
+                preview = {}
+                error = f"StockBridge preview failed: {exc}"
+            self._run_on_ui_thread(finish_preview, preview, error)
+
+        threading.Thread(target=preview_worker, name="stock-bridge-preview", daemon=True).start()
 
     def _push_to_shopify_clicked(self) -> None:
         if self.shopify_push_inflight:
@@ -6485,6 +7693,7 @@ class ProductProspectorDesktopApp:
             self.sku_text_status.set("")
             self.mpn_text_status.set("")
             self.product_id_text_status.set("")
+            self.audit_sku_text_status.set("")
             self.create_existing_skus = set()
             self.create_duplicate_scope = ()
             self.duplicate_check_text.set("")
@@ -6544,6 +7753,22 @@ class ProductProspectorDesktopApp:
             self.load_product_ids_btn.configure(state="disabled")
             self.clear_product_ids_btn.configure(state="disabled")
             self.product_id_text_widget.configure(state="disabled")
+        elif mode == RUN_MODE_AUDIT:
+            self.session.mode = MODE_AUDIT
+            self.update_lookup_skus = ()
+            self.update_lookup_search_terms_by_sku = {}
+            self.create_existing_skus = set()
+            self.create_duplicate_scope = ()
+            self.duplicate_check_text.set("")
+            self._set_duplicate_check_busy(False)
+            self.mode_help_text.set(
+                "Audit: Scrape selected fields from one vendor site or selected wholesale distributors for a large SKU/MPN batch."
+            )
+            self.audit_status_text.set(
+                "Choose Vendor Search or WD Search, paste SKUs/MPNs, and select the fields to audit."
+            )
+            self.setup_continue_btn.configure(text="Continue to Scraping")
+            self.setup_skip_review_btn.configure(state="disabled")
         elif mode == RUN_MODE_IMAGE_CAPTURE:
             self.session.mode = ""
             self.image_capture_status.set("")
@@ -6576,12 +7801,18 @@ class ProductProspectorDesktopApp:
             except Exception:
                 continue
         self.sku_text_widget.configure(state=state)
+        if hasattr(self, "audit_sku_text_widget"):
+            self.audit_sku_text_widget.configure(state=state)
+        if hasattr(self, "audit_vendor_combo"):
+            self.audit_vendor_combo.configure(state="normal" if enabled else "disabled")
+        for option in getattr(self, "audit_distributor_checks", []):
+            option.configure(state="normal" if enabled and self._audit_uses_wd_search() else "disabled")
         mpn_lookup_enabled = enabled and self.session.mode in {MODE_NEW, MODE_UPDATE}
         mpn_state = state if mpn_lookup_enabled else "disabled"
         if hasattr(self, "mpn_text_widget"):
             self.mpn_text_widget.configure(state=mpn_state)
         if hasattr(self, "update_lookup_vendor_combo"):
-            self.update_lookup_vendor_combo.configure(state="readonly" if mpn_lookup_enabled else "disabled")
+            self.update_lookup_vendor_combo.configure(state="normal" if mpn_lookup_enabled else "disabled")
         product_id_state = state if enabled and self.session.mode == MODE_UPDATE else "disabled"
         self.product_id_text_widget.configure(state=product_id_state)
         if hasattr(self, "load_product_ids_btn"):
@@ -6741,6 +7972,8 @@ class ProductProspectorDesktopApp:
         return self._parse_sku_text(self.mpn_text_widget.get("1.0", END))
 
     def _active_lookup_vendor(self) -> str:
+        if self.session.mode == MODE_AUDIT:
+            return str(self.audit_vendor.get() or "").strip()
         return str(self.update_lookup_vendor.get() or "").strip()
 
     def _canonical_vendor_key(self, value: str) -> str:
@@ -6776,8 +8009,12 @@ class ProductProspectorDesktopApp:
         return host
 
     def _single_direct_scrape_scope_input_count(self) -> int:
-        if self.session.mode not in {MODE_NEW, MODE_UPDATE}:
+        if self.session.mode not in {MODE_NEW, MODE_UPDATE, MODE_AUDIT}:
             return 0
+        if self.session.mode == MODE_AUDIT:
+            if self.session.setup_complete and self.session.target_skus:
+                return len([sku for sku in self.session.target_skus if normalize_sku(sku)])
+            return len(self._parse_sku_text(self.audit_sku_text_widget.get("1.0", END)))
         if self.session.mode == MODE_UPDATE and self.session.setup_complete and self.session.target_skus:
             return len([sku for sku in self.session.target_skus if normalize_sku(sku)])
         if self.session.mode == MODE_NEW and self.vendor_source_is_sheet and self.vendor_df_raw is not None and not self.vendor_df_raw.empty:
@@ -6792,7 +8029,9 @@ class ProductProspectorDesktopApp:
         return scope_count
 
     def _should_show_scrape_product_url_input(self) -> bool:
-        if self.session.mode not in {MODE_NEW, MODE_UPDATE}:
+        if self.session.mode not in {MODE_NEW, MODE_UPDATE, MODE_AUDIT}:
+            return False
+        if self.session.mode == MODE_AUDIT and self._audit_uses_wd_search():
             return False
         if self.session.mode == MODE_UPDATE:
             if str(self.scrape_product_url.get() or "").strip():
@@ -6815,7 +8054,62 @@ class ProductProspectorDesktopApp:
         self._refresh_scrape_source_inputs()
 
     def _refresh_scrape_source_inputs(self) -> None:
-        show_product_url = self._should_show_scrape_product_url_input()
+        wd_search = self.session.mode == MODE_AUDIT and self._audit_uses_wd_search()
+        show_product_url = self._should_show_scrape_product_url_input() and not wd_search
+        selected_wd_keys = set(self._selected_audit_distributor_keys()) if wd_search else set()
+        turn14_selected = "turn14" in selected_wd_keys
+
+        for widget in [self.scrape_search_url_label, self.scrape_search_url_entry]:
+            if widget is None:
+                continue
+            try:
+                if wd_search:
+                    widget.grid_remove()
+                else:
+                    widget.grid()
+            except Exception:
+                continue
+
+        if self.wd_search_urls_frame is not None:
+            try:
+                if wd_search:
+                    for child in self.wd_search_urls_frame.winfo_children():
+                        child.destroy()
+                    self.wd_search_url_vars.clear()
+                    selected = processing_distributors(selected_wd_keys)
+                    if selected:
+                        for row_index, distributor in enumerate(selected):
+                            ttk.Label(
+                                self.wd_search_urls_frame,
+                                text=f"{distributor.label} Search URL",
+                                width=38,
+                            ).grid(row=row_index, column=0, sticky=W, padx=(0, 8), pady=3)
+                            url_var = StringVar(value=distributor.processing_search_url)
+                            self.wd_search_url_vars[distributor.key] = url_var
+                            ttk.Entry(
+                                self.wd_search_urls_frame,
+                                textvariable=url_var,
+                                state="readonly",
+                            ).grid(row=row_index, column=1, sticky="ew", pady=3)
+                    else:
+                        ttk.Label(
+                            self.wd_search_urls_frame,
+                            text="WD Search URL",
+                            width=38,
+                        ).grid(row=0, column=0, sticky=W, padx=(0, 8), pady=3)
+                        empty_var = StringVar(value="Select at least one distributor in Setup")
+                        self.wd_search_url_vars["none"] = empty_var
+                        ttk.Entry(
+                            self.wd_search_urls_frame,
+                            textvariable=empty_var,
+                            state="readonly",
+                        ).grid(row=0, column=1, sticky="ew", pady=3)
+                    self.wd_search_urls_frame.grid()
+                else:
+                    self.wd_search_urls_frame.grid_remove()
+            except Exception:
+                pass
+
         for widget in [self.scrape_product_url_label, self.scrape_product_url_entry, self.scrape_product_url_note]:
             if widget is None:
                 continue
@@ -6831,6 +8125,50 @@ class ProductProspectorDesktopApp:
         if self.scrape_search_url_entry is not None:
             try:
                 self.scrape_search_url_entry.configure(state="disabled" if direct_product_url_active else "normal")
+            except Exception:
+                pass
+        for widget in [self.scrape_cookie_label, self.scrape_cookie_text, self.scrape_cookie_note]:
+            if widget is None:
+                continue
+            try:
+                if wd_search:
+                    widget.grid_remove()
+                else:
+                    widget.grid()
+            except Exception:
+                pass
+        if self.scrape_cookie_text is not None:
+            try:
+                self.scrape_cookie_text.configure(state="normal")
+            except Exception:
+                pass
+        for widget in [self.turn14_cookie_label, self.turn14_cookie_text, self.turn14_cookie_note]:
+            if widget is None:
+                continue
+            try:
+                if wd_search and turn14_selected:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            except Exception:
+                pass
+        if self.turn14_cookie_text is not None:
+            try:
+                self.turn14_cookie_text.configure(state="normal")
+            except Exception:
+                pass
+        if hasattr(self, "wd_processing_summary_label"):
+            try:
+                if wd_search:
+                    selected = selected_distributors(self._selected_audit_distributor_keys())
+                    self.wd_processing_summary_text.set(
+                        "WD Search endpoints: " + ", ".join(item.label for item in selected)
+                        + ". Each SKU/MPN will run against every selected endpoint."
+                    )
+                    self.wd_processing_summary_label.grid()
+                else:
+                    self.wd_processing_summary_text.set("")
+                    self.wd_processing_summary_label.grid_remove()
             except Exception:
                 pass
         if self.scrape_workers_combo is not None:
@@ -7029,6 +8367,159 @@ class ProductProspectorDesktopApp:
             self.duplicate_check_text.set("Duplicate check is preparing. Try again shortly.")
             return
         self._queue_create_duplicate_check(scope_skus)
+
+    def _on_audit_vendor_changed(self) -> None:
+        if self.session.mode != MODE_AUDIT:
+            return
+        if not self._audit_uses_wd_search():
+            self._sync_scrape_search_url_from_vendor()
+        if hasattr(self, "audit_sku_text_widget"):
+            raw_values = self._parse_sku_text(self.audit_sku_text_widget.get("1.0", END))
+            if raw_values:
+                self.audit_sku_text_status.set(f"{len(raw_values)} unique input SKU(s) ready")
+
+    def _audit_uses_wd_search(self) -> bool:
+        return str(self.audit_search_type.get() or "").strip() == AUDIT_SEARCH_WD
+
+    def _selected_audit_distributor_keys(self) -> list[str]:
+        return [
+            distributor.key
+            for distributor in WHOLESALE_DISTRIBUTORS
+            if bool(self.audit_distributor_vars[distributor.key].get())
+        ]
+
+    def _on_audit_search_type_changed(self) -> None:
+        if self.session.mode != MODE_AUDIT:
+            return
+        enabled = bool(self.setup_widgets_enabled)
+        wd_search = self._audit_uses_wd_search()
+        if hasattr(self, "audit_vendor_combo"):
+            self.audit_vendor_combo.configure(state="normal" if enabled else "disabled")
+        for option in getattr(self, "audit_distributor_checks", []):
+            option.configure(state="normal" if wd_search and enabled else "disabled")
+        if wd_search:
+            selected_count = len(self._selected_audit_distributor_keys())
+            self.audit_status_text.set(
+                f"WD Search selected: choose the vendor/brand context, then every SKU/MPN will be checked at {selected_count} distributor(s)."
+            )
+        else:
+            self.audit_status_text.set("Vendor Search selected: choose one vendor and paste its SKUs or MPNs.")
+            self._sync_scrape_search_url_from_vendor()
+        self._refresh_scrape_source_inputs()
+
+    def _on_audit_distributor_selection_changed(self) -> None:
+        if self.session.mode != MODE_AUDIT or not self._audit_uses_wd_search():
+            return
+        labels = [item.label for item in selected_distributors(self._selected_audit_distributor_keys())]
+        if labels:
+            self.audit_status_text.set(f"WD Search selected: {len(labels)} distributor(s) — {', '.join(labels)}.")
+        else:
+            self.audit_status_text.set("WD Search needs at least one distributor.")
+        self._refresh_scrape_source_inputs()
+
+    def _selected_audit_fields(self) -> list[str]:
+        return [
+            field_name
+            for field_name, variable in self.audit_field_vars.items()
+            if field_name != "sku" and bool(variable.get())
+        ]
+
+    def _audit_search_term(self, raw_value: str, vendor_name: str) -> str:
+        normalized_value = normalize_sku(raw_value)
+        if not normalized_value or self.audit_input_is_mpn.get():
+            return normalized_value
+
+        profile = resolve_vendor_profile(vendor_name, required_root=self.required_root)
+        prefix = _normalize_prefix_token(str(profile.sku_prefix or "")) if profile is not None else ""
+        if prefix:
+            match = re.match(rf"^{re.escape(prefix)}(?:[-_\s]+)(.+)$", normalized_value, flags=re.IGNORECASE)
+            if match:
+                stripped = normalize_sku(match.group(1))
+                if stripped:
+                    return stripped
+
+        if self._audit_uses_wd_search():
+            match = re.match(r"^[^-_\s]+(?:[-_\s]+)(.+)$", normalized_value, flags=re.IGNORECASE)
+            if match:
+                stripped = normalize_sku(match.group(1))
+                if stripped:
+                    return stripped
+        return normalized_value
+
+    def _audit_search_terms_for_scope(
+        self,
+        search_terms_by_sku: dict[str, str],
+        vendor_name: str,
+    ) -> dict[str, str]:
+        return {
+            normalize_sku(sku): self._audit_search_term(raw_value, vendor_name) or normalize_sku(sku)
+            for sku, raw_value in search_terms_by_sku.items()
+            if normalize_sku(sku)
+        }
+
+    def _on_audit_search_mode_changed(self) -> None:
+        if self.session.mode != MODE_AUDIT or not hasattr(self, "audit_sku_text_widget"):
+            return
+        vendor_name = str(self.audit_vendor.get() or "").strip()
+        raw_values = self._parse_sku_text(self.audit_sku_text_widget.get("1.0", END))
+        if not vendor_name or not raw_values:
+            return
+        self._load_audit_skus()
+
+    def _load_audit_skus(self) -> None:
+        vendor_name = str(self.audit_vendor.get() or "").strip()
+        wd_search = self._audit_uses_wd_search()
+        if not vendor_name:
+            messagebox.showwarning(APP_TITLE, "Choose the vendor/brand for this audit batch before loading SKUs.")
+            return
+        selected_wd_keys = self._selected_audit_distributor_keys() if wd_search else []
+        if wd_search and not selected_wd_keys:
+            messagebox.showwarning(APP_TITLE, "Choose at least one wholesale distributor for the WD Search.")
+            return
+        raw_values = self._parse_sku_text(self.audit_sku_text_widget.get("1.0", END))
+        if not raw_values:
+            messagebox.showwarning(APP_TITLE, "Paste at least one valid SKU or vendor part number.")
+            return
+        if wd_search:
+            scoped_skus = list(dict.fromkeys(normalize_sku(value) for value in raw_values if normalize_sku(value)))
+            base_search_terms = {sku: sku for sku in scoped_skus}
+            vendor_profile = resolve_vendor_profile(vendor_name, required_root=self.required_root)
+            sku_prefix = str(vendor_profile.sku_prefix or "").strip() if vendor_profile is not None else ""
+            error_text = None
+        else:
+            scoped_skus, base_search_terms, sku_prefix, error_text = self._build_vendor_prefixed_scope(
+                raw_values,
+                vendor_name,
+                require_vendor=True,
+            )
+        if error_text:
+            messagebox.showwarning(APP_TITLE, error_text)
+            return
+        audit_search_terms = self._audit_search_terms_for_scope(base_search_terms, vendor_name)
+        first_search_term = next(iter(audit_search_terms.values()), "")
+        search_mode = "full MPN value" if self.audit_input_is_mpn.get() else "SKU prefix removed"
+        prefix_text = f" | Stored SKU prefix: {sku_prefix}" if sku_prefix else ""
+        search_preview = f" | First search: {first_search_term}" if first_search_term else ""
+        self.audit_sku_text_status.set(
+            f"Loaded {len(scoped_skus)} unique SKU(s){prefix_text} | Search mode: {search_mode}{search_preview}"
+        )
+        source_label = (
+            f"WD Search: {vendor_name} across {len(selected_wd_keys)} distributor(s)"
+            if wd_search
+            else f"Vendor Search: {vendor_name}"
+        )
+        self.audit_status_text.set(
+            f"Audit batch ready: {source_label} | {len(scoped_skus)} SKU(s) | "
+            f"{len(self._selected_audit_fields())} scrape field(s) selected."
+        )
+        if not wd_search:
+            self._sync_scrape_search_url_from_vendor()
+
+    def _clear_audit_skus(self) -> None:
+        if hasattr(self, "audit_sku_text_widget"):
+            self.audit_sku_text_widget.delete("1.0", END)
+        self.audit_sku_text_status.set("")
+        self.audit_status_text.set("Choose Vendor Search or WD Search, paste SKUs/MPNs, and select the fields to audit.")
 
     def _load_cached_shopify_catalog(self) -> pd.DataFrame:
         cached_df = load_shopify_sku_cache()
@@ -7593,13 +9084,17 @@ class ProductProspectorDesktopApp:
             "application",
             "core_charge_product_code",
         }
-        if self.session.mode == MODE_UPDATE:
+        if self.session.mode in {MODE_UPDATE, MODE_AUDIT}:
             selected_update = [f for f in (self.session.update_fields or []) if str(f or "").strip()]
             if not selected_update:
+                if self.session.mode == MODE_AUDIT:
+                    return set()
                 # No specific fields selected — scrape everything
                 return set(_all_scrapeable)
             # Specific fields selected — only scrape the ones that overlap with scrapeable fields
             requested = {f for f in selected_update if f in _all_scrapeable}
+            if self.session.mode == MODE_AUDIT:
+                return requested
             if "core_charge_product_code" in selected_update:
                 requested.add("core_charge_product_code")
             if requested:
@@ -7629,7 +9124,7 @@ class ProductProspectorDesktopApp:
         return requested
 
     def _effective_update_processing_fields(self) -> set[str]:
-        if self.session.mode != MODE_UPDATE:
+        if self.session.mode not in {MODE_UPDATE, MODE_AUDIT}:
             return set()
         selected = {str(field or "").strip() for field in (self.session.update_fields or []) if str(field or "").strip()}
         if selected:
@@ -7652,11 +9147,15 @@ class ProductProspectorDesktopApp:
         }
 
     def _effective_update_review_fields(self) -> set[str] | None:
-        if self.session.mode != MODE_UPDATE:
+        if self.session.mode not in {MODE_UPDATE, MODE_AUDIT}:
             return None
         selected = {field for field in (self.session.update_fields or []) if str(field or "").strip()}
         if not selected:
             return None
+        if self.session.mode == MODE_AUDIT:
+            if self.session.audit_search_type == AUDIT_SEARCH_WD:
+                return {"sku", "mpn"}
+            return {"sku", "vendor", "mpn"} | selected
         always_visible = {
             "vendor",
             "sku",
@@ -7725,6 +9224,13 @@ class ProductProspectorDesktopApp:
                 if column in df.columns and column in visible_fields and column not in keep
             ]
         )
+        if self.session.mode == MODE_AUDIT and self.session.audit_search_type == AUDIT_SEARCH_WD:
+            wd_prefixes = tuple(f"{item.label} - " for item in selected_distributors(self.session.audit_distributors))
+            keep.extend(
+                column
+                for column in df.columns
+                if wd_prefixes and str(column).startswith(wd_prefixes) and column not in keep
+            )
         if not keep:
             return df
         return df.loc[:, keep]
@@ -7870,6 +9376,123 @@ class ProductProspectorDesktopApp:
             return
         self.notebook.tab(2, state="disabled")
 
+    def _capture_audit_setup_to_session(
+        self,
+        show_messages: bool = True,
+        preserve_review_state: bool = False,
+    ) -> bool:
+        vendor_name = str(self.audit_vendor.get() or "").strip()
+        wd_search = self._audit_uses_wd_search()
+        if not vendor_name:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, "Choose the vendor/brand context for this audit run.")
+            return False
+
+        selected_wd_keys = self._selected_audit_distributor_keys() if wd_search else []
+        if wd_search and not selected_wd_keys:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, "Choose at least one wholesale distributor for the WD Search.")
+            return False
+
+        raw_values = self._parse_sku_text(self.audit_sku_text_widget.get("1.0", END))
+        if not raw_values:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, "Paste at least one valid SKU or vendor part number.")
+            return False
+
+        selected_fields = self._selected_audit_fields()
+        if not selected_fields:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, "Select at least one field to audit. Price is the usual starting point.")
+            return False
+
+        if wd_search:
+            target_skus = list(dict.fromkeys(normalize_sku(value) for value in raw_values if normalize_sku(value)))
+            search_terms_by_sku = {sku: sku for sku in target_skus}
+            vendor_profile = resolve_vendor_profile(vendor_name, required_root=self.required_root)
+            sku_prefix = str(vendor_profile.sku_prefix or "").strip() if vendor_profile is not None else ""
+            error_text = None
+        else:
+            target_skus, search_terms_by_sku, sku_prefix, error_text = self._build_vendor_prefixed_scope(
+                raw_values,
+                vendor_name,
+                require_vendor=True,
+            )
+        if error_text or not target_skus:
+            if show_messages:
+                messagebox.showwarning(APP_TITLE, error_text or "No valid audit SKUs were found.")
+            return False
+
+        search_terms_by_sku = self._audit_search_terms_for_scope(search_terms_by_sku, vendor_name)
+
+        self.session.lookup_vendor = vendor_name
+        self.session.audit_search_type = AUDIT_SEARCH_WD if wd_search else AUDIT_SEARCH_VENDOR
+        self.session.audit_distributors = list(selected_wd_keys)
+        self.session.vendor_df = None
+        self.session.source_mapping.vendor = ""
+        self.session.source_mapping.title = ""
+        self.session.source_mapping.description = ""
+        self.session.source_mapping.media = ""
+        self.session.source_mapping.price = ""
+        self.session.source_mapping.map_price = ""
+        self.session.source_mapping.msrp_price = ""
+        self.session.source_mapping.jobber_price = ""
+        self.session.source_mapping.cost = ""
+        self.session.source_mapping.dealer_cost = ""
+        self.session.source_mapping.core_charge_product_code = ""
+        self.session.source_mapping.sku = "sku"
+        self.session.source_mapping.barcode = ""
+        self.session.source_mapping.weight = ""
+        self.session.source_mapping.application = ""
+        self.session.pasted_skus = list(target_skus)
+        self.session.target_skus = list(target_skus)
+        self.session.target_product_ids = []
+        self.session.search_terms_by_sku = {
+            normalize_sku(key): normalize_sku(value) or normalize_sku(key)
+            for key, value in search_terms_by_sku.items()
+            if normalize_sku(key)
+        }
+        self.session.update_fields = list(selected_fields)
+        self.session.missing_fields = detect_missing_required_fields(self.session, required_root=self.required_root)
+        self.session.inventory_default = _inventory_for_owner(self.inventory_owner.get())
+        if not wd_search:
+            self._sync_scrape_search_url_from_vendor()
+        self._refresh_scrape_source_inputs()
+        self.session.setup_complete = True
+        if not preserve_review_state:
+            self.session.processing_complete = False
+            self.session.products = []
+            self.review_tab_unlocked = False
+            self._cancel_review_table_refresh()
+            self._hide_review_busy_overlay()
+            self.review_loaded_raw = {}
+            self.review_loaded_display = {}
+            self.review_loaded_truncated = {}
+            self.review_cost_options_loaded_for_sku = ""
+        self.review_refresh_pending = False
+        self.review_refresh_inflight = False
+
+        prefix_text = f" | Stored SKU prefix: {sku_prefix}" if sku_prefix else ""
+        first_search_term = next(iter(self.session.search_terms_by_sku.values()), "")
+        search_mode = "full MPN value" if self.audit_input_is_mpn.get() else "SKU prefix removed"
+        search_preview = f" | First search: {first_search_term}" if first_search_term else ""
+        self.audit_sku_text_status.set(
+            f"Loaded {len(target_skus)} unique SKU(s){prefix_text} | Search mode: {search_mode}{search_preview}"
+        )
+        field_labels = ", ".join(field.replace("_html", "").replace("media_urls", "images") for field in selected_fields)
+        if wd_search:
+            distributor_labels = [item.label for item in selected_distributors(selected_wd_keys)]
+            source_label = f"WD Search for {vendor_name} ({', '.join(distributor_labels)})"
+        else:
+            source_label = f"Vendor Search ({vendor_name})"
+        self.audit_status_text.set(
+            f"Ready: {source_label} | {len(target_skus)} SKU(s) | Audit fields: {field_labels}."
+        )
+        self.source_status_text.set(
+            f"Audit scope: {source_label} | {len(target_skus)} SKU(s) | {len(selected_fields)} scrape field(s)."
+        )
+        return True
+
     def _capture_setup_to_session(
         self,
         show_messages: bool = True,
@@ -7880,6 +9503,12 @@ class ProductProspectorDesktopApp:
             if show_messages:
                 messagebox.showwarning(APP_TITLE, "Select a Run Mode first.")
             return False
+
+        if self.session.mode == MODE_AUDIT:
+            return self._capture_audit_setup_to_session(
+                show_messages=show_messages,
+                preserve_review_state=preserve_review_state,
+            )
 
         raw_pasted_skus = self._parse_sku_text(self.sku_text_widget.get("1.0", END))
         raw_pasted_mpns = self._pasted_scope_mpns()

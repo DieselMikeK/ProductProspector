@@ -192,6 +192,12 @@ if ($LASTEXITCODE -ne 0) {
   throw "Failed to install build requirements."
 }
 
+Write-Host "Ensuring the Playwright Firefox runtime is available for embedding..."
+& $VenvPython -m playwright install firefox
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to install the Playwright Firefox runtime required by Keystone."
+}
+
 Push-Location $AppDevDir
 
 Write-Host "Running syntax checks..."

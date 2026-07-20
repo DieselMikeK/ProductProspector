@@ -4,6 +4,11 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from product_prospector.core.wholesale_distributors import (
+    WHOLESALE_DISTRIBUTOR_BY_KEY,
+    flatten_distributor_results,
+)
+
 
 PRODUCT_EXPORT_COLUMNS = [
     "sku",
@@ -180,6 +185,12 @@ class Product:
     excluded: bool = False
     exclusion_reason: str = ""
     shopify_collective_locked: bool = False
+    audit_distributor_results: dict[str, dict[str, object]] = field(default_factory=dict)
+    audit_distributor_errors: dict[str, str] = field(default_factory=dict)
+    audit_distributor_skips: dict[str, str] = field(default_factory=dict)
+    audit_requested_fields: list[str] = field(default_factory=list)
+    audit_shopify_price: str = ""
+    audit_shopify_lookup_error: str = ""
 
     def set_field(self, name: str, value: object, source: str) -> None:
         text = _clean_text(value)
@@ -204,7 +215,7 @@ class Product:
             self.ad_words_spend = calculated_ad_words_spend
 
     def to_row(self) -> dict[str, str]:
-        return {
+        row = {
             "record_type": _clean_text(self.record_type) or "Product",
             "parent_has_variants": "yes" if bool(self.parent_has_variants) else "",
             "product_id": _clean_text(self.product_id),
@@ -247,6 +258,7 @@ class Product:
             "brand": _clean_text(self.brand),
             "application": _clean_text(self.application),
             "ad_words_spend": _clean_text(self.ad_words_spend),
+            "audit_shopify_price": _clean_text(self.audit_shopify_price),
             "collections": _clean_text(self.collections),
             "variant_google_mpn": _clean_text(self.variant_google_mpn),
             "variant_enable_low_stock_message": _clean_text(self.variant_enable_low_stock_message),
@@ -254,3 +266,15 @@ class Product:
             "tags": " | ".join([item for item in self.tags if _clean_text(item)]),
             "metafields": str(self.metafields) if self.metafields else "",
         }
+        row.update(flatten_distributor_results(self.audit_distributor_results, self.audit_requested_fields))
+        for distributor_key, error_text in self.audit_distributor_errors.items():
+            distributor = WHOLESALE_DISTRIBUTOR_BY_KEY.get(str(distributor_key or "").strip())
+            if distributor is None:
+                continue
+            row[f"{distributor.label} - status"] = _clean_text(error_text) or "Not found"
+        for distributor_key, skip_text in self.audit_distributor_skips.items():
+            distributor = WHOLESALE_DISTRIBUTOR_BY_KEY.get(str(distributor_key or "").strip())
+            if distributor is None:
+                continue
+            row[f"{distributor.label} - status"] = _clean_text(skip_text) or "Vendor Doesn't Exist"
+        return row
