@@ -20,7 +20,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import urllib.parse
 import webbrowser
-from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
+from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, VERTICAL, W, X, Y, BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, simpledialog, ttk
 
 # Avoid Python 3.14's Windows WMI path during startup. Pandas calls
 # platform.machine() at import time, and WMI can hang on this machine.
@@ -114,6 +114,14 @@ from product_prospector.core.workflow_build import (
 )
 from product_prospector.core.years import format_years_compact, parse_years_from_many, replace_years_in_text
 from product_prospector.core.scraper_engine import scrape_direct_product_record, scrape_product_page_images, scrape_vendor_records
+from product_prospector.core.stock_bridge import (
+    StockBridgeError,
+    assess_price_review,
+    load_stock_bridge_api_key,
+    preview_wd_prices,
+    save_stock_bridge_api_key,
+    stage_wd_prices,
+)
 from product_prospector.core.wholesale_distributors import (
     WHOLESALE_DISTRIBUTOR_BY_KEY,
     WHOLESALE_DISTRIBUTORS,
@@ -872,6 +880,7 @@ class ProductProspectorDesktopApp:
         self._duplicate_check_pending_scope: tuple[str, ...] = ()
         self._duplicate_check_started_at = 0.0
         self.shopify_push_inflight = False
+        self.stock_bridge_push_inflight = False
         self.push_selected_skus: set[str] = set()
         self.variant_selected_keys: set[str] = set()
         self.review_table_row_index_map: dict[str, int] = {}
@@ -1014,6 +1023,7 @@ class ProductProspectorDesktopApp:
                 self.processing_inflight,
                 self.image_capture_inflight,
                 self.shopify_push_inflight,
+                self.stock_bridge_push_inflight,
                 self.shopify_connecting,
                 self._background_connect_running,
                 self.review_busy_active,
@@ -2683,8 +2693,8 @@ class ProductProspectorDesktopApp:
         self._refresh_mode_lock_ui()
 
     def _reset_application_state(self) -> None:
-        if self.processing_inflight or self.shopify_push_inflight:
-            messagebox.showwarning(APP_TITLE, "Wait for active processing or Shopify push to finish before resetting.")
+        if self.processing_inflight or self.shopify_push_inflight or self.stock_bridge_push_inflight:
+            messagebox.showwarning(APP_TITLE, "Wait for active processing or push to finish before resetting.")
             return
 
         self._unlock_run_mode()
@@ -3105,7 +3115,12 @@ class ProductProspectorDesktopApp:
         ttk.Button(export_row, text="Save CSV / XLSX", command=self._export_review_products).pack(side=LEFT, padx=(8, 0))
         self.push_shopify_btn = ttk.Button(export_row, text="Push to Shopify", command=self._push_to_shopify_clicked)
         self.push_shopify_btn.pack(side=LEFT, padx=(8, 0))
-        self.push_stock_bridge_btn = ttk.Button(export_row, text="Push to Stock Bridge", state="disabled")
+        self.push_stock_bridge_btn = ttk.Button(
+            export_row,
+            text="Push to Stock Bridge",
+            command=self._push_to_stock_bridge_clicked,
+            state="disabled",
+        )
         self.push_stock_bridge_btn.pack(side=LEFT, padx=(8, 0))
         self._refresh_push_button_state()
 
@@ -6147,17 +6162,264 @@ class ProductProspectorDesktopApp:
         if not busy:
             self._hide_review_busy_overlay()
 
+    def _set_stock_bridge_push_busy(self, busy: bool) -> None:
+        self.stock_bridge_push_inflight = bool(busy)
+        self._refresh_push_button_state()
+        if not busy:
+            self._hide_review_busy_overlay()
+
     def _refresh_push_button_state(self) -> None:
-        if not hasattr(self, "push_shopify_btn"):
+        if hasattr(self, "push_shopify_btn"):
+            eligible_count = sum(1 for product in (self.session.products or []) if self._is_push_eligible(product))
+            shopify_enabled = not self.shopify_push_inflight and eligible_count > 0
+            self.push_shopify_btn.configure(state="normal" if shopify_enabled else "disabled")
+
+        if hasattr(self, "push_stock_bridge_btn"):
+            stock_bridge_enabled = bool(
+                not self.stock_bridge_push_inflight
+                and self.session.mode == MODE_AUDIT
+                and self.session.audit_search_type == AUDIT_SEARCH_WD
+                and self.session.audit_distributors
+                and self.session.products
+                and 0 <= self.review_index < len(self.session.products)
+            )
+            self.push_stock_bridge_btn.configure(state="normal" if stock_bridge_enabled else "disabled")
+
+    def _build_stock_bridge_price_proposals(self, product) -> list[dict[str, object]]:
+        results = dict(getattr(product, "audit_distributor_results", {}) or {})
+        proposals: list[dict[str, object]] = []
+        for distributor in selected_distributors(self.session.audit_distributors):
+            payload = dict(results.get(distributor.key, {}) or {})
+            proposals.append(
+                {
+                    "distributorKey": distributor.key,
+                    "distributorName": distributor.label,
+                    "newProductCost": _audit_money_value(payload.get("price")),
+                    "sourceUrl": _audit_wd_source_url(payload),
+                }
+            )
+        return proposals
+
+    def _show_stock_bridge_verification(
+        self,
+        product,
+        proposals: list[dict[str, object]],
+        preview: dict[str, object],
+    ) -> list[dict[str, object]]:
+        sku = str(getattr(product, "sku", "") or "").strip()
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Verify StockBridge price push - {sku}")
+        dialog.transient(self.root)
+        dialog.geometry("1260x520")
+        dialog.minsize(960, 420)
+        dialog.grab_set()
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill=BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text="Review the current and proposed WD costs before staging them in StockBridge.",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor=W)
+        ttk.Label(
+            outer,
+            text="Blocked rows will not be sent. Warnings can be confirmed after review. No live cost or SKU Nexus value is changed by this push.",
+            foreground="#6B7280",
+            wraplength=1180,
+        ).pack(anchor=W, pady=(2, 10))
+
+        columns = ("wd", "current", "proposed", "shopify", "margin", "change", "status", "source")
+        tree_wrap = ttk.Frame(outer)
+        tree_wrap.pack(fill=BOTH, expand=True)
+        tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12)
+        headings = {
+            "wd": "Wholesale distributor",
+            "current": "Current cost",
+            "proposed": "New cost",
+            "shopify": "Shopify price",
+            "margin": "Margin",
+            "change": "Cost change",
+            "status": "Checks",
+            "source": "Source URL (double-click)",
+        }
+        widths = {"wd": 155, "current": 85, "proposed": 85, "shopify": 90, "margin": 70, "change": 85, "status": 300, "source": 300}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=65, anchor=W, stretch=column in {"status", "source"})
+        y_scroll = ttk.Scrollbar(tree_wrap, orient=VERTICAL, command=tree.yview)
+        x_scroll = ttk.Scrollbar(tree_wrap, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+        tree.tag_configure("blocked", foreground="#9B1C1C")
+        tree.tag_configure("warning", foreground="#92400E")
+
+        ready_proposals: list[dict[str, object]] = []
+        url_by_item: dict[str, tuple[str, str]] = {}
+        selling_price = _audit_money_value(getattr(product, "audit_shopify_price", ""))
+        preview_results = list(preview.get("results", []) or [])
+        for result in preview_results:
+            if not isinstance(result, dict):
+                continue
+            request_index = int(result.get("requestIndex", -1))
+            proposal = proposals[request_index] if 0 <= request_index < len(proposals) else {}
+            proposed_cost = _audit_money_value(result.get("newProductCost"))
+            current_cost = _audit_money_value(result.get("currentProductCost"))
+            review = assess_price_review(selling_price, current_cost, proposed_cost)
+            margin = review["marginPercent"]
+            change = review["costChangePercent"]
+
+            status = str(result.get("status", "") or "")
+            issues: list[str] = []
+            blocked = status != "ready"
+            if blocked:
+                issues.append(f"BLOCKED: {str(result.get('message', status) or status)}")
+            else:
+                issues.extend(str(value) for value in review["warnings"])
+                ready_proposals.append(proposal)
+            if not issues:
+                issues.append("Ready")
+
+            item_id = tree.insert(
+                "",
+                END,
+                values=(
+                    str(result.get("vendorName") or result.get("distributorName") or proposal.get("distributorName") or ""),
+                    "-" if current_cost is None else f"${current_cost:.2f}",
+                    "-" if proposed_cost is None else f"${proposed_cost:.2f}",
+                    "-" if selling_price is None else f"${selling_price:.2f}",
+                    "-" if margin is None else f"{margin:+.1f}%",
+                    "-" if change is None else f"{change:+.1f}%",
+                    "; ".join(issues),
+                    str(result.get("sourceUrl") or proposal.get("sourceUrl") or ""),
+                ),
+                tags=("blocked" if blocked else ("warning" if issues != ["Ready"] else ""),),
+            )
+            source_url = str(result.get("sourceUrl") or proposal.get("sourceUrl") or "").strip()
+            distributor_key = str(result.get("distributorKey") or proposal.get("distributorKey") or "").strip()
+            if source_url:
+                url_by_item[item_id] = (distributor_key, source_url)
+
+        def open_selected_source(_event=None) -> None:
+            selection = tree.selection()
+            target = url_by_item.get(selection[0]) if selection else None
+            if target:
+                self._open_audit_wd_source_url(target[0], target[1])
+
+        tree.bind("<Double-1>", open_selected_source)
+        confirmed = {"value": False}
+        button_row = ttk.Frame(outer)
+        button_row.pack(fill=X, pady=(12, 0))
+        ttk.Label(button_row, text=f"{len(ready_proposals)} of {len(preview_results)} WD price(s) eligible to stage.").pack(side=LEFT)
+
+        def close_dialog(value: bool) -> None:
+            confirmed["value"] = value
+            dialog.destroy()
+
+        ttk.Button(button_row, text="Cancel", command=lambda: close_dialog(False)).pack(side=RIGHT)
+        confirm_button = ttk.Button(button_row, text="Confirm and Stage", command=lambda: close_dialog(True))
+        confirm_button.pack(side=RIGHT, padx=(0, 8))
+        if not ready_proposals:
+            confirm_button.configure(state="disabled")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog(False))
+        dialog.wait_window()
+        return ready_proposals if confirmed["value"] else []
+
+    def _push_to_stock_bridge_clicked(self) -> None:
+        if self.stock_bridge_push_inflight:
             return
-        if self.shopify_push_inflight:
-            self.push_shopify_btn.configure(state="disabled")
+        if self.session.mode != MODE_AUDIT or self.session.audit_search_type != AUDIT_SEARCH_WD:
+            messagebox.showwarning(APP_TITLE, "StockBridge staging is available for WD price audits.")
             return
-        eligible_count = sum(1 for product in (self.session.products or []) if self._is_push_eligible(product))
-        if eligible_count <= 0:
-            self.push_shopify_btn.configure(state="disabled")
+        if not self.session.products or not (0 <= self.review_index < len(self.session.products)):
+            messagebox.showwarning(APP_TITLE, "No current SKU is available to stage.")
             return
-        self.push_shopify_btn.configure(state="normal")
+
+        self._save_current_review_product()
+        product = self.session.products[self.review_index]
+        sku = normalize_sku(getattr(product, "sku", ""))
+        proposals = self._build_stock_bridge_price_proposals(product)
+        if not sku or not proposals:
+            messagebox.showwarning(APP_TITLE, "The current SKU has no selected WD price rows.")
+            return
+
+        api_key = load_stock_bridge_api_key()
+        if not api_key:
+            api_key = str(
+                simpledialog.askstring(
+                    APP_TITLE,
+                    "Enter the StockBridge integration API key. It will be stored in Windows Credential Manager.",
+                    show="*",
+                    parent=self.root,
+                )
+                or ""
+            ).strip()
+            if not api_key:
+                return
+            save_stock_bridge_api_key(api_key)
+
+        self._show_review_busy_overlay(f"Checking {sku} against StockBridge...")
+        self._set_stock_bridge_push_busy(True)
+
+        def finish_stage(result: dict[str, object], error: str) -> None:
+            self._set_stock_bridge_push_busy(False)
+            if error:
+                messagebox.showerror(APP_TITLE, error)
+                return
+            staged_count = int(result.get("stagedCount", 0) or 0)
+            failures = [
+                str(item.get("message", "") or item.get("status", ""))
+                for item in list(result.get("results", []) or [])
+                if isinstance(item, dict) and item.get("status") != "staged"
+            ]
+            self.review_status_text.set(f"Staged {staged_count} WD price(s) for {sku} in StockBridge.")
+            message = f"Staged {staged_count} WD price(s) for {sku}.\n\nThe live Product Cost and SKU Nexus were not changed."
+            if failures:
+                message += "\n\nNot staged:\n- " + "\n- ".join(failures)
+            messagebox.showinfo(APP_TITLE, message)
+
+        def finish_preview(preview: dict[str, object], error: str) -> None:
+            self._set_stock_bridge_push_busy(False)
+            if error:
+                messagebox.showerror(APP_TITLE, error)
+                return
+            ready = self._show_stock_bridge_verification(product, proposals, preview)
+            if not ready:
+                return
+
+            self._show_review_busy_overlay(f"Staging {len(ready)} WD price(s) for {sku}...")
+            self._set_stock_bridge_push_busy(True)
+
+            def stage_worker() -> None:
+                try:
+                    result = stage_wd_prices(sku, ready, api_key)
+                    stage_error = ""
+                except StockBridgeError as exc:
+                    result = {}
+                    stage_error = str(exc)
+                except Exception as exc:
+                    result = {}
+                    stage_error = f"StockBridge staging failed: {exc}"
+                self._run_on_ui_thread(finish_stage, result, stage_error)
+
+            threading.Thread(target=stage_worker, name="stock-bridge-stage", daemon=True).start()
+
+        def preview_worker() -> None:
+            try:
+                preview = preview_wd_prices(sku, proposals, api_key)
+                error = ""
+            except StockBridgeError as exc:
+                preview = {}
+                error = str(exc)
+            except Exception as exc:
+                preview = {}
+                error = f"StockBridge preview failed: {exc}"
+            self._run_on_ui_thread(finish_preview, preview, error)
+
+        threading.Thread(target=preview_worker, name="stock-bridge-preview", daemon=True).start()
 
     def _push_to_shopify_clicked(self) -> None:
         if self.shopify_push_inflight:
